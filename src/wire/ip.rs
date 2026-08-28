@@ -769,6 +769,15 @@ pub mod checksum {
         ((sum >> 16) as u16) + (sum as u16)
     }
 
+    #[inline(always)]
+    fn add_with_end_around_carry(accumulator: u32, word: u32) -> u32 {
+        // Accumulating modulo 2^32-1 preserves the final Internet-checksum
+        // fold because 2^32 is congruent to 1 modulo 2^16-1. This avoids
+        // splitting every native u32 load into two u16 addends.
+        let (sum, carry) = accumulator.overflowing_add(word);
+        sum + u32::from(carry)
+    }
+
     /// Compute an RFC 1071 compliant checksum (without the final complement).
     #[allow(unsafe_code)]
     pub fn data(data: &[u8]) -> u16 {
@@ -814,27 +823,29 @@ pub mod checksum {
         let mut accum_2 = 0u32;
         let mut accum_3 = 0u32;
         for words in quad_words {
-            accum_0 += (words[0] & 0xffff) + (words[0] >> 16);
-            accum_1 += (words[1] & 0xffff) + (words[1] >> 16);
-            accum_2 += (words[2] & 0xffff) + (words[2] >> 16);
-            accum_3 += (words[3] & 0xffff) + (words[3] >> 16);
+            accum_0 = add_with_end_around_carry(accum_0, words[0]);
+            accum_1 = add_with_end_around_carry(accum_1, words[1]);
+            accum_2 = add_with_end_around_carry(accum_2, words[2]);
+            accum_3 = add_with_end_around_carry(accum_3, words[3]);
         }
-        accum = accum_0 + accum_1 + accum_2 + accum_3;
+        accum = add_with_end_around_carry(accum_0, accum_1);
+        accum = add_with_end_around_carry(accum, accum_2);
+        accum = add_with_end_around_carry(accum, accum_3);
         for &double_word in remaining_double_words {
-            accum += (double_word & 0xffff) + (double_word >> 16);
+            accum = add_with_end_around_carry(accum, double_word);
         }
 
         let mut tail = &bytes[double_word_count * 4..];
         if tail.len() >= 2 {
             // SAFETY: the bulk slice is u32-aligned and two bytes remain.
             let word = unsafe { tail.as_ptr().cast::<u16>().read() };
-            accum += word as u32;
+            accum = add_with_end_around_carry(accum, word as u32);
             tail = &tail[2..];
         }
         if let Some(&last) = tail.first() {
             edge_bytes[0] = last;
         }
-        accum += u16::from_ne_bytes(edge_bytes) as u32;
+        accum = add_with_end_around_carry(accum, u16::from_ne_bytes(edge_bytes) as u32);
 
         let mut collapsed = propagate_carries(accum);
         collapsed = propagate_carries(collapsed as u32);

@@ -22,7 +22,9 @@ pub use xarxa_driver::{
     TxToken,
 };
 #[cfg(feature = "tx-egress-metadata")]
-pub use xarxa_driver::{EgressAdmission, EgressHardwareAddress, EgressKey, EgressSchedule};
+pub use xarxa_driver::{
+    EgressAdmission, EgressHardwareAddress, EgressKey, EgressRoute, EgressSchedule,
+};
 
 /// Type of medium of a driver, as reported in [`DeviceCapabilities::medium`].
 ///

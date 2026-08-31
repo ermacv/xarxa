@@ -22,10 +22,10 @@ use crate::time::Instant;
 
 #[cfg(feature = "tx-egress-metadata")]
 fn resolved_key(last_octet: u8) -> EgressKey {
-    EgressKey {
+    EgressKey::from_route(EgressRoute {
         destination: EgressHardwareAddress::Ethernet([2, 0, 0, 0, 0, last_octet]),
         traffic_class: 0,
-    }
+    })
 }
 
 #[cfg(feature = "tx-egress-metadata")]
@@ -42,7 +42,7 @@ fn egress_schedule(max_packets_per_key: u8, dispatch_quantum: u8, epoch: u32) ->
 fn interface_wide_resolved_burst_defers_a_second_socket_until_ba32() {
     let a = resolved_key(1);
     let b = resolved_key(2);
-    let mut burst = ResolvedEgressBurstState::default();
+    let mut burst = EgressBurstState::default();
     burst.configure(egress_schedule(32, 1, 1));
 
     for _ in 0..31 {
@@ -66,7 +66,7 @@ fn interface_wide_resolved_burst_defers_a_second_socket_until_ba32() {
 fn interface_wide_resolved_burst_rotates_when_current_socket_empties_early() {
     let a = resolved_key(1);
     let b = resolved_key(2);
-    let mut burst = ResolvedEgressBurstState::default();
+    let mut burst = EgressBurstState::default();
     burst.configure(egress_schedule(32, 1, 1));
 
     for _ in 0..3 {
@@ -88,7 +88,7 @@ fn interface_wide_resolved_burst_rotates_when_current_socket_empties_early() {
 #[test]
 fn uncontended_resolved_burst_has_no_empty_round_at_ba32() {
     let a = resolved_key(1);
-    let mut burst = ResolvedEgressBurstState::default();
+    let mut burst = EgressBurstState::default();
     burst.configure(egress_schedule(32, 1, 1));
 
     for _ in 0..64 {
@@ -106,7 +106,7 @@ fn uncontended_resolved_burst_has_no_empty_round_at_ba32() {
 fn global_exhaustion_does_not_rotate_the_resolved_burst() {
     let a = resolved_key(1);
     let b = resolved_key(2);
-    let mut burst = ResolvedEgressBurstState::default();
+    let mut burst = EgressBurstState::default();
     burst.configure(egress_schedule(32, 1, 1));
 
     assert!(burst.prepare(a));
@@ -124,7 +124,7 @@ fn global_exhaustion_does_not_rotate_the_resolved_burst() {
 fn resolved_burst_epoch_discards_the_previous_lifecycle_phase() {
     let a = resolved_key(1);
     let b = resolved_key(2);
-    let mut burst = ResolvedEgressBurstState::default();
+    let mut burst = EgressBurstState::default();
     burst.configure(egress_schedule(32, 1, 7));
 
     for _ in 0..17 {
@@ -148,7 +148,7 @@ fn resolved_burst_epoch_discards_the_previous_lifecycle_phase() {
 fn sparse_peer_sends_a_partial_run_without_waiting_for_ba32() {
     let saturated = resolved_key(1);
     let sparse = resolved_key(2);
-    let mut burst = ResolvedEgressBurstState::default();
+    let mut burst = EgressBurstState::default();
     burst.configure(egress_schedule(32, 1, 1));
 
     // The sparse peer becomes contended during the saturated peer's current

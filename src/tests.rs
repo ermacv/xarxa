@@ -60,6 +60,8 @@ pub struct TestingDevice {
     pub(crate) rx_queue: VecDeque<Vec<u8>>,
     max_transmission_unit: usize,
     medium: Medium,
+    #[cfg(feature = "tx-egress-metadata")]
+    egress_key_override: Option<phy::EgressKey>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -86,7 +88,14 @@ impl TestingDevice {
                 Medium::Ieee802154 => 1500,
             },
             medium,
+            #[cfg(feature = "tx-egress-metadata")]
+            egress_key_override: None,
         }
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn set_egress_key_override(&mut self, key: Option<phy::EgressKey>) {
+        self.egress_key_override = key;
     }
 }
 
@@ -115,6 +124,12 @@ impl Device for TestingDevice {
         Some(TxToken {
             queue: &mut self.tx_queue,
         })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
+        self.egress_key_override
+            .unwrap_or_else(|| phy::EgressKey::from_route(route))
     }
 }
 

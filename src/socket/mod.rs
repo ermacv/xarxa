@@ -36,7 +36,7 @@ pub(crate) use self::waker::WakerRegistration;
 /// Result of attempting to emit one packet selected by an egress key.
 ///
 /// This is socket-protocol independent: non-UDP sockets also use keyed device
-/// admission when the driver exposes resolved egress metadata.
+/// admission when the driver exposes device-classified egress metadata.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyedEmitError<E> {
     /// This key has no current scheduler grant; another key may progress.

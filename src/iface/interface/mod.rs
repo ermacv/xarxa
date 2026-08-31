@@ -47,7 +47,7 @@ use crate::iface::Slaac;
 use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 #[cfg(feature = "tx-egress-metadata")]
-use crate::phy::{EgressAdmission, EgressHardwareAddress, EgressKey, EgressSchedule};
+use crate::phy::{EgressAdmission, EgressHardwareAddress, EgressKey, EgressRoute, EgressSchedule};
 use crate::rand::Rand;
 use crate::socket::*;
 use crate::time::{Duration, Instant};
@@ -158,12 +158,12 @@ pub struct InterfaceInner {
     slaac_updated: Instant,
     routes: Routes,
     #[cfg(feature = "tx-egress-metadata")]
-    resolved_egress_burst: ResolvedEgressBurstState,
+    egress_burst: EgressBurstState,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
 }
 
-/// Interface-wide arbitration for stack-resolved egress keys.
+/// Interface-wide arbitration for device-classified egress keys.
 ///
 /// A UDP socket owns its packet arena and its per-key FIFO index, but the
 /// interface owns the set of sockets. Keeping the active burst here prevents
@@ -171,7 +171,7 @@ pub struct InterfaceInner {
 /// as `A, B, A, B, ...`.
 #[cfg(feature = "tx-egress-metadata")]
 #[derive(Default)]
-struct ResolvedEgressBurstState {
+struct EgressBurstState {
     current: Option<EgressKey>,
     run_length: u8,
     schedule: Option<EgressSchedule>,
@@ -182,7 +182,7 @@ struct ResolvedEgressBurstState {
 }
 
 #[cfg(feature = "tx-egress-metadata")]
-impl ResolvedEgressBurstState {
+impl EgressBurstState {
     fn configure(&mut self, schedule: EgressSchedule) {
         if self.schedule != Some(schedule) {
             *self = Self {
@@ -380,7 +380,7 @@ impl Interface {
                 any_ip: false,
                 routes: Routes::new(),
                 #[cfg(feature = "tx-egress-metadata")]
-                resolved_egress_burst: ResolvedEgressBurstState::default(),
+                egress_burst: EgressBurstState::default(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
                 #[cfg(feature = "multicast")]
@@ -818,9 +818,9 @@ impl Interface {
         let egress_schedule = device.egress_schedule();
         #[cfg(feature = "tx-egress-metadata")]
         match egress_schedule {
-            Some(schedule) => self.inner.resolved_egress_burst.configure(schedule),
+            Some(schedule) => self.inner.egress_burst.configure(schedule),
             None => {
-                self.inner.resolved_egress_burst.disable();
+                self.inner.egress_burst.disable();
             }
         }
 
@@ -843,26 +843,31 @@ impl Interface {
             }
 
             let mut neighbor_addr = None;
-            let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
+            let mut respond = |inner: &mut InterfaceInner,
+                               device: &mut _,
+                               meta: PacketMeta,
+                               response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
                 #[cfg(feature = "tx-egress-metadata")]
-                let resolved_egress = inner.resolved_egress_key(&response.ip_repr().dst_addr());
+                let egress_route = inner.resolved_egress_route(&response.ip_repr().dst_addr());
                 #[cfg(feature = "tx-egress-metadata")]
-                if let (Some(egress), Some(_)) = (resolved_egress, egress_schedule)
-                    && !inner.resolved_egress_burst.prepare(egress)
+                let egress_key = egress_route.map(|route| Device::egress_key(device, route));
+                #[cfg(feature = "tx-egress-metadata")]
+                if let (Some(egress), Some(_)) = (egress_key, egress_schedule)
+                    && !inner.egress_burst.prepare(egress)
                 {
                     return Err(KeyedEmitError::KeyDeferred);
                 }
                 #[cfg(feature = "tx-egress-metadata")]
-                let admission = match resolved_egress {
-                    Some(egress) => device.transmit_for(egress),
-                    None => match device.transmit() {
+                let admission = match egress_key {
+                    Some(egress) => Device::transmit_for(device, egress),
+                    None => match Device::transmit(device) {
                         Some(token) => EgressAdmission::Granted(token),
                         None => EgressAdmission::GlobalExhausted,
                     },
                 };
                 #[cfg(not(feature = "tx-egress-metadata"))]
-                let admission = match device.transmit() {
+                let admission = match Device::transmit(device) {
                     Some(token) => Some(token),
                     None => None,
                 };
@@ -870,8 +875,8 @@ impl Interface {
                 #[cfg(feature = "tx-egress-metadata")]
                 let t = match admission {
                     EgressAdmission::Granted(token) => {
-                        if let (Some(egress), Some(_)) = (resolved_egress, egress_schedule) {
-                            inner.resolved_egress_burst.commit(egress);
+                        if let (Some(egress), Some(_)) = (egress_key, egress_schedule) {
+                            inner.egress_burst.commit(egress);
                         }
                         token
                     }
@@ -888,9 +893,9 @@ impl Interface {
                 })?;
 
                 #[cfg(feature = "tx-egress-metadata")]
-                let dispatched = match resolved_egress {
-                    Some(egress) => {
-                        inner.dispatch_ip_resolved(t, meta, response, &mut self.fragmenter, egress)
+                let dispatched = match egress_route {
+                    Some(route) => {
+                        inner.dispatch_ip_resolved(t, meta, response, &mut self.fragmenter, route)
                     }
                     None => inner.dispatch_ip(t, meta, response, &mut self.fragmenter),
                 };
@@ -917,14 +922,14 @@ impl Interface {
                 ($inner:expr, $meta:expr, $packet:expr) => {{
                     #[cfg(feature = "tx-egress-metadata")]
                     {
-                        respond($inner, $meta, $packet).map_err(|error| match error {
+                        respond($inner, device, $meta, $packet).map_err(|error| match error {
                             KeyedEmitError::KeyDeferred => EgressError::AllKeysDeferred,
                             KeyedEmitError::Global(error) => error,
                         })
                     }
                     #[cfg(not(feature = "tx-egress-metadata"))]
                     {
-                        respond($inner, $meta, $packet)
+                        respond($inner, device, $meta, $packet)
                     }
                 }};
             }
@@ -964,10 +969,12 @@ impl Interface {
                         socket
                             .dispatch_keyed(
                                 &mut self.inner,
+                                device,
                                 egress_schedule,
-                                |inner, meta, (ip, udp, payload)| {
+                                |inner, device, meta, (ip, udp, payload)| {
                                     respond(
                                         inner,
+                                        device,
                                         meta,
                                         Packet::new(ip, IpPayload::Udp(udp, payload)),
                                     )
@@ -981,7 +988,12 @@ impl Interface {
                     #[cfg(not(feature = "tx-egress-metadata"))]
                     {
                         socket.dispatch(&mut self.inner, |inner, meta, (ip, udp, payload)| {
-                            respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
+                            respond(
+                                inner,
+                                device,
+                                meta,
+                                Packet::new(ip, IpPayload::Udp(udp, payload)),
+                            )
                         })
                     }
                 }
@@ -1037,12 +1049,7 @@ impl Interface {
             }
         }
         #[cfg(feature = "tx-egress-metadata")]
-        if egress_schedule.is_some()
-            && self
-                .inner
-                .resolved_egress_burst
-                .finish_round(globally_exhausted)
-        {
+        if egress_schedule.is_some() && self.inner.egress_burst.finish_round(globally_exhausted) {
             result = PollResult::SocketStateChanged;
         }
         result
@@ -1288,7 +1295,7 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    pub(crate) fn resolved_egress_key(&self, addr: &IpAddress) -> Option<EgressKey> {
+    pub(crate) fn resolved_egress_route(&self, addr: &IpAddress) -> Option<EgressRoute> {
         if !matches!(self.medium, Medium::Ethernet) {
             return None;
         }
@@ -1323,7 +1330,7 @@ impl InterfaceInner {
                 _ => return None,
             }
         };
-        Some(EgressKey {
+        Some(EgressRoute {
             destination: EgressHardwareAddress::Ethernet(destination.0),
             traffic_class: 0,
         })
@@ -1499,7 +1506,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
-        egress: EgressKey,
+        egress: EgressRoute,
     ) -> Result<(), DispatchError> {
         let destination = match egress.destination {
             #[cfg(feature = "medium-ethernet")]

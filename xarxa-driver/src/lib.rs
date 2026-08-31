@@ -82,15 +82,62 @@ pub enum EgressHardwareAddress {
     Ip,
 }
 
-/// Stack-resolved information available before a TX token emits its frame.
+/// Stack-resolved route available before device-specific egress classification.
 #[cfg(feature = "tx-egress-metadata")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
-pub struct EgressKey {
+pub struct EgressRoute {
     /// Link-layer destination selected after route and neighbor lookup.
     pub destination: EgressHardwareAddress,
     /// Packet traffic class. Zero denotes the default best-effort class.
     pub traffic_class: u8,
+}
+
+/// Opaque device-owned scheduling identity for one resolved egress route.
+///
+/// A link-layer destination is not necessarily a radio peer. For example, an
+/// infrastructure Wi-Fi station can reach several bridged Ethernet addresses
+/// through one BSSID. The device therefore canonicalizes [`EgressRoute`] into
+/// this key before Xarxa groups queues or requests final backing.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct EgressKey([u32; 4]);
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressKey {
+    /// Construct a device-owned scheduling key.
+    ///
+    /// The words are opaque to Xarxa. A device using keyed scheduling must keep
+    /// its classification stable for one [`EgressSchedule::epoch`] and advance
+    /// the epoch whenever a route could map to a different scheduling domain.
+    pub const fn from_words(words: [u32; 4]) -> Self {
+        Self(words)
+    }
+
+    /// Return the opaque representation for a driver adapter.
+    pub const fn words(self) -> [u32; 4] {
+        self.0
+    }
+
+    /// Losslessly classify a route for devices without a narrower hardware
+    /// scheduling domain.
+    pub const fn from_route(route: EgressRoute) -> Self {
+        let (kind, low, high) = match route.destination {
+            EgressHardwareAddress::Ethernet(address) => (
+                1,
+                u32::from_le_bytes([address[0], address[1], address[2], address[3]]),
+                u16::from_le_bytes([address[4], address[5]]) as u32,
+            ),
+            EgressHardwareAddress::Ieee802154(address) => (
+                2,
+                u32::from_le_bytes([address[0], address[1], address[2], address[3]]),
+                u32::from_le_bytes([address[4], address[5], address[6], address[7]]),
+            ),
+            EgressHardwareAddress::Ip => (3, 0, 0),
+        };
+        Self([kind, low, high, route.traffic_class as u32])
+    }
 }
 
 /// Result of requesting final TX backing for one resolved egress key.
@@ -123,10 +170,10 @@ impl<T> EgressAdmission<T> {
 
 /// Bounded interface-wide scheduling requested by a keyed device.
 ///
-/// Xarxa owns packet queues and resolved link keys. The device owns final
-/// admission and may still defer any key through [`EgressAdmission`]. This
-/// configuration only bounds how Xarxa groups and scans eligible queues; it is
-/// not a peer authorization or an airtime grant.
+/// Xarxa owns packet queues grouped by opaque device keys. The device owns key
+/// classification and final admission, and may still defer any key through
+/// [`EgressAdmission`]. This configuration only bounds how Xarxa groups and
+/// scans eligible queues; it is not a peer authorization or an airtime grant.
 #[cfg(feature = "tx-egress-metadata")]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
@@ -433,7 +480,17 @@ pub trait Device {
     /// if there is no free space and fail later.
     fn transmit(&mut self) -> Option<Self::TxToken<'_>>;
 
-    /// Request a TX token for a stack-resolved link destination.
+    /// Canonicalize a stack-resolved route into the device scheduling domain.
+    ///
+    /// The default preserves one distinct key per link destination and traffic
+    /// class. Devices such as Wi-Fi should override this when several link
+    /// destinations share one physical peer or when peer generations matter.
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: EgressRoute) -> EgressKey {
+        EgressKey::from_route(route)
+    }
+
+    /// Request a TX token for a device-classified egress key.
     ///
     /// Devices without keyed scheduling use the ordinary global admission
     /// contract. A keyed implementation must return [`EgressAdmission::KeyDeferred`]
@@ -508,6 +565,11 @@ impl<T: ?Sized + Device> Device for &mut T {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: EgressRoute) -> EgressKey {
+        T::egress_key(self, route)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, egress: EgressKey) -> EgressAdmission<Self::TxToken<'_>> {
         T::transmit_for(self, egress)
     }
@@ -558,4 +620,35 @@ pub trait TxToken {
     /// The packet metadata to be associated with the frame to be transmitted by this [`TxToken`].
     #[allow(unused_variables)]
     fn set_meta(&mut self, meta: PacketMeta) {}
+}
+
+#[cfg(all(test, feature = "tx-egress-metadata"))]
+mod egress_tests {
+    use super::{EgressHardwareAddress, EgressKey, EgressRoute};
+
+    #[test]
+    fn default_key_is_lossless_and_includes_traffic_class() {
+        let route = EgressRoute {
+            destination: EgressHardwareAddress::Ethernet([0x02, 1, 2, 3, 4, 5]),
+            traffic_class: 6,
+        };
+        let other_destination = EgressRoute {
+            destination: EgressHardwareAddress::Ethernet([0x02, 1, 2, 3, 4, 6]),
+            traffic_class: 6,
+        };
+        let other_class = EgressRoute {
+            traffic_class: 7,
+            ..route
+        };
+
+        assert_eq!(EgressKey::from_route(route), EgressKey::from_route(route));
+        assert_ne!(
+            EgressKey::from_route(route),
+            EgressKey::from_route(other_destination)
+        );
+        assert_ne!(
+            EgressKey::from_route(route),
+            EgressKey::from_route(other_class)
+        );
+    }
 }

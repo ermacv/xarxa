@@ -2,11 +2,12 @@ use core::cmp::min;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
+#[cfg(feature = "tx-egress-metadata")]
 use super::{KeyedDispatchError, KeyedEmitError};
 use crate::iface::Context;
-#[cfg(feature = "tx-egress-metadata")]
-use crate::phy::EgressKey;
 use crate::phy::PacketMeta;
+#[cfg(feature = "tx-egress-metadata")]
+use crate::phy::{Device, EgressKey};
 use crate::socket::PollAt;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
@@ -130,13 +131,13 @@ struct EgressQueue {
 
 /// Queue identity used before final device backing is requested.
 ///
-/// A resolved link destination is the real scheduling key. The IP fallback
-/// preserves progress for packets which still need neighbour discovery and
-/// keeps the selector independent of any particular link medium.
+/// Resolved routes are canonicalized by the device because a link destination
+/// is not necessarily a physical peer. The IP fallback preserves progress for
+/// packets which still need neighbour discovery.
 #[cfg(feature = "tx-egress-metadata")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ResolvedEgressQueueKey {
-    Resolved(EgressKey),
+enum DeviceEgressQueueKey {
+    Classified(EgressKey),
     Unresolved(IpAddress),
 }
 
@@ -152,7 +153,7 @@ pub struct Socket<'a> {
     tx_egress_queues: [Option<EgressQueue>; EGRESS_QUEUE_CAPACITY],
     tx_egress_current: Option<u8>,
     #[cfg(feature = "tx-egress-metadata")]
-    tx_resolved_egress_current: Option<ResolvedEgressQueueKey>,
+    tx_device_egress_current: Option<DeviceEgressQueueKey>,
     #[cfg(feature = "tx-egress-metadata")]
     tx_egress_epoch: u32,
     tx_egress_cursor: u8,
@@ -176,7 +177,7 @@ impl<'a> Socket<'a> {
             tx_egress_queues: [None; EGRESS_QUEUE_CAPACITY],
             tx_egress_current: None,
             #[cfg(feature = "tx-egress-metadata")]
-            tx_resolved_egress_current: None,
+            tx_device_egress_current: None,
             #[cfg(feature = "tx-egress-metadata")]
             tx_egress_epoch: 0,
             tx_egress_cursor: 0,
@@ -224,13 +225,13 @@ impl<'a> Socket<'a> {
         self.tx_egress_current = None;
         #[cfg(feature = "tx-egress-metadata")]
         {
-            self.tx_resolved_egress_current = None;
+            self.tx_device_egress_current = None;
         }
         self.tx_burst_remaining = 0;
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn begin_resolved_egress_epoch(&mut self, epoch: u32) {
+    fn begin_device_egress_epoch(&mut self, epoch: u32) {
         if self.tx_egress_epoch != epoch {
             // Rebuild all intrusive links from live packet metadata on the
             // next selection. Packet owners and per-destination FIFO order
@@ -290,21 +291,26 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn resolved_queue_key(cx: &Context, queue: EgressQueue) -> ResolvedEgressQueueKey {
-        cx.resolved_egress_key(&queue.destination)
-            .map(ResolvedEgressQueueKey::Resolved)
-            .unwrap_or(ResolvedEgressQueueKey::Unresolved(queue.destination))
+    fn device_queue_key<D: Device + ?Sized>(
+        cx: &Context,
+        device: &mut D,
+        queue: EgressQueue,
+    ) -> DeviceEgressQueueKey {
+        cx.resolved_egress_route(&queue.destination)
+            .map(|route| DeviceEgressQueueKey::Classified(device.egress_key(route)))
+            .unwrap_or(DeviceEgressQueueKey::Unresolved(queue.destination))
     }
 
-    /// Select one packet by resolved link destination, not by routed IP.
+    /// Select one packet by its device-classified scheduling domain.
     ///
     /// Resolution is performed only when a burst starts or crosses from one
     /// IP FIFO to another. The common one-IP-per-peer case therefore does not
     /// add a neighbour-cache lookup for every packet in a full aggregate.
     #[cfg(feature = "tx-egress-metadata")]
-    fn select_resolved_egress_packet(
+    fn select_device_egress_packet<D: Device + ?Sized>(
         &mut self,
         cx: &Context,
+        device: &mut D,
         max_packets: u8,
     ) -> Option<(usize, PacketHandle)> {
         if !self.enable_egress_index() {
@@ -318,14 +324,14 @@ impl<'a> Socket<'a> {
                 return Some((index, queue.head));
             }
 
-            if let Some(current_key) = self.tx_resolved_egress_current {
+            if let Some(current_key) = self.tx_device_egress_current {
                 for offset in 0..EGRESS_QUEUE_CAPACITY {
                     let index =
                         (usize::from(self.tx_egress_cursor) + offset) % EGRESS_QUEUE_CAPACITY;
                     let Some(queue) = self.tx_egress_queues[index] else {
                         continue;
                     };
-                    if Self::resolved_queue_key(cx, queue) == current_key {
+                    if Self::device_queue_key(cx, device, queue) == current_key {
                         self.tx_egress_current = Some(index as u8);
                         self.tx_egress_cursor = ((index + 1) % EGRESS_QUEUE_CAPACITY) as u8;
                         return Some((index, queue.head));
@@ -335,13 +341,13 @@ impl<'a> Socket<'a> {
         }
 
         self.tx_egress_current = None;
-        self.tx_resolved_egress_current = None;
+        self.tx_device_egress_current = None;
         self.tx_burst_remaining = 0;
         for offset in 0..EGRESS_QUEUE_CAPACITY {
             let index = (usize::from(self.tx_egress_cursor) + offset) % EGRESS_QUEUE_CAPACITY;
             if let Some(queue) = self.tx_egress_queues[index] {
                 self.tx_egress_current = Some(index as u8);
-                self.tx_resolved_egress_current = Some(Self::resolved_queue_key(cx, queue));
+                self.tx_device_egress_current = Some(Self::device_queue_key(cx, device, queue));
                 self.tx_egress_cursor = ((index + 1) % EGRESS_QUEUE_CAPACITY) as u8;
                 self.tx_burst_remaining = max_packets;
                 return Some((index, queue.head));
@@ -351,17 +357,17 @@ impl<'a> Socket<'a> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn complete_resolved_egress_packet(
+    fn complete_device_egress_packet(
         &mut self,
         queue_index: usize,
         handle: PacketHandle,
         next: Option<PacketHandle>,
     ) -> bool {
         let queue = self.tx_egress_queues[queue_index]
-            .expect("a selected resolved egress queue remains active");
+            .expect("a selected device egress queue remains active");
         assert_eq!(
             queue.head, handle,
-            "resolved egress preserves IP FIFO order"
+            "device egress scheduling preserves IP FIFO order"
         );
         let queue_emptied = if let Some(next) = next {
             self.tx_egress_queues[queue_index] = Some(EgressQueue {
@@ -379,7 +385,7 @@ impl<'a> Socket<'a> {
         let burst_completed = self.tx_burst_remaining == 0;
         if burst_completed {
             self.tx_egress_current = None;
-            self.tx_resolved_egress_current = None;
+            self.tx_device_egress_current = None;
         }
 
         // As with the IP selector, wake a full producer only at a scheduling
@@ -897,28 +903,33 @@ impl<'a> Socket<'a> {
     /// both non-zero quanta, so the hot loop has no compatibility or zero-value
     /// branches.
     #[cfg(feature = "tx-egress-metadata")]
-    pub(crate) fn dispatch_keyed<F, E>(
+    pub(crate) fn dispatch_keyed<D, F, E>(
         &mut self,
         cx: &mut Context,
+        device: &mut D,
         schedule: Option<crate::phy::EgressSchedule>,
         mut emit: F,
     ) -> Result<(), KeyedDispatchError<E>>
     where
+        D: Device + ?Sized,
         F: FnMut(
             &mut Context,
+            &mut D,
             PacketMeta,
             (IpRepr, UdpRepr, &[u8]),
         ) -> Result<(), KeyedEmitError<E>>,
     {
         let Some(schedule) = schedule else {
             self.disable_egress_index(false);
-            return self.dispatch(cx, emit).map_err(|error| match error {
-                KeyedEmitError::KeyDeferred => KeyedDispatchError::AllKeysDeferred,
-                KeyedEmitError::Global(error) => KeyedDispatchError::Global(error),
-            });
+            return self
+                .dispatch(cx, |cx, meta, packet| emit(cx, device, meta, packet))
+                .map_err(|error| match error {
+                    KeyedEmitError::KeyDeferred => KeyedDispatchError::AllKeysDeferred,
+                    KeyedEmitError::Global(error) => KeyedDispatchError::Global(error),
+                });
         };
 
-        self.begin_resolved_egress_epoch(schedule.epoch());
+        self.begin_device_egress_epoch(schedule.epoch());
         let max_packets = schedule.max_packets_per_key().get();
         let dispatch_quantum = schedule.dispatch_quantum().get();
         let endpoint = self.endpoint;
@@ -926,9 +937,9 @@ impl<'a> Socket<'a> {
         let mut deferred = 0;
         let mut emitted = 0_u8;
         loop {
-            let selected = self.select_resolved_egress_packet(cx, max_packets);
+            let selected = self.select_device_egress_packet(cx, device, max_packets);
             let Some((queue_index, handle)) = selected else {
-                let result = self.dispatch(cx, &mut emit);
+                let result = self.dispatch(cx, |cx, meta, packet| emit(cx, device, meta, packet));
                 if self.tx_buffer.is_empty() {
                     self.tx_egress_index_blocked = false;
                 }
@@ -977,13 +988,13 @@ impl<'a> Socket<'a> {
                     hop_limit,
                 );
 
-                emit(cx, packet_meta.meta, (ip_repr, repr, payload_buf))
+                emit(cx, device, packet_meta.meta, (ip_repr, repr, payload_buf))
             };
             let (result, next) = self.tx_buffer.dequeue_handle_with(handle, dispatch_packet);
             match result {
                 Ok(()) => {
                     let _wake_producer =
-                        self.complete_resolved_egress_packet(queue_index, handle, next);
+                        self.complete_device_egress_packet(queue_index, handle, next);
                     #[cfg(feature = "async")]
                     if _wake_producer {
                         self.tx_waker.wake();
@@ -1001,7 +1012,7 @@ impl<'a> Socket<'a> {
                     // Retain the exact queue head, but do not interpret a
                     // key-specific scheduler decision as global pressure.
                     self.tx_egress_current = None;
-                    self.tx_resolved_egress_current = None;
+                    self.tx_device_egress_current = None;
                     self.tx_burst_remaining = 0;
                     deferred += 1;
                     let active = self
@@ -1274,7 +1285,7 @@ mod test {
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_destination_burst_dispatch_preserves_per_destination_fifo() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(8));
         let other = IpEndpoint {
@@ -1297,8 +1308,9 @@ mod test {
             assert_eq!(
                 socket.dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, (ip, _, payload)| {
+                    |_, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1321,15 +1333,17 @@ mod test {
 
     #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
     #[test]
-    fn test_resolved_egress_burst_coalesces_ip_queues_for_one_link_key() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+    fn device_key_coalesces_distinct_link_routes_into_one_scheduling_run() {
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
+        device.set_egress_key_override(Some(crate::phy::EgressKey::from_words([7, 11, 13, 17])));
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(12));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
 
-        // IPv4 multicast maps only the low 23 address bits into Ethernet.
-        // These first two IP destinations therefore resolve to one link key,
-        // while `other_link` resolves to a different multicast MAC.
+        // The three IPv4 routes resolve to two distinct multicast MACs, but
+        // the device maps them to one physical scheduling domain. This models
+        // an infrastructure STA sending several bridged destinations through
+        // one BSSID.
         let same_link_a = IpEndpoint {
             addr: crate::wire::Ipv4Address::new(224, 1, 2, 3).into(),
             port: REMOTE_PORT,
@@ -1358,8 +1372,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(4, 1, 0)),
-                    |_, _, (_, _, payload)| {
+                    |_, _, _, (_, _, payload)| {
                         observed.push(payload.to_vec());
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1372,10 +1387,10 @@ mod test {
             [
                 b"a0".to_vec(),
                 b"a1".to_vec(),
-                b"b0".to_vec(),
-                b"b1".to_vec(),
                 b"c0".to_vec(),
                 b"c1".to_vec(),
+                b"b0".to_vec(),
+                b"b1".to_vec(),
             ]
         );
         assert!(socket.can_send());
@@ -1384,7 +1399,7 @@ mod test {
     #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
     #[test]
     fn resolved_dispatch_quantum_emits_one_bounded_contiguous_run() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(8));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
@@ -1405,8 +1420,9 @@ mod test {
         socket
             .dispatch_keyed(
                 cx,
+                &mut device,
                 Some(egress_schedule(4, 4, 0)),
-                |_, _, (_, _, payload)| {
+                |_, _, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 },
@@ -1421,8 +1437,9 @@ mod test {
         socket
             .dispatch_keyed(
                 cx,
+                &mut device,
                 Some(egress_schedule(4, 4, 0)),
-                |_, _, (_, _, payload)| {
+                |_, _, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 },
@@ -1439,7 +1456,7 @@ mod test {
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_destination_index_retains_failed_head_and_links_new_packets() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(8));
         let other = IpEndpoint {
@@ -1452,8 +1469,9 @@ mod test {
         assert_eq!(
             socket.dispatch_keyed(
                 cx,
+                &mut device,
                 Some(egress_schedule(3, 1, 0)),
-                |_, _, (_, _, payload)| {
+                |_, _, _, (_, _, payload)| {
                     assert_eq!(payload, b"a0");
                     Result::<(), KeyedEmitError<()>>::Err(KeyedEmitError::Global(()))
                 },
@@ -1471,8 +1489,9 @@ mod test {
             assert_eq!(
                 socket.dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(3, 1, 0)),
-                    |_, _, (ip, _, payload)| {
+                    |_, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1494,7 +1513,7 @@ mod test {
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_key_defer_rotates_but_global_error_retains_current_burst() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(8));
         let other = IpEndpoint {
@@ -1517,8 +1536,9 @@ mod test {
                 socket
                     .dispatch_keyed(
                         cx,
+                        &mut device,
                         Some(egress_schedule(2, 1, 0)),
-                        |_, _, (ip, _, payload)| {
+                        |_, _, _, (ip, _, payload)| {
                             if ip.dst_addr() == REMOTE_ADDR.into() {
                                 Err(KeyedEmitError::<()>::KeyDeferred)
                             } else {
@@ -1533,9 +1553,12 @@ mod test {
         assert_eq!(observed, [b"b0".to_vec(), b"b1".to_vec()]);
 
         assert!(matches!(
-            socket.dispatch_keyed(cx, Some(egress_schedule(2, 1, 0)), |_, _, _| Err(
-                KeyedEmitError::<()>::KeyDeferred
-            ),),
+            socket.dispatch_keyed(
+                cx,
+                &mut device,
+                Some(egress_schedule(2, 1, 0)),
+                |_, _, _, _| Err(KeyedEmitError::<()>::KeyDeferred),
+            ),
             Err(KeyedDispatchError::AllKeysDeferred)
         ));
 
@@ -1544,8 +1567,9 @@ mod test {
         assert!(matches!(
             socket.dispatch_keyed(
                 cx,
+                &mut device,
                 Some(egress_schedule(2, 1, 0)),
-                |_, _, (_, _, payload)| {
+                |_, _, _, (_, _, payload)| {
                     assert_eq!(payload, b"a0");
                     Err(KeyedEmitError::Global(()))
                 },
@@ -1557,8 +1581,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, (_, _, payload)| {
+                    |_, _, _, (_, _, payload)| {
                         assert_eq!(payload, expected);
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1574,7 +1599,7 @@ mod test {
         const PEERS: usize = 15;
         const PACKETS_PER_PEER: usize = 4;
 
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(PEERS * PACKETS_PER_PEER));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
@@ -1594,8 +1619,9 @@ mod test {
             assert_eq!(
                 socket.dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(PACKETS_PER_PEER as u8, 1, 0)),
-                    |_, _, (ip, _, payload)| {
+                    |_, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1621,7 +1647,7 @@ mod test {
         const PEERS: usize = 15;
         const PACKETS_PER_PEER: usize = 32;
 
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(PEERS * PACKETS_PER_PEER));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
@@ -1645,8 +1671,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(PACKETS_PER_PEER as u8, 1, 0)),
-                    |_, _, (ip, _, payload)| {
+                    |_, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1671,7 +1698,7 @@ mod test {
         const PEERS: usize = 15;
         const BACKLOG: usize = 128;
 
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(BACKLOG));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
@@ -1690,8 +1717,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(32, 1, 0)),
-                    |_, _, (_, _, payload)| {
+                    |_, _, _, (_, _, payload)| {
                         observed.push(payload[0]);
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1712,7 +1740,7 @@ mod test {
     fn test_destination_index_overflow_falls_back_without_rejecting_packets() {
         const PEERS: usize = EGRESS_QUEUE_CAPACITY + 1;
 
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(PEERS));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
@@ -1730,8 +1758,9 @@ mod test {
             assert_eq!(
                 socket.dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(4, 1, 0)),
-                    |_, _, (_, _, payload)| {
+                    |_, _, _, (_, _, payload)| {
                         observed.push(payload[0]);
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1762,8 +1791,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(4, 1, 0)),
-                    |_, _, (_, _, payload)| {
+                    |_, _, _, (_, _, payload)| {
                         observed.push(payload[1]);
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1776,7 +1806,7 @@ mod test {
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_switching_back_to_fifo_clears_intrusive_index_links() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), buffer(6));
         let other = IpEndpoint {
@@ -1797,8 +1827,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, (_, _, _)| Result::<(), KeyedEmitError<()>>::Err(
+                    |_, _, _, (_, _, _)| Result::<(), KeyedEmitError<()>>::Err(
                         KeyedEmitError::Global(()),
                     ),
                 )
@@ -1808,7 +1839,7 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..3 {
             socket
-                .dispatch_keyed(cx, None, |_, _, (_, _, payload)| {
+                .dispatch_keyed(cx, &mut device, None, |_, _, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 })
@@ -1820,7 +1851,7 @@ mod test {
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn indexed_slot_reuse_preserves_global_fifo_fallback() {
-        let (mut iface, _, _) = setup(Medium::Ethernet);
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
         let mut socket = socket(buffer(0), indexed_buffer(4));
         let other = IpEndpoint {
@@ -1842,8 +1873,9 @@ mod test {
             socket
                 .dispatch_keyed(
                     cx,
+                    &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, (_, _, payload)| {
+                    |_, _, _, (_, _, payload)| {
                         selected.push(payload.to_vec());
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1857,7 +1889,7 @@ mod test {
         let mut fifo = Vec::new();
         for _ in 0..4 {
             socket
-                .dispatch_keyed(cx, None, |_, _, (_, _, payload)| {
+                .dispatch_keyed(cx, &mut device, None, |_, _, _, (_, _, payload)| {
                     fifo.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 })

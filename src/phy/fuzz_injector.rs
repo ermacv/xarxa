@@ -90,6 +90,11 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
+        self.inner.egress_key(route)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         self.inner.transmit_for(egress).map(|token| TxToken {
             fuzzer: &mut self.fuzz_tx,

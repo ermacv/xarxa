@@ -219,6 +219,11 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
+        self.lower.egress_key(route)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         let sink = &self.sink;
         let mode = self.mode;

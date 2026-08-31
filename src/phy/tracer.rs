@@ -86,6 +86,11 @@ impl<D: Device> Device for Tracer<D> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
+        self.inner.egress_key(route)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         let medium = self.inner.capabilities().medium;
         self.inner.transmit_for(egress).map(|token| TxToken {
@@ -278,6 +283,24 @@ mod tests {
         );
         let last_event = TRACE_EVENTS.with_borrow_mut(|events| events.pop_front());
         assert_eq!(last_event, None);
+    }
+
+    #[cfg(all(feature = "tx-egress-metadata", feature = "medium-ethernet"))]
+    #[test]
+    fn tracer_preserves_device_egress_classification() {
+        use crate::phy::{EgressHardwareAddress, EgressKey, EgressRoute, Medium};
+        use crate::tests::TestingDevice;
+
+        let expected = EgressKey::from_words([11, 13, 17, 19]);
+        let mut inner = TestingDevice::new(Medium::Ethernet);
+        inner.set_egress_key_override(Some(expected));
+        let mut tracer = Tracer::new(inner, |_| {});
+        let route = EgressRoute {
+            destination: EgressHardwareAddress::Ethernet([2, 3, 5, 7, 11, 13]),
+            traffic_class: 4,
+        };
+
+        assert_eq!(tracer.egress_key(route), expected);
     }
 
     #[cfg(feature = "medium-ethernet")]

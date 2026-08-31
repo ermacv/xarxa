@@ -86,13 +86,18 @@ impl<D: Device> Device for Tracer<D> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+    fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         let medium = self.inner.capabilities().medium;
         self.inner.transmit_for(egress).map(|token| TxToken {
             token,
             medium,
             writer: self.writer,
         })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
+        self.inner.egress_schedule()
     }
 }
 

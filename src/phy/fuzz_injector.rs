@@ -90,11 +90,16 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+    fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         self.inner.transmit_for(egress).map(|token| TxToken {
             fuzzer: &mut self.fuzz_tx,
             token,
         })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
+        self.inner.egress_schedule()
     }
 }
 

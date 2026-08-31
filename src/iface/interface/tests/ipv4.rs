@@ -884,7 +884,7 @@ fn test_packet_len(#[case] medium: Medium) {
 fn resolved_ethernet_egress_is_used_without_a_second_lookup() {
     use core::cell::Cell;
 
-    use crate::phy::{EgressHardwareAddress, EgressMeta};
+    use crate::phy::{EgressHardwareAddress, EgressKey};
 
     let (mut iface, _, _) = setup(Medium::Ethernet);
     let destination_ip = Ipv4Address::new(192, 168, 1, 2);
@@ -946,7 +946,7 @@ fn resolved_ethernet_egress_is_used_without_a_second_lookup() {
             PacketMeta::default(),
             packet,
             &mut iface.fragmenter,
-            EgressMeta {
+            EgressKey {
                 destination: EgressHardwareAddress::Ethernet(destination_mac.0),
                 traffic_class: 0,
             },

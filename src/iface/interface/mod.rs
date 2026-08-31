@@ -44,12 +44,10 @@ use crate::config::{
 use crate::iface::Routes;
 #[cfg(feature = "proto-ipv6-slaac")]
 use crate::iface::Slaac;
-#[cfg(feature = "tx-egress-metadata")]
-use crate::phy::EgressQueuePolicy;
 use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
 #[cfg(feature = "tx-egress-metadata")]
-use crate::phy::{EgressHardwareAddress, EgressMeta, KeyedTxToken};
+use crate::phy::{EgressAdmission, EgressHardwareAddress, EgressKey, EgressSchedule};
 use crate::rand::Rand;
 use crate::socket::*;
 use crate::time::{Duration, Instant};
@@ -174,33 +172,32 @@ pub struct InterfaceInner {
 #[cfg(feature = "tx-egress-metadata")]
 #[derive(Default)]
 struct ResolvedEgressBurstState {
-    current: Option<EgressMeta>,
+    current: Option<EgressKey>,
     run_length: u8,
-    max_packets: u8,
-    epoch: u32,
+    schedule: Option<EgressSchedule>,
     contended: bool,
     granted_in_round: bool,
-    deferred_in_round: Option<EgressMeta>,
+    deferred_in_round: Option<EgressKey>,
     quota_blocked_in_round: bool,
 }
 
 #[cfg(feature = "tx-egress-metadata")]
 impl ResolvedEgressBurstState {
-    fn configure(&mut self, max_packets: u8, epoch: u32) {
-        if self.max_packets != max_packets || self.epoch != epoch {
+    fn configure(&mut self, schedule: EgressSchedule) {
+        if self.schedule != Some(schedule) {
             *self = Self {
-                max_packets,
-                epoch,
+                schedule: Some(schedule),
                 ..Self::default()
             };
         }
     }
 
-    fn prepare(&mut self, egress: EgressMeta, max_packets: u8) -> bool {
-        if max_packets == 0 {
-            return true;
-        }
-        debug_assert_eq!(self.max_packets, max_packets);
+    fn prepare(&mut self, egress: EgressKey) -> bool {
+        let max_packets = self
+            .schedule
+            .expect("configured egress scheduler owns a non-zero quantum")
+            .max_packets_per_key()
+            .get();
 
         let Some(current) = self.current else {
             return true;
@@ -223,8 +220,12 @@ impl ResolvedEgressBurstState {
         false
     }
 
-    fn commit(&mut self, egress: EgressMeta, max_packets: u8) {
-        debug_assert_ne!(max_packets, 0);
+    fn commit(&mut self, egress: EgressKey) {
+        let max_packets = self
+            .schedule
+            .expect("configured egress scheduler owns a non-zero quantum")
+            .max_packets_per_key()
+            .get();
         if self.current != Some(egress) {
             self.current = Some(egress);
             self.run_length = 0;
@@ -813,23 +814,15 @@ impl Interface {
         sockets: &mut SocketSet<'_>,
     ) -> PollResult {
         let _caps = device.capabilities();
-        #[cfg(any(feature = "socket-udp", feature = "tx-egress-metadata"))]
-        let egress_queue_policy = device.egress_queue_policy();
         #[cfg(feature = "tx-egress-metadata")]
-        let resolved_burst_max = match egress_queue_policy {
-            EgressQueuePolicy::ResolvedEgressBurst {
-                max_packets, epoch, ..
-            } if max_packets != 0 => {
-                self.inner
-                    .resolved_egress_burst
-                    .configure(max_packets, epoch);
-                Some(max_packets)
-            }
-            _ => {
+        let egress_schedule = device.egress_schedule();
+        #[cfg(feature = "tx-egress-metadata")]
+        match egress_schedule {
+            Some(schedule) => self.inner.resolved_egress_burst.configure(schedule),
+            None => {
                 self.inner.resolved_egress_burst.disable();
-                None
             }
-        };
+        }
 
         enum EgressError {
             Exhausted,
@@ -853,10 +846,10 @@ impl Interface {
             let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
                 #[cfg(feature = "tx-egress-metadata")]
-                let resolved_egress = inner.resolved_egress_meta(&response.ip_repr().dst_addr());
+                let resolved_egress = inner.resolved_egress_key(&response.ip_repr().dst_addr());
                 #[cfg(feature = "tx-egress-metadata")]
-                if let (Some(egress), Some(max_packets)) = (resolved_egress, resolved_burst_max)
-                    && !inner.resolved_egress_burst.prepare(egress, max_packets)
+                if let (Some(egress), Some(_)) = (resolved_egress, egress_schedule)
+                    && !inner.resolved_egress_burst.prepare(egress)
                 {
                     return Err(KeyedEmitError::KeyDeferred);
                 }
@@ -864,8 +857,8 @@ impl Interface {
                 let admission = match resolved_egress {
                     Some(egress) => device.transmit_for(egress),
                     None => match device.transmit() {
-                        Some(token) => KeyedTxToken::Granted(token),
-                        None => KeyedTxToken::GlobalExhausted,
+                        Some(token) => EgressAdmission::Granted(token),
+                        None => EgressAdmission::GlobalExhausted,
                     },
                 };
                 #[cfg(not(feature = "tx-egress-metadata"))]
@@ -876,19 +869,17 @@ impl Interface {
 
                 #[cfg(feature = "tx-egress-metadata")]
                 let t = match admission {
-                    KeyedTxToken::Granted(token) => {
-                        if let (Some(egress), Some(max_packets)) =
-                            (resolved_egress, resolved_burst_max)
-                        {
-                            inner.resolved_egress_burst.commit(egress, max_packets);
+                    EgressAdmission::Granted(token) => {
+                        if let (Some(egress), Some(_)) = (resolved_egress, egress_schedule) {
+                            inner.resolved_egress_burst.commit(egress);
                         }
                         token
                     }
-                    KeyedTxToken::GlobalExhausted => {
+                    EgressAdmission::GlobalExhausted => {
                         net_debug!("failed to transmit IP: device globally exhausted");
                         return Err(KeyedEmitError::Global(EgressError::Exhausted));
                     }
-                    KeyedTxToken::KeyDeferred => return Err(KeyedEmitError::KeyDeferred),
+                    EgressAdmission::KeyDeferred => return Err(KeyedEmitError::KeyDeferred),
                 };
                 #[cfg(not(feature = "tx-egress-metadata"))]
                 let t = admission.ok_or_else(|| {
@@ -971,9 +962,9 @@ impl Interface {
                     #[cfg(feature = "tx-egress-metadata")]
                     {
                         socket
-                            .dispatch_with_keyed_policy(
+                            .dispatch_keyed(
                                 &mut self.inner,
-                                egress_queue_policy,
+                                egress_schedule,
                                 |inner, meta, (ip, udp, payload)| {
                                     respond(
                                         inner,
@@ -989,13 +980,9 @@ impl Interface {
                     }
                     #[cfg(not(feature = "tx-egress-metadata"))]
                     {
-                        socket.dispatch_with_policy(
-                            &mut self.inner,
-                            egress_queue_policy,
-                            |inner, meta, (ip, udp, payload)| {
-                                respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
-                            },
-                        )
+                        socket.dispatch(&mut self.inner, |inner, meta, (ip, udp, payload)| {
+                            respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
+                        })
                     }
                 }
                 #[cfg(feature = "socket-tcp")]
@@ -1050,7 +1037,7 @@ impl Interface {
             }
         }
         #[cfg(feature = "tx-egress-metadata")]
-        if resolved_burst_max.is_some()
+        if egress_schedule.is_some()
             && self
                 .inner
                 .resolved_egress_burst
@@ -1301,7 +1288,7 @@ impl InterfaceInner {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    pub(crate) fn resolved_egress_meta(&self, addr: &IpAddress) -> Option<EgressMeta> {
+    pub(crate) fn resolved_egress_key(&self, addr: &IpAddress) -> Option<EgressKey> {
         if !matches!(self.medium, Medium::Ethernet) {
             return None;
         }
@@ -1336,7 +1323,7 @@ impl InterfaceInner {
                 _ => return None,
             }
         };
-        Some(EgressMeta {
+        Some(EgressKey {
             destination: EgressHardwareAddress::Ethernet(destination.0),
             traffic_class: 0,
         })
@@ -1512,7 +1499,7 @@ impl InterfaceInner {
         meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
-        egress: EgressMeta,
+        egress: EgressKey,
     ) -> Result<(), DispatchError> {
         let destination = match egress.destination {
             #[cfg(feature = "medium-ethernet")]

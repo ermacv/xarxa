@@ -219,7 +219,7 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+    fn transmit_for(&mut self, egress: phy::EgressKey) -> phy::EgressAdmission<Self::TxToken<'_>> {
         let sink = &self.sink;
         let mode = self.mode;
         let clock = self.clock;
@@ -229,6 +229,11 @@ where
             mode,
             clock,
         })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
+        self.lower.egress_schedule()
     }
 }
 

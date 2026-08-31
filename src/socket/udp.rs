@@ -5,8 +5,8 @@ use core::task::Waker;
 use super::{KeyedDispatchError, KeyedEmitError};
 use crate::iface::Context;
 #[cfg(feature = "tx-egress-metadata")]
-use crate::phy::EgressMeta;
-use crate::phy::{EgressQueuePolicy, PacketMeta};
+use crate::phy::EgressKey;
+use crate::phy::PacketMeta;
 use crate::socket::PollAt;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
@@ -136,7 +136,7 @@ struct EgressQueue {
 #[cfg(feature = "tx-egress-metadata")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResolvedEgressQueueKey {
-    Resolved(EgressMeta),
+    Resolved(EgressKey),
     Unresolved(IpAddress),
 }
 
@@ -255,10 +255,7 @@ impl<'a> Socket<'a> {
         let mut destinations = [None; EGRESS_QUEUE_CAPACITY];
         let mut overflow = false;
         self.tx_buffer.for_each_packet(|_, metadata| {
-            if destinations
-                .iter()
-                .any(|destination| *destination == Some(metadata.endpoint.addr))
-            {
+            if destinations.contains(&Some(metadata.endpoint.addr)) {
                 return;
             }
             match destinations
@@ -292,34 +289,9 @@ impl<'a> Socket<'a> {
         true
     }
 
-    fn select_egress_packet(&mut self, max_packets: u8) -> Option<(usize, PacketHandle)> {
-        if !self.enable_egress_index() {
-            return None;
-        }
-        if let Some(index) = self.tx_egress_current.map(usize::from)
-            && self.tx_burst_remaining != 0
-            && let Some(queue) = self.tx_egress_queues[index]
-        {
-            return Some((index, queue.head));
-        }
-
-        self.tx_egress_current = None;
-        self.tx_burst_remaining = 0;
-        for offset in 0..EGRESS_QUEUE_CAPACITY {
-            let index = (usize::from(self.tx_egress_cursor) + offset) % EGRESS_QUEUE_CAPACITY;
-            if let Some(queue) = self.tx_egress_queues[index] {
-                self.tx_egress_current = Some(index as u8);
-                self.tx_egress_cursor = ((index + 1) % EGRESS_QUEUE_CAPACITY) as u8;
-                self.tx_burst_remaining = max_packets;
-                return Some((index, queue.head));
-            }
-        }
-        None
-    }
-
     #[cfg(feature = "tx-egress-metadata")]
     fn resolved_queue_key(cx: &Context, queue: EgressQueue) -> ResolvedEgressQueueKey {
-        cx.resolved_egress_meta(&queue.destination)
+        cx.resolved_egress_key(&queue.destination)
             .map(ResolvedEgressQueueKey::Resolved)
             .unwrap_or(ResolvedEgressQueueKey::Unresolved(queue.destination))
     }
@@ -376,42 +348,6 @@ impl<'a> Socket<'a> {
             }
         }
         None
-    }
-
-    fn complete_egress_packet(
-        &mut self,
-        queue_index: usize,
-        handle: PacketHandle,
-        next: Option<PacketHandle>,
-    ) -> bool {
-        let queue =
-            self.tx_egress_queues[queue_index].expect("a selected egress queue remains active");
-        assert_eq!(queue.head, handle, "egress completion preserves FIFO order");
-        let queue_emptied = if let Some(next) = next {
-            self.tx_egress_queues[queue_index] = Some(EgressQueue {
-                head: next,
-                ..queue
-            });
-            false
-        } else {
-            self.tx_egress_queues[queue_index] = None;
-            self.tx_egress_current = None;
-            true
-        };
-        self.tx_burst_remaining -= 1;
-        let burst_completed = self.tx_burst_remaining == 0;
-        if burst_completed {
-            self.tx_egress_current = None;
-        }
-
-        // Indexed storage makes every selected slot immediately reusable. Do
-        // not turn that useful ownership property into one producer wake and
-        // one executor handoff per packet: a full software backlog otherwise
-        // gets refilled while its selected destination is still draining and
-        // loses the bounded burst geometry used for radio admission. Release
-        // the producer at the service boundary, or earlier when this key ran
-        // dry and continuing the burst is impossible.
-        burst_completed || queue_emptied
     }
 
     #[cfg(feature = "tx-egress-metadata")]
@@ -955,94 +891,16 @@ impl<'a> Socket<'a> {
         }
     }
 
-    #[inline(always)]
-    pub(crate) fn dispatch_with_policy<F, E>(
+    /// Dispatch one bounded run selected by the resolved interface egress key.
+    ///
+    /// `None` preserves ordinary FIFO dispatch. A configured schedule owns
+    /// both non-zero quanta, so the hot loop has no compatibility or zero-value
+    /// branches.
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn dispatch_keyed<F, E>(
         &mut self,
         cx: &mut Context,
-        policy: EgressQueuePolicy,
-        mut emit: F,
-    ) -> Result<(), E>
-    where
-        F: FnMut(&mut Context, PacketMeta, (IpRepr, UdpRepr, &[u8])) -> Result<(), E>,
-    {
-        match self.dispatch_with_keyed_policy(cx, policy, |cx, meta, packet| {
-            emit(cx, meta, packet).map_err(KeyedEmitError::Global)
-        }) {
-            Ok(()) => Ok(()),
-            Err(KeyedDispatchError::Global(error)) => Err(error),
-            Err(KeyedDispatchError::AllKeysDeferred) => {
-                unreachable!("an unkeyed emission never defers one destination")
-            }
-        }
-    }
-
-    pub(crate) fn dispatch_with_keyed_policy<F, E>(
-        &mut self,
-        cx: &mut Context,
-        policy: EgressQueuePolicy,
-        emit: F,
-    ) -> Result<(), KeyedDispatchError<E>>
-    where
-        F: FnMut(
-            &mut Context,
-            PacketMeta,
-            (IpRepr, UdpRepr, &[u8]),
-        ) -> Result<(), KeyedEmitError<E>>,
-    {
-        match policy {
-            EgressQueuePolicy::Fifo
-            | EgressQueuePolicy::DestinationBurst { max_packets: 0 }
-            | EgressQueuePolicy::ResolvedEgressBurst { max_packets: 0, .. } => {
-                self.disable_egress_index(false);
-                self.dispatch(cx, emit).map_err(|error| match error {
-                    KeyedEmitError::KeyDeferred => KeyedDispatchError::AllKeysDeferred,
-                    KeyedEmitError::Global(error) => KeyedDispatchError::Global(error),
-                })
-            }
-            EgressQueuePolicy::DestinationBurst { max_packets } => {
-                self.dispatch_destination_burst_keyed(cx, max_packets, 1, false, emit)
-            }
-            #[cfg(feature = "tx-egress-metadata")]
-            EgressQueuePolicy::ResolvedEgressBurst {
-                max_packets,
-                dispatch_quantum,
-                epoch,
-            } => {
-                self.begin_resolved_egress_epoch(epoch);
-                self.dispatch_destination_burst_keyed(
-                    cx,
-                    max_packets,
-                    dispatch_quantum.max(1),
-                    true,
-                    emit,
-                )
-            }
-            #[cfg(not(feature = "tx-egress-metadata"))]
-            EgressQueuePolicy::ResolvedEgressBurst {
-                max_packets,
-                dispatch_quantum,
-                ..
-            } => self.dispatch_destination_burst_keyed(
-                cx,
-                max_packets,
-                dispatch_quantum.max(1),
-                false,
-                emit,
-            ),
-        }
-    }
-
-    /// Bounded pull selector kept out of the ordinary FIFO instruction working
-    /// set. The S31 production adapter uses this as its first scheduling tier;
-    /// a later radio policy will refine the key from IP destination to resolved
-    /// VIF/peer-generation/TID ownership and charge airtime rather than packets.
-    #[inline(never)]
-    fn dispatch_destination_burst_keyed<F, E>(
-        &mut self,
-        cx: &mut Context,
-        max_packets: u8,
-        dispatch_quantum: u8,
-        resolved: bool,
+        schedule: Option<crate::phy::EgressSchedule>,
         mut emit: F,
     ) -> Result<(), KeyedDispatchError<E>>
     where
@@ -1052,22 +910,23 @@ impl<'a> Socket<'a> {
             (IpRepr, UdpRepr, &[u8]),
         ) -> Result<(), KeyedEmitError<E>>,
     {
+        let Some(schedule) = schedule else {
+            self.disable_egress_index(false);
+            return self.dispatch(cx, emit).map_err(|error| match error {
+                KeyedEmitError::KeyDeferred => KeyedDispatchError::AllKeysDeferred,
+                KeyedEmitError::Global(error) => KeyedDispatchError::Global(error),
+            });
+        };
+
+        self.begin_resolved_egress_epoch(schedule.epoch());
+        let max_packets = schedule.max_packets_per_key().get();
+        let dispatch_quantum = schedule.dispatch_quantum().get();
         let endpoint = self.endpoint;
         let hop_limit = self.hop_limit.unwrap_or(64);
         let mut deferred = 0;
         let mut emitted = 0_u8;
         loop {
-            #[cfg(feature = "tx-egress-metadata")]
-            let selected = if resolved {
-                self.select_resolved_egress_packet(cx, max_packets)
-            } else {
-                self.select_egress_packet(max_packets)
-            };
-            #[cfg(not(feature = "tx-egress-metadata"))]
-            let selected = {
-                let _ = resolved;
-                self.select_egress_packet(max_packets)
-            };
+            let selected = self.select_resolved_egress_packet(cx, max_packets);
             let Some((queue_index, handle)) = selected else {
                 let result = self.dispatch(cx, &mut emit);
                 if self.tx_buffer.is_empty() {
@@ -1123,14 +982,8 @@ impl<'a> Socket<'a> {
             let (result, next) = self.tx_buffer.dequeue_handle_with(handle, dispatch_packet);
             match result {
                 Ok(()) => {
-                    #[cfg(feature = "tx-egress-metadata")]
-                    let _wake_producer = if resolved {
-                        self.complete_resolved_egress_packet(queue_index, handle, next)
-                    } else {
-                        self.complete_egress_packet(queue_index, handle, next)
-                    };
-                    #[cfg(not(feature = "tx-egress-metadata"))]
-                    let _wake_producer = self.complete_egress_packet(queue_index, handle, next);
+                    let _wake_producer =
+                        self.complete_resolved_egress_packet(queue_index, handle, next);
                     #[cfg(feature = "async")]
                     if _wake_producer {
                         self.tx_waker.wake();
@@ -1148,10 +1001,7 @@ impl<'a> Socket<'a> {
                     // Retain the exact queue head, but do not interpret a
                     // key-specific scheduler decision as global pressure.
                     self.tx_egress_current = None;
-                    #[cfg(feature = "tx-egress-metadata")]
-                    {
-                        self.tx_resolved_egress_current = None;
-                    }
+                    self.tx_resolved_egress_current = None;
                     self.tx_burst_remaining = 0;
                     deferred += 1;
                     let active = self
@@ -1208,6 +1058,19 @@ mod test {
         tx_buffer: PacketBuffer<'static>,
     ) -> Socket<'static> {
         Socket::new(rx_buffer, tx_buffer)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_schedule(
+        max_packets_per_key: u8,
+        dispatch_quantum: u8,
+        epoch: u32,
+    ) -> crate::phy::EgressSchedule {
+        crate::phy::EgressSchedule::new(
+            core::num::NonZeroU8::new(max_packets_per_key).unwrap(),
+            core::num::NonZeroU8::new(dispatch_quantum).unwrap(),
+            epoch,
+        )
     }
 
     const LOCAL_PORT: u16 = 53;
@@ -1408,6 +1271,7 @@ mod test {
         assert!(socket.can_send());
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_destination_burst_dispatch_preserves_per_destination_fifo() {
         let (mut iface, _, _) = setup(Medium::Ethernet);
@@ -1431,12 +1295,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..4 {
             assert_eq!(
-                socket.dispatch_with_policy(
+                socket.dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 2 },
+                    Some(egress_schedule(2, 1, 0)),
                     |_, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 ),
                 Ok(())
@@ -1492,16 +1356,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..6 {
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::ResolvedEgressBurst {
-                        max_packets: 4,
-                        dispatch_quantum: 1,
-                        epoch: 0,
-                    },
+                    Some(egress_schedule(4, 1, 0)),
                     |_, _, (_, _, payload)| {
                         observed.push(payload.to_vec());
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 )
                 .unwrap();
@@ -1543,16 +1403,12 @@ mod test {
 
         let mut observed = Vec::new();
         socket
-            .dispatch_with_policy(
+            .dispatch_keyed(
                 cx,
-                EgressQueuePolicy::ResolvedEgressBurst {
-                    max_packets: 4,
-                    dispatch_quantum: 4,
-                    epoch: 0,
-                },
+                Some(egress_schedule(4, 4, 0)),
                 |_, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
-                    Result::<(), ()>::Ok(())
+                    Result::<(), KeyedEmitError<()>>::Ok(())
                 },
             )
             .unwrap();
@@ -1563,16 +1419,12 @@ mod test {
         assert!(!socket.tx_buffer.is_empty());
 
         socket
-            .dispatch_with_policy(
+            .dispatch_keyed(
                 cx,
-                EgressQueuePolicy::ResolvedEgressBurst {
-                    max_packets: 4,
-                    dispatch_quantum: 4,
-                    epoch: 0,
-                },
+                Some(egress_schedule(4, 4, 0)),
                 |_, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
-                    Result::<(), ()>::Ok(())
+                    Result::<(), KeyedEmitError<()>>::Ok(())
                 },
             )
             .unwrap();
@@ -1584,6 +1436,7 @@ mod test {
         assert!(socket.can_send());
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_destination_index_retains_failed_head_and_links_new_packets() {
         let (mut iface, _, _) = setup(Medium::Ethernet);
@@ -1597,15 +1450,15 @@ mod test {
         assert_eq!(socket.send_slice(b"a0", REMOTE_END), Ok(()));
         assert_eq!(socket.send_slice(b"b0", other), Ok(()));
         assert_eq!(
-            socket.dispatch_with_policy(
+            socket.dispatch_keyed(
                 cx,
-                EgressQueuePolicy::DestinationBurst { max_packets: 3 },
+                Some(egress_schedule(3, 1, 0)),
                 |_, _, (_, _, payload)| {
                     assert_eq!(payload, b"a0");
-                    Result::<(), ()>::Err(())
+                    Result::<(), KeyedEmitError<()>>::Err(KeyedEmitError::Global(()))
                 },
             ),
-            Err(())
+            Err(KeyedDispatchError::Global(()))
         );
 
         // The index is now active. Newly enqueued packets must append to the
@@ -1616,12 +1469,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..4 {
             assert_eq!(
-                socket.dispatch_with_policy(
+                socket.dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 3 },
+                    Some(egress_schedule(3, 1, 0)),
                     |_, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 ),
                 Ok(())
@@ -1638,6 +1491,7 @@ mod test {
         );
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_key_defer_rotates_but_global_error_retains_current_burst() {
         let (mut iface, _, _) = setup(Medium::Ethernet);
@@ -1661,9 +1515,9 @@ mod test {
         for _ in 0..2 {
             assert!(
                 socket
-                    .dispatch_with_keyed_policy(
+                    .dispatch_keyed(
                         cx,
-                        EgressQueuePolicy::DestinationBurst { max_packets: 2 },
+                        Some(egress_schedule(2, 1, 0)),
                         |_, _, (ip, _, payload)| {
                             if ip.dst_addr() == REMOTE_ADDR.into() {
                                 Err(KeyedEmitError::<()>::KeyDeferred)
@@ -1679,20 +1533,18 @@ mod test {
         assert_eq!(observed, [b"b0".to_vec(), b"b1".to_vec()]);
 
         assert!(matches!(
-            socket.dispatch_with_keyed_policy(
-                cx,
-                EgressQueuePolicy::DestinationBurst { max_packets: 2 },
-                |_, _, _| Err(KeyedEmitError::<()>::KeyDeferred),
-            ),
+            socket.dispatch_keyed(cx, Some(egress_schedule(2, 1, 0)), |_, _, _| Err(
+                KeyedEmitError::<()>::KeyDeferred
+            ),),
             Err(KeyedDispatchError::AllKeysDeferred)
         ));
 
         // Neither defer consumed nor reordered A's head. A global error also
         // retains that exact head instead of rotating the burst.
         assert!(matches!(
-            socket.dispatch_with_keyed_policy(
+            socket.dispatch_keyed(
                 cx,
-                EgressQueuePolicy::DestinationBurst { max_packets: 2 },
+                Some(egress_schedule(2, 1, 0)),
                 |_, _, (_, _, payload)| {
                     assert_eq!(payload, b"a0");
                     Err(KeyedEmitError::Global(()))
@@ -1703,12 +1555,12 @@ mod test {
 
         for expected in [b"a0" as &[u8], b"a1"] {
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 2 },
+                    Some(egress_schedule(2, 1, 0)),
                     |_, _, (_, _, payload)| {
                         assert_eq!(payload, expected);
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 )
                 .unwrap();
@@ -1716,7 +1568,7 @@ mod test {
         assert!(socket.can_send());
     }
 
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
     #[test]
     fn test_destination_burst_dispatch_scales_to_fifteen_interleaved_destinations() {
         const PEERS: usize = 15;
@@ -1740,14 +1592,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..PEERS * PACKETS_PER_PEER {
             assert_eq!(
-                socket.dispatch_with_policy(
+                socket.dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst {
-                        max_packets: PACKETS_PER_PEER as u8,
-                    },
+                    Some(egress_schedule(PACKETS_PER_PEER as u8, 1, 0)),
                     |_, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 ),
                 Ok(())
@@ -1793,16 +1643,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..PEERS * PACKETS_PER_PEER {
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::ResolvedEgressBurst {
-                        max_packets: PACKETS_PER_PEER as u8,
-                        dispatch_quantum: 1,
-                        epoch: 0,
-                    },
+                    Some(egress_schedule(PACKETS_PER_PEER as u8, 1, 0)),
                     |_, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 )
                 .unwrap();
@@ -1842,16 +1688,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..10 {
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::ResolvedEgressBurst {
-                        max_packets: 32,
-                        dispatch_quantum: 1,
-                        epoch: 0,
-                    },
+                    Some(egress_schedule(32, 1, 0)),
                     |_, _, (_, _, payload)| {
                         observed.push(payload[0]);
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 )
                 .unwrap();
@@ -1865,7 +1707,7 @@ mod test {
         assert_eq!(observed[9], 1);
     }
 
-    #[cfg(feature = "proto-ipv4")]
+    #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
     #[test]
     fn test_destination_index_overflow_falls_back_without_rejecting_packets() {
         const PEERS: usize = EGRESS_QUEUE_CAPACITY + 1;
@@ -1886,12 +1728,12 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..PEERS {
             assert_eq!(
-                socket.dispatch_with_policy(
+                socket.dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 4 },
+                    Some(egress_schedule(4, 1, 0)),
                     |_, _, (_, _, payload)| {
                         observed.push(payload[0]);
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 ),
                 Ok(())
@@ -1918,12 +1760,12 @@ mod test {
         observed.clear();
         for _ in 0..3 {
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 4 },
+                    Some(egress_schedule(4, 1, 0)),
                     |_, _, (_, _, payload)| {
                         observed.push(payload[1]);
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 )
                 .unwrap();
@@ -1931,6 +1773,7 @@ mod test {
         assert_eq!(observed, b"010");
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_switching_back_to_fifo_clears_intrusive_index_links() {
         let (mut iface, _, _) = setup(Medium::Ethernet);
@@ -1952,10 +1795,12 @@ mod test {
         // Activate the index, then fail emission so ownership remains queued.
         assert!(
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 2 },
-                    |_, _, (_, _, _)| Result::<(), ()>::Err(()),
+                    Some(egress_schedule(2, 1, 0)),
+                    |_, _, (_, _, _)| Result::<(), KeyedEmitError<()>>::Err(
+                        KeyedEmitError::Global(()),
+                    ),
                 )
                 .is_err()
         );
@@ -1963,15 +1808,16 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..3 {
             socket
-                .dispatch_with_policy(cx, EgressQueuePolicy::Fifo, |_, _, (_, _, payload)| {
+                .dispatch_keyed(cx, None, |_, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
-                    Result::<(), ()>::Ok(())
+                    Result::<(), KeyedEmitError<()>>::Ok(())
                 })
                 .unwrap();
         }
         assert_eq!(observed, [b"a0".to_vec(), b"b0".to_vec(), b"a1".to_vec()]);
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn indexed_slot_reuse_preserves_global_fifo_fallback() {
         let (mut iface, _, _) = setup(Medium::Ethernet);
@@ -1994,12 +1840,12 @@ mod test {
         let mut selected = Vec::new();
         for _ in 0..2 {
             socket
-                .dispatch_with_policy(
+                .dispatch_keyed(
                     cx,
-                    EgressQueuePolicy::DestinationBurst { max_packets: 2 },
+                    Some(egress_schedule(2, 1, 0)),
                     |_, _, (_, _, payload)| {
                         selected.push(payload.to_vec());
-                        Result::<(), ()>::Ok(())
+                        Result::<(), KeyedEmitError<()>>::Ok(())
                     },
                 )
                 .unwrap();
@@ -2011,9 +1857,9 @@ mod test {
         let mut fifo = Vec::new();
         for _ in 0..4 {
             socket
-                .dispatch_with_policy(cx, EgressQueuePolicy::Fifo, |_, _, (_, _, payload)| {
+                .dispatch_keyed(cx, None, |_, _, (_, _, payload)| {
                     fifo.push(payload.to_vec());
-                    Result::<(), ()>::Ok(())
+                    Result::<(), KeyedEmitError<()>>::Ok(())
                 })
                 .unwrap();
         }

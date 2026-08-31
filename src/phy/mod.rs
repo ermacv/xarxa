@@ -18,9 +18,11 @@ This module provides implementations of [Driver]:
 #[cfg(feature = "packetmeta-timestamp")]
 pub use xarxa_driver::TxTimestamp;
 pub use xarxa_driver::{
-    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, PacketMeta, RxToken, Timestamp,
-    TxToken,
+    Checksum, ChecksumCapabilities, Device, DeviceCapabilities, EgressQueuePolicy, PacketMeta,
+    RxToken, Timestamp, TxToken,
 };
+#[cfg(feature = "tx-egress-metadata")]
+pub use xarxa_driver::{EgressHardwareAddress, EgressMeta, KeyedTxToken};
 
 /// Type of medium of a driver, as reported in [`DeviceCapabilities::medium`].
 ///

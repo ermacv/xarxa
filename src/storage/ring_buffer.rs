@@ -109,6 +109,28 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
     fn get_idx_unchecked(&self, idx: usize) -> usize {
         (self.read_at + idx) % self.capacity()
     }
+
+    /// Access the underlying storage by physical index without applying ring
+    /// ownership. Packet-slot storage uses this only while the ring length
+    /// remains zero and maintains its own typed ownership graph.
+    pub(crate) fn storage(&self, index: usize) -> Option<&T> {
+        self.storage.get(index)
+    }
+
+    /// Mutable counterpart of [`Self::storage`].
+    pub(crate) fn storage_mut(&mut self, index: usize) -> Option<&mut T> {
+        self.storage.get_mut(index)
+    }
+
+    /// Return one physical storage range without applying ring ownership.
+    pub(crate) fn storage_range_mut(&mut self, offset: usize, size: usize) -> Option<&mut [T]> {
+        self.storage.get_mut(offset..offset.checked_add(size)?)
+    }
+
+    /// Immutable counterpart of [`Self::storage_range_mut`].
+    pub(crate) fn storage_range(&self, offset: usize, size: usize) -> Option<&[T]> {
+        self.storage.get(offset..offset.checked_add(size)?)
+    }
 }
 
 /// This is the "discrete" ring buffer interface: it operates with single elements,
@@ -367,6 +389,30 @@ impl<'a, T: 'a> RingBuffer<'a, T> {
         }
 
         &self.storage[start_at..start_at + size]
+    }
+
+    /// Return the largest mutable contiguous slice of allocated buffer
+    /// elements starting at the given offset past the first allocated element,
+    /// and up to the given size.
+    #[must_use]
+    pub fn get_allocated_mut(&mut self, offset: usize, mut size: usize) -> &mut [T] {
+        let start_at = self.get_idx(offset);
+        // We can't write past the end of allocated data.
+        if offset > self.length {
+            return &mut self.storage[0..0];
+        }
+        // We can't write more than we have allocated.
+        let clamped_length = self.length - offset;
+        if size > clamped_length {
+            size = clamped_length
+        }
+        // We can't contiguously cross the end of the storage.
+        let until_end = self.capacity() - start_at;
+        if size > until_end {
+            size = until_end
+        }
+
+        &mut self.storage[start_at..start_at + size]
     }
 
     /// Read as many elements from allocated buffer elements into the given slice
@@ -747,6 +793,22 @@ mod test {
         let len_enqueued = ring.enqueue_slice(b"abcd");
         assert_eq!(ring.get_allocated(4, 8), b"ijkl");
         assert_eq!(len_enqueued, 4);
+    }
+
+    #[test]
+    fn test_buffer_get_allocated_mut() {
+        let mut ring = RingBuffer::new(*b"........");
+        assert_eq!(ring.enqueue_slice(b"abcdef"), 6);
+        ring.dequeue_allocated(4);
+        assert_eq!(ring.enqueue_slice(b"ghij"), 4);
+
+        ring.get_allocated_mut(0, 2).copy_from_slice(b"EF");
+        ring.get_allocated_mut(2, 2).copy_from_slice(b"GH");
+        ring.get_allocated_mut(4, 2).copy_from_slice(b"IJ");
+
+        let mut data = [0; 6];
+        assert_eq!(ring.read_allocated(0, &mut data), 6);
+        assert_eq!(&data, b"EFGHIJ");
     }
 
     #[test]

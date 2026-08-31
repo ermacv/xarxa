@@ -33,6 +33,25 @@ mod waker;
 #[cfg(feature = "async")]
 pub(crate) use self::waker::WakerRegistration;
 
+/// Result of attempting to emit one packet selected by an egress key.
+///
+/// This is socket-protocol independent: non-UDP sockets also use keyed device
+/// admission when the driver exposes resolved egress metadata.
+pub(crate) enum KeyedEmitError<E> {
+    /// This key has no current scheduler grant; another key may progress.
+    KeyDeferred,
+    /// No key can progress, or packet construction failed globally.
+    Global(E),
+}
+
+/// Terminal result after a bounded keyed dispatch attempt.
+pub(crate) enum KeyedDispatchError<E> {
+    /// Every currently active key was deferred once.
+    AllKeysDeferred,
+    /// A global device or protocol error stopped dispatch.
+    Global(E),
+}
+
 /// Gives an indication on the next time the socket should be polled.
 #[derive(Debug, PartialOrd, Ord, PartialEq, Eq, Clone, Copy)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]

@@ -879,6 +879,84 @@ fn test_packet_len(#[case] medium: Medium) {
     }
 }
 
+#[test]
+#[cfg(all(feature = "tx-egress-metadata", feature = "medium-ethernet"))]
+fn resolved_ethernet_egress_is_used_without_a_second_lookup() {
+    use core::cell::Cell;
+
+    use crate::phy::{EgressHardwareAddress, EgressMeta};
+
+    let (mut iface, _, _) = setup(Medium::Ethernet);
+    let destination_ip = Ipv4Address::new(192, 168, 1, 2);
+    let destination_mac = EthernetAddress::from_bytes(&[0x02, 0, 0, 0, 0, 2]);
+    iface.inner.neighbor_cache.fill(
+        IpAddress::Ipv4(destination_ip),
+        HardwareAddress::Ethernet(destination_mac),
+        Instant::ZERO,
+    );
+
+    struct OrderingToken<'a> {
+        phase: &'a Cell<u8>,
+        emitted_destination: &'a Cell<Option<[u8; 6]>>,
+    }
+
+    impl TxToken for OrderingToken<'_> {
+        fn set_meta(&mut self, _meta: PacketMeta) {
+            assert_eq!(self.phase.replace(1), 0, "packet metadata is first");
+        }
+
+        fn consume<R, F>(self, len: usize, f: F) -> R
+        where
+            F: FnOnce(&mut [u8]) -> R,
+        {
+            assert_eq!(self.phase.replace(2), 1, "emission follows packet metadata");
+            let mut bytes = [0_u8; 1536];
+            let result = f(&mut bytes[..len]);
+            let frame = EthernetFrame::new_checked(&bytes[..len]).expect("emitted Ethernet frame");
+            self.emitted_destination.set(Some(frame.dst_addr().0));
+            result
+        }
+    }
+
+    let phase = Cell::new(0);
+    let emitted_destination = Cell::new(None);
+    let udp_repr = UdpRepr {
+        src_port: 12345,
+        dst_port: 54321,
+    };
+    let payload = [0x5a; 4];
+    let packet = Packet::new_ipv4(
+        Ipv4Repr {
+            src_addr: Ipv4Address::new(192, 168, 1, 1),
+            dst_addr: destination_ip,
+            next_header: IpProtocol::Udp,
+            payload_len: udp_repr.header_len() + payload.len(),
+            hop_limit: 64,
+        },
+        IpPayload::Udp(udp_repr, &payload),
+    );
+
+    iface
+        .inner
+        .dispatch_ip_resolved(
+            OrderingToken {
+                phase: &phase,
+                emitted_destination: &emitted_destination,
+            },
+            PacketMeta::default(),
+            packet,
+            &mut iface.fragmenter,
+            EgressMeta {
+                destination: EgressHardwareAddress::Ethernet(destination_mac.0),
+                traffic_class: 0,
+            },
+        )
+        .expect("known neighbor dispatches");
+
+    assert_eq!(phase.get(), 2);
+    assert_eq!(emitted_destination.get(), Some(destination_mac.0));
+}
+
 /// Check no reply is emitted when using a raw socket
 #[cfg(feature = "socket-raw")]
 fn check_no_reply_raw_socket(medium: Medium, frame: &crate::wire::ipv4::Packet<&[u8]>) {

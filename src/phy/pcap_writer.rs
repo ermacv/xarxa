@@ -217,6 +217,19 @@ where
             clock,
         })
     }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+        let sink = &self.sink;
+        let mode = self.mode;
+        let clock = self.clock;
+        self.lower.transmit_for(egress).map(move |token| TxToken {
+            token,
+            sink,
+            mode,
+            clock,
+        })
+    }
 }
 
 #[doc(hidden)]

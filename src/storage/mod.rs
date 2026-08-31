@@ -10,6 +10,8 @@ mod packet_buffer;
 mod ring_buffer;
 
 pub use self::assembler::Assembler;
+#[cfg(feature = "socket-udp")]
+pub(crate) use self::packet_buffer::PacketHandle;
 pub use self::packet_buffer::{PacketBuffer, PacketMetadata};
 pub use self::ring_buffer::RingBuffer;
 

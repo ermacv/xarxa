@@ -20,6 +20,8 @@ defmt = ["dep:defmt"]
 
 # Enable the `PacketMeta::id` field.
 "packetmeta-id" = []
+# Expose the stack-resolved egress link destination to a lazy TX token.
+"tx-egress-metadata" = []
 # Enable the `PacketMeta::timestamp` and `PacketMeta::request_timestamp` fields, and
 # `Device::poll_tx_timestamp`.
 #

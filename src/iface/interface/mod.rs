@@ -44,8 +44,12 @@ use crate::config::{
 use crate::iface::Routes;
 #[cfg(feature = "proto-ipv6-slaac")]
 use crate::iface::Slaac;
+#[cfg(feature = "tx-egress-metadata")]
+use crate::phy::EgressQueuePolicy;
 use crate::phy::PacketMeta;
 use crate::phy::{ChecksumCapabilities, Device, DeviceCapabilities, Medium, RxToken, TxToken};
+#[cfg(feature = "tx-egress-metadata")]
+use crate::phy::{EgressHardwareAddress, EgressMeta, KeyedTxToken};
 use crate::rand::Rand;
 use crate::socket::*;
 use crate::time::{Duration, Instant};
@@ -155,8 +159,114 @@ pub struct InterfaceInner {
     #[cfg(feature = "proto-ipv6-slaac")]
     slaac_updated: Instant,
     routes: Routes,
+    #[cfg(feature = "tx-egress-metadata")]
+    resolved_egress_burst: ResolvedEgressBurstState,
     #[cfg(feature = "multicast")]
     multicast: multicast::State,
+}
+
+/// Interface-wide arbitration for stack-resolved egress keys.
+///
+/// A UDP socket owns its packet arena and its per-key FIFO index, but the
+/// interface owns the set of sockets. Keeping the active burst here prevents
+/// two independently well-ordered sockets from being admitted to the device
+/// as `A, B, A, B, ...`.
+#[cfg(feature = "tx-egress-metadata")]
+#[derive(Default)]
+struct ResolvedEgressBurstState {
+    current: Option<EgressMeta>,
+    run_length: u8,
+    max_packets: u8,
+    epoch: u32,
+    contended: bool,
+    granted_in_round: bool,
+    deferred_in_round: Option<EgressMeta>,
+    quota_blocked_in_round: bool,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl ResolvedEgressBurstState {
+    fn configure(&mut self, max_packets: u8, epoch: u32) {
+        if self.max_packets != max_packets || self.epoch != epoch {
+            *self = Self {
+                max_packets,
+                epoch,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn prepare(&mut self, egress: EgressMeta, max_packets: u8) -> bool {
+        if max_packets == 0 {
+            return true;
+        }
+        debug_assert_eq!(self.max_packets, max_packets);
+
+        let Some(current) = self.current else {
+            return true;
+        };
+        if current == egress {
+            if self.run_length < max_packets || !self.contended {
+                return true;
+            }
+            self.quota_blocked_in_round = true;
+            return false;
+        }
+
+        self.contended = true;
+        if self.run_length >= max_packets {
+            return true;
+        }
+        if self.deferred_in_round.is_none() {
+            self.deferred_in_round = Some(egress);
+        }
+        false
+    }
+
+    fn commit(&mut self, egress: EgressMeta, max_packets: u8) {
+        debug_assert_ne!(max_packets, 0);
+        if self.current != Some(egress) {
+            self.current = Some(egress);
+            self.run_length = 0;
+            self.contended = false;
+        } else if self.run_length >= max_packets && !self.contended {
+            // An uncontended stream must not pay for an empty scheduler round
+            // merely because it crossed an accounting quantum.
+            self.run_length = 0;
+        }
+        self.run_length = self.run_length.saturating_add(1);
+        self.granted_in_round = true;
+    }
+
+    /// End one complete scan of all socket egress queues.
+    ///
+    /// Returns true when the selected key changed without an emitted packet,
+    /// so the caller should immediately scan the sockets once more.
+    fn finish_round(&mut self, globally_exhausted: bool) -> bool {
+        let mut retry = false;
+        if !globally_exhausted && !self.granted_in_round {
+            if let Some(deferred) = self.deferred_in_round {
+                self.current = Some(deferred);
+                self.run_length = 0;
+                self.contended = false;
+                retry = true;
+            } else if self.quota_blocked_in_round {
+                // A previously observed contender disappeared. Let the only
+                // remaining key resume instead of retaining a stale defer.
+                self.run_length = 0;
+                self.contended = false;
+                retry = true;
+            }
+        }
+        self.granted_in_round = false;
+        self.deferred_in_round = None;
+        self.quota_blocked_in_round = false;
+        retry
+    }
+
+    fn disable(&mut self) {
+        *self = Self::default();
+    }
 }
 
 /// Configuration structure used for creating a network interface.
@@ -268,6 +378,8 @@ impl Interface {
                 ip_addrs: Vec::new(),
                 any_ip: false,
                 routes: Routes::new(),
+                #[cfg(feature = "tx-egress-metadata")]
+                resolved_egress_burst: ResolvedEgressBurstState::default(),
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
                 neighbor_cache: NeighborCache::new(),
                 #[cfg(feature = "multicast")]
@@ -701,13 +813,34 @@ impl Interface {
         sockets: &mut SocketSet<'_>,
     ) -> PollResult {
         let _caps = device.capabilities();
+        #[cfg(any(feature = "socket-udp", feature = "tx-egress-metadata"))]
+        let egress_queue_policy = device.egress_queue_policy();
+        #[cfg(feature = "tx-egress-metadata")]
+        let resolved_burst_max = match egress_queue_policy {
+            EgressQueuePolicy::ResolvedEgressBurst {
+                max_packets, epoch, ..
+            } if max_packets != 0 => {
+                self.inner
+                    .resolved_egress_burst
+                    .configure(max_packets, epoch);
+                Some(max_packets)
+            }
+            _ => {
+                self.inner.resolved_egress_burst.disable();
+                None
+            }
+        };
 
         enum EgressError {
             Exhausted,
             Dispatch,
+            #[cfg(feature = "tx-egress-metadata")]
+            AllKeysDeferred,
         }
 
         let mut result = PollResult::None;
+        #[cfg(feature = "tx-egress-metadata")]
+        let mut globally_exhausted = false;
         for item in sockets.items_mut() {
             if !item
                 .meta
@@ -719,43 +852,115 @@ impl Interface {
             let mut neighbor_addr = None;
             let mut respond = |inner: &mut InterfaceInner, meta: PacketMeta, response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
-                let t = device.transmit().ok_or_else(|| {
+                #[cfg(feature = "tx-egress-metadata")]
+                let resolved_egress = inner.resolved_egress_meta(&response.ip_repr().dst_addr());
+                #[cfg(feature = "tx-egress-metadata")]
+                if let (Some(egress), Some(max_packets)) = (resolved_egress, resolved_burst_max)
+                    && !inner.resolved_egress_burst.prepare(egress, max_packets)
+                {
+                    return Err(KeyedEmitError::KeyDeferred);
+                }
+                #[cfg(feature = "tx-egress-metadata")]
+                let admission = match resolved_egress {
+                    Some(egress) => device.transmit_for(egress),
+                    None => match device.transmit() {
+                        Some(token) => KeyedTxToken::Granted(token),
+                        None => KeyedTxToken::GlobalExhausted,
+                    },
+                };
+                #[cfg(not(feature = "tx-egress-metadata"))]
+                let admission = match device.transmit() {
+                    Some(token) => Some(token),
+                    None => None,
+                };
+
+                #[cfg(feature = "tx-egress-metadata")]
+                let t = match admission {
+                    KeyedTxToken::Granted(token) => {
+                        if let (Some(egress), Some(max_packets)) =
+                            (resolved_egress, resolved_burst_max)
+                        {
+                            inner.resolved_egress_burst.commit(egress, max_packets);
+                        }
+                        token
+                    }
+                    KeyedTxToken::GlobalExhausted => {
+                        net_debug!("failed to transmit IP: device globally exhausted");
+                        return Err(KeyedEmitError::Global(EgressError::Exhausted));
+                    }
+                    KeyedTxToken::KeyDeferred => return Err(KeyedEmitError::KeyDeferred),
+                };
+                #[cfg(not(feature = "tx-egress-metadata"))]
+                let t = admission.ok_or_else(|| {
                     net_debug!("failed to transmit IP: device exhausted");
                     EgressError::Exhausted
                 })?;
 
-                inner
-                    .dispatch_ip(t, meta, response, &mut self.fragmenter)
-                    .map_err(|_| EgressError::Dispatch)?;
+                #[cfg(feature = "tx-egress-metadata")]
+                let dispatched = match resolved_egress {
+                    Some(egress) => {
+                        inner.dispatch_ip_resolved(t, meta, response, &mut self.fragmenter, egress)
+                    }
+                    None => inner.dispatch_ip(t, meta, response, &mut self.fragmenter),
+                };
+                #[cfg(not(feature = "tx-egress-metadata"))]
+                let dispatched = inner.dispatch_ip(t, meta, response, &mut self.fragmenter);
+
+                dispatched.map_err(|_| {
+                    #[cfg(feature = "tx-egress-metadata")]
+                    {
+                        KeyedEmitError::Global(EgressError::Dispatch)
+                    }
+                    #[cfg(not(feature = "tx-egress-metadata"))]
+                    {
+                        EgressError::Dispatch
+                    }
+                })?;
 
                 result = PollResult::SocketStateChanged;
 
                 Ok(())
             };
 
+            macro_rules! respond_global {
+                ($inner:expr, $meta:expr, $packet:expr) => {{
+                    #[cfg(feature = "tx-egress-metadata")]
+                    {
+                        respond($inner, $meta, $packet).map_err(|error| match error {
+                            KeyedEmitError::KeyDeferred => EgressError::AllKeysDeferred,
+                            KeyedEmitError::Global(error) => error,
+                        })
+                    }
+                    #[cfg(not(feature = "tx-egress-metadata"))]
+                    {
+                        respond($inner, $meta, $packet)
+                    }
+                }};
+            }
+
             let result = match &mut item.socket {
                 #[cfg(feature = "socket-raw")]
                 Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, (ip, raw)| {
-                    respond(
+                    respond_global!(
                         inner,
                         PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Raw(raw)),
+                        Packet::new(ip, IpPayload::Raw(raw))
                     )
                 }),
                 #[cfg(feature = "socket-icmp")]
                 Socket::Icmp(socket) => {
                     socket.dispatch(&mut self.inner, |inner, response| match response {
                         #[cfg(feature = "proto-ipv4")]
-                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond(
+                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond_global!(
                             inner,
                             PacketMeta::default(),
-                            Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr)),
+                            Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr))
                         ),
                         #[cfg(feature = "proto-ipv6")]
-                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond(
+                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond_global!(
                             inner,
                             PacketMeta::default(),
-                            Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr)),
+                            Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr))
                         ),
                         #[allow(unreachable_patterns)]
                         _ => unreachable!(),
@@ -763,40 +968,72 @@ impl Interface {
                 }
                 #[cfg(feature = "socket-udp")]
                 Socket::Udp(socket) => {
-                    socket.dispatch(&mut self.inner, |inner, meta, (ip, udp, payload)| {
-                        respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
-                    })
+                    #[cfg(feature = "tx-egress-metadata")]
+                    {
+                        socket
+                            .dispatch_with_keyed_policy(
+                                &mut self.inner,
+                                egress_queue_policy,
+                                |inner, meta, (ip, udp, payload)| {
+                                    respond(
+                                        inner,
+                                        meta,
+                                        Packet::new(ip, IpPayload::Udp(udp, payload)),
+                                    )
+                                },
+                            )
+                            .map_err(|error| match error {
+                                KeyedDispatchError::AllKeysDeferred => EgressError::AllKeysDeferred,
+                                KeyedDispatchError::Global(error) => error,
+                            })
+                    }
+                    #[cfg(not(feature = "tx-egress-metadata"))]
+                    {
+                        socket.dispatch_with_policy(
+                            &mut self.inner,
+                            egress_queue_policy,
+                            |inner, meta, (ip, udp, payload)| {
+                                respond(inner, meta, Packet::new(ip, IpPayload::Udp(udp, payload)))
+                            },
+                        )
+                    }
                 }
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond(
+                    respond_global!(
                         inner,
                         PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Tcp(tcp)),
+                        Packet::new(ip, IpPayload::Tcp(tcp))
                     )
                 }),
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
                     socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
-                        respond(
+                        respond_global!(
                             inner,
                             PacketMeta::default(),
-                            Packet::new_ipv4(ip, IpPayload::Dhcpv4(udp, dhcp)),
+                            Packet::new_ipv4(ip, IpPayload::Dhcpv4(udp, dhcp))
                         )
                     })
                 }
                 #[cfg(feature = "socket-dns")]
                 Socket::Dns(socket) => socket.dispatch(&mut self.inner, |inner, (ip, udp, dns)| {
-                    respond(
+                    respond_global!(
                         inner,
                         PacketMeta::default(),
-                        Packet::new(ip, IpPayload::Udp(udp, dns)),
+                        Packet::new(ip, IpPayload::Udp(udp, dns))
                     )
                 }),
             };
 
             match result {
-                Err(EgressError::Exhausted) => break, // Driver buffer full.
+                Err(EgressError::Exhausted) => {
+                    #[cfg(feature = "tx-egress-metadata")]
+                    {
+                        globally_exhausted = true;
+                    }
+                    break; // Driver buffer full.
+                }
                 Err(EgressError::Dispatch) => {
                     // `NeighborCache` already takes care of rate limiting the neighbor discovery
                     // requests from the socket. However, without an additional rate limiting
@@ -807,8 +1044,19 @@ impl Interface {
                         neighbor_addr.expect("non-IP response packet"),
                     );
                 }
+                #[cfg(feature = "tx-egress-metadata")]
+                Err(EgressError::AllKeysDeferred) => {}
                 Ok(()) => {}
             }
+        }
+        #[cfg(feature = "tx-egress-metadata")]
+        if resolved_burst_max.is_some()
+            && self
+                .inner
+                .resolved_egress_burst
+                .finish_round(globally_exhausted)
+        {
+            result = PollResult::SocketStateChanged;
         }
         result
     }
@@ -1052,6 +1300,48 @@ impl InterfaceInner {
         }
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn resolved_egress_meta(&self, addr: &IpAddress) -> Option<EgressMeta> {
+        if !matches!(self.medium, Medium::Ethernet) {
+            return None;
+        }
+        let destination = if self.is_broadcast(addr) {
+            EthernetAddress::BROADCAST
+        } else if addr.is_multicast() {
+            match *addr {
+                #[cfg(feature = "proto-ipv4")]
+                IpAddress::Ipv4(addr) => {
+                    let bytes = addr.octets();
+                    EthernetAddress::from_bytes(&[
+                        0x01,
+                        0x00,
+                        0x5e,
+                        bytes[1] & 0x7f,
+                        bytes[2],
+                        bytes[3],
+                    ])
+                }
+                #[cfg(feature = "proto-ipv6")]
+                IpAddress::Ipv6(addr) => {
+                    let bytes = addr.octets();
+                    EthernetAddress::from_bytes(&[
+                        0x33, 0x33, bytes[12], bytes[13], bytes[14], bytes[15],
+                    ])
+                }
+            }
+        } else {
+            let routed = self.route(addr, self.now)?;
+            match self.neighbor_cache.lookup(&routed, self.now) {
+                NeighborAnswer::Found(HardwareAddress::Ethernet(address)) => address,
+                _ => return None,
+            }
+        };
+        Some(EgressMeta {
+            destination: EgressHardwareAddress::Ethernet(destination.0),
+            traffic_class: 0,
+        })
+    }
+
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn lookup_hardware_addr<Tx>(
         &mut self,
@@ -1207,12 +1497,48 @@ impl InterfaceInner {
 
     fn dispatch_ip<Tx: TxToken>(
         &mut self,
+        tx_token: Tx,
+        meta: PacketMeta,
+        packet: Packet,
+        frag: &mut Fragmenter,
+    ) -> Result<(), DispatchError> {
+        self.dispatch_ip_to(tx_token, meta, packet, frag, None)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn dispatch_ip_resolved<Tx: TxToken>(
+        &mut self,
+        tx_token: Tx,
+        meta: PacketMeta,
+        packet: Packet,
+        frag: &mut Fragmenter,
+        egress: EgressMeta,
+    ) -> Result<(), DispatchError> {
+        let destination = match egress.destination {
+            #[cfg(feature = "medium-ethernet")]
+            EgressHardwareAddress::Ethernet(address) => {
+                Some(HardwareAddress::Ethernet(EthernetAddress(address)))
+            }
+            #[cfg(feature = "medium-ieee802154")]
+            EgressHardwareAddress::Ieee802154(address) => Some(HardwareAddress::Ieee802154(
+                Ieee802154Address::Extended(address),
+            )),
+            #[cfg(feature = "medium-ip")]
+            EgressHardwareAddress::Ip => Some(HardwareAddress::Ip),
+            _ => None,
+        };
+        self.dispatch_ip_to(tx_token, meta, packet, frag, destination)
+    }
+
+    fn dispatch_ip_to<Tx: TxToken>(
+        &mut self,
         // NOTE(unused_mut): tx_token isn't always mutated, depending on
         // the feature set that is used.
         #[allow(unused_mut)] mut tx_token: Tx,
         meta: PacketMeta,
         packet: Packet,
         frag: &mut Fragmenter,
+        resolved_destination: Option<HardwareAddress>,
     ) -> Result<(), DispatchError> {
         let mut ip_repr = packet.ip_repr();
         assert!(!ip_repr.dst_addr().is_unspecified());
@@ -1248,12 +1574,14 @@ impl InterfaceInner {
         // If the medium is Ethernet, then we need to retrieve the destination hardware address.
         #[cfg(feature = "medium-ethernet")]
         let (dst_hardware_addr, mut tx_token) = match self.medium {
-            Medium::Ethernet => {
-                match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
+            Medium::Ethernet => match resolved_destination {
+                Some(HardwareAddress::Ethernet(address)) => (address, tx_token),
+                Some(_) => unreachable!("resolved egress medium matches the interface"),
+                None => match self.lookup_hardware_addr(tx_token, &ip_repr.dst_addr(), frag)? {
                     (HardwareAddress::Ethernet(addr), tx_token) => (addr, tx_token),
                     (_, _) => unreachable!(),
-                }
-            }
+                },
+            },
             _ => (EthernetAddress([0; 6]), tx_token),
         };
 

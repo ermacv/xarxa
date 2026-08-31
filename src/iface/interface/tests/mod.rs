@@ -20,6 +20,157 @@ use crate::phy::ChecksumCapabilities;
 use crate::phy::Loopback;
 use crate::time::Instant;
 
+#[cfg(feature = "tx-egress-metadata")]
+fn resolved_key(last_octet: u8) -> EgressMeta {
+    EgressMeta {
+        destination: EgressHardwareAddress::Ethernet([2, 0, 0, 0, 0, last_octet]),
+        traffic_class: 0,
+    }
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+#[test]
+fn interface_wide_resolved_burst_defers_a_second_socket_until_ba32() {
+    let a = resolved_key(1);
+    let b = resolved_key(2);
+    let mut burst = ResolvedEgressBurstState::default();
+    burst.configure(32, 1);
+
+    for _ in 0..31 {
+        assert!(burst.prepare(a, 32));
+        burst.commit(a, 32);
+        assert!(!burst.prepare(b, 32));
+        assert!(!burst.finish_round(false));
+    }
+
+    assert!(burst.prepare(a, 32));
+    burst.commit(a, 32);
+    assert!(burst.prepare(b, 32));
+    burst.commit(b, 32);
+    assert!(!burst.finish_round(false));
+    assert_eq!(burst.current, Some(b));
+    assert_eq!(burst.run_length, 1);
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+#[test]
+fn interface_wide_resolved_burst_rotates_when_current_socket_empties_early() {
+    let a = resolved_key(1);
+    let b = resolved_key(2);
+    let mut burst = ResolvedEgressBurstState::default();
+    burst.configure(32, 1);
+
+    for _ in 0..3 {
+        assert!(burst.prepare(a, 32));
+        burst.commit(a, 32);
+        assert!(!burst.prepare(b, 32));
+        assert!(!burst.finish_round(false));
+    }
+
+    assert!(!burst.prepare(b, 32));
+    assert!(burst.finish_round(false));
+    assert_eq!(burst.current, Some(b));
+    assert!(burst.prepare(b, 32));
+    burst.commit(b, 32);
+    assert!(!burst.finish_round(false));
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+#[test]
+fn uncontended_resolved_burst_has_no_empty_round_at_ba32() {
+    let a = resolved_key(1);
+    let mut burst = ResolvedEgressBurstState::default();
+    burst.configure(32, 1);
+
+    for _ in 0..64 {
+        assert!(burst.prepare(a, 32));
+        burst.commit(a, 32);
+        assert!(!burst.finish_round(false));
+    }
+
+    assert_eq!(burst.current, Some(a));
+    assert_eq!(burst.run_length, 32);
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+#[test]
+fn global_exhaustion_does_not_rotate_the_resolved_burst() {
+    let a = resolved_key(1);
+    let b = resolved_key(2);
+    let mut burst = ResolvedEgressBurstState::default();
+    burst.configure(32, 1);
+
+    assert!(burst.prepare(a, 32));
+    burst.commit(a, 32);
+    assert!(!burst.prepare(b, 32));
+    assert!(!burst.finish_round(true));
+
+    assert_eq!(burst.current, Some(a));
+    assert_eq!(burst.run_length, 1);
+    assert!(burst.contended);
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+#[test]
+fn resolved_burst_epoch_discards_the_previous_lifecycle_phase() {
+    let a = resolved_key(1);
+    let b = resolved_key(2);
+    let mut burst = ResolvedEgressBurstState::default();
+    burst.configure(32, 7);
+
+    for _ in 0..17 {
+        assert!(burst.prepare(a, 32));
+        burst.commit(a, 32);
+        assert!(!burst.prepare(b, 32));
+        assert!(!burst.finish_round(false));
+    }
+    assert_eq!(burst.current, Some(a));
+    assert_eq!(burst.run_length, 17);
+
+    burst.configure(32, 8);
+    assert_eq!(burst.current, None);
+    assert_eq!(burst.run_length, 0);
+    assert!(!burst.contended);
+    assert!(burst.prepare(b, 32));
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+#[test]
+fn sparse_peer_sends_a_partial_run_without_waiting_for_ba32() {
+    let saturated = resolved_key(1);
+    let sparse = resolved_key(2);
+    let mut burst = ResolvedEgressBurstState::default();
+    burst.configure(32, 1);
+
+    // The sparse peer becomes contended during the saturated peer's current
+    // bounded service quantum.
+    for _ in 0..31 {
+        assert!(burst.prepare(saturated, 32));
+        burst.commit(saturated, 32);
+        assert!(!burst.prepare(sparse, 32));
+        assert!(!burst.finish_round(false));
+    }
+    assert!(burst.prepare(saturated, 32));
+    burst.commit(saturated, 32);
+
+    // It owns only two packets. Both are admitted immediately; BA32 is the
+    // maximum run, never a minimum fill threshold.
+    for _ in 0..2 {
+        assert!(burst.prepare(sparse, 32));
+        burst.commit(sparse, 32);
+        assert!(!burst.prepare(saturated, 32));
+        assert!(!burst.finish_round(false));
+    }
+
+    // Once the sparse queue is empty, one complete interface scan changes
+    // ownership back to the still-backlogged peer and asks for an immediate
+    // retry. No timer or additional packet is required.
+    assert!(!burst.prepare(saturated, 32));
+    assert!(burst.finish_round(false));
+    assert_eq!(burst.current, Some(saturated));
+    assert!(burst.prepare(saturated, 32));
+}
+
 #[allow(unused)]
 fn fill_slice(s: &mut [u8], val: u8) {
     for x in s.iter_mut() {

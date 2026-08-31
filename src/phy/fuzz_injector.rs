@@ -88,6 +88,14 @@ where
             token: token,
         })
     }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_for(&mut self, egress: phy::EgressMeta) -> phy::KeyedTxToken<Self::TxToken<'_>> {
+        self.inner.transmit_for(egress).map(|token| TxToken {
+            fuzzer: &mut self.fuzz_tx,
+            token,
+        })
+    }
 }
 
 #[doc(hidden)]

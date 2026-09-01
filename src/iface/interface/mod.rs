@@ -10,6 +10,11 @@ mod ethernet;
 #[cfg(feature = "medium-ieee802154")]
 mod ieee802154;
 
+// Phase-one host model. Phase two makes this production state when protocol
+// providers can own its affine handles without rescanning packet payloads.
+#[cfg(all(test, feature = "tx-egress-metadata"))]
+mod egress_catalog;
+
 #[cfg(feature = "proto-ipv4")]
 mod ipv4;
 #[cfg(feature = "proto-ipv6")]

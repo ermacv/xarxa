@@ -23,7 +23,8 @@ pub use xarxa_driver::{
 };
 #[cfg(feature = "tx-egress-metadata")]
 pub use xarxa_driver::{
-    EgressAdmission, EgressHardwareAddress, EgressKey, EgressRoute, EgressSchedule,
+    EgressAdmission, EgressDemand, EgressDemandId, EgressDemandLevel, EgressDemandUpdate,
+    EgressHardwareAddress, EgressKey, EgressRoute, EgressSchedule,
 };
 
 /// Type of medium of a driver, as reported in [`DeviceCapabilities::medium`].
@@ -93,6 +94,14 @@ impl Medium {
 ))]
 mod sys;
 
+#[cfg(all(
+    test,
+    feature = "std",
+    feature = "alloc",
+    feature = "medium-ethernet",
+    feature = "tx-egress-metadata"
+))]
+mod egress_forwarding_tests;
 mod fault_injector;
 #[cfg(feature = "alloc")]
 mod fuzz_injector;

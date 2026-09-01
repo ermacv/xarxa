@@ -62,6 +62,8 @@ pub struct TestingDevice {
     medium: Medium,
     #[cfg(feature = "tx-egress-metadata")]
     egress_key_override: Option<phy::EgressKey>,
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) egress_demand_updates: Vec<phy::EgressDemandUpdate>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -90,6 +92,8 @@ impl TestingDevice {
             medium,
             #[cfg(feature = "tx-egress-metadata")]
             egress_key_override: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            egress_demand_updates: Vec::new(),
         }
     }
 
@@ -130,6 +134,11 @@ impl Device for TestingDevice {
     fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
         self.egress_key_override
             .unwrap_or_else(|| phy::EgressKey::from_route(route))
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn update_egress_demand(&mut self, update: phy::EgressDemandUpdate) {
+        self.egress_demand_updates.push(update);
     }
 }
 

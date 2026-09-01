@@ -298,6 +298,11 @@ impl<D: Device> Device for FaultInjector<D> {
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.inner.egress_schedule()
     }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn update_egress_demand(&mut self, update: phy::EgressDemandUpdate) {
+        self.inner.update_egress_demand(update)
+    }
 }
 
 #[doc(hidden)]

@@ -240,6 +240,11 @@ where
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.lower.egress_schedule()
     }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn update_egress_demand(&mut self, update: phy::EgressDemandUpdate) {
+        self.lower.update_egress_demand(update)
+    }
 }
 
 #[doc(hidden)]

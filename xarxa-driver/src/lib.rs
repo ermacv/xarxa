@@ -3,7 +3,7 @@
 #![doc = include_str!("../README.md")]
 
 #[cfg(feature = "tx-egress-metadata")]
-use core::num::NonZeroU8;
+use core::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 
 /// Type of medium of a device.
 ///
@@ -212,6 +212,143 @@ impl EgressSchedule {
     pub const fn epoch(self) -> u32 {
         self.epoch
     }
+}
+
+/// Stable identity of one nonempty egress-demand lifetime.
+///
+/// `schedule_epoch` is owned by the device and invalidates route-to-key
+/// classification. `activation` is owned by the stack and changes whenever a
+/// key becomes nonempty after being empty. A grant or asynchronous policy
+/// observation must match both values; a bare [`EgressKey`] is not sufficient
+/// to authorize a later packet.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct EgressDemandId {
+    schedule_epoch: u32,
+    activation: NonZeroU32,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressDemandId {
+    /// Construct one stack-owned demand identity.
+    pub const fn new(schedule_epoch: u32, activation: NonZeroU32) -> Self {
+        Self {
+            schedule_epoch,
+            activation,
+        }
+    }
+
+    /// Device-owned route-classification epoch.
+    pub const fn schedule_epoch(self) -> u32 {
+        self.schedule_epoch
+    }
+
+    /// Stack-owned nonempty-lifetime serial.
+    pub const fn activation(self) -> NonZeroU32 {
+        self.activation
+    }
+}
+
+/// Coalesced amount of currently visible work for one egress demand.
+///
+/// `ready_units` is an advisory, saturating point-in-time observation. It is
+/// neither reserved SRAM nor airtime already consumed. `horizon_ready` marks a
+/// device-requested useful queueing watermark; hysteresis may keep it true
+/// while the exact ready count changes, avoiding one cross-owner publication
+/// for every enqueue or dequeue.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct EgressDemandLevel {
+    ready_units: NonZeroU16,
+    horizon_ready: bool,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressDemandLevel {
+    /// Construct one nonempty demand level.
+    pub const fn new(ready_units: NonZeroU16, horizon_ready: bool) -> Self {
+        Self {
+            ready_units,
+            horizon_ready,
+        }
+    }
+
+    /// Bounded point-in-time work estimate.
+    pub const fn ready_units(self) -> NonZeroU16 {
+        self.ready_units
+    }
+
+    /// Whether the queue crossed its useful high watermark and has not yet
+    /// crossed the corresponding low watermark.
+    pub const fn horizon_ready(self) -> bool {
+        self.horizon_ready
+    }
+}
+
+/// Identity and current level of one active generic egress queue.
+///
+/// The key remains opaque to Xarxa. In particular, this value does not expose
+/// Wi-Fi association, TID, BlockAck, rate or airtime policy to the network
+/// stack.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct EgressDemand {
+    id: EgressDemandId,
+    key: EgressKey,
+    level: EgressDemandLevel,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressDemand {
+    /// Construct one active demand observation.
+    pub const fn new(id: EgressDemandId, key: EgressKey, level: EgressDemandLevel) -> Self {
+        Self { id, key, level }
+    }
+
+    /// Nonempty-lifetime identity.
+    pub const fn id(self) -> EgressDemandId {
+        self.id
+    }
+
+    /// Opaque device scheduling key.
+    pub const fn key(self) -> EgressKey {
+        self.key
+    }
+
+    /// Coalesced queue level.
+    pub const fn level(self) -> EgressDemandLevel {
+        self.level
+    }
+}
+
+/// One ordered stack-to-device egress-demand state transition.
+///
+/// A producer publishes [`Self::Reset`] before any activation in a new device
+/// scheduling epoch. [`Self::Active`] represents both empty-to-nonempty
+/// activation and a useful watermark transition for the same demand identity.
+/// [`Self::Inactive`] is terminal for that identity. Consumers must reject an
+/// active or inactive transition from an older schedule epoch.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum EgressDemandUpdate {
+    /// Discard every demand from an older route-classification epoch.
+    Reset {
+        /// New device-owned scheduling epoch.
+        schedule_epoch: u32,
+    },
+    /// Activate a key or update its coalesced useful level.
+    Active(EgressDemand),
+    /// End one exact nonempty lifetime.
+    Inactive {
+        /// Terminal demand identity.
+        id: EgressDemandId,
+        /// Opaque key retained for direct consumer lookup.
+        key: EgressKey,
+    },
 }
 
 /// Metadata associated to a packet.
@@ -518,6 +655,17 @@ pub trait Device {
         None
     }
 
+    /// Observe one coalesced stack-owned egress-demand transition.
+    ///
+    /// This callback does not authorize transmission and does not transfer a
+    /// packet or device credit. Ordinary devices may ignore it. A device which
+    /// implements asynchronous keyed policy can use the ordered lifecycle as
+    /// its control-plane input while [`Self::transmit_for`] remains the final
+    /// synchronous admission boundary.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn update_egress_demand(&mut self, update: EgressDemandUpdate) {}
+
     /// Poll for the timestamp of an already-transmitted packet.
     ///
     /// Returns the transmit timestamp of a packet previously sent with
@@ -581,6 +729,11 @@ impl<T: ?Sized + Device> Device for &mut T {
     #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<EgressSchedule> {
         T::egress_schedule(self)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn update_egress_demand(&mut self, update: EgressDemandUpdate) {
+        T::update_egress_demand(self, update)
     }
 
     #[cfg(feature = "packetmeta-timestamp")]

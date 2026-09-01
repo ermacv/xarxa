@@ -128,13 +128,14 @@ pub struct Interface {
     egress_demands: egress_catalog::EgressDemandCatalog<EGRESS_DEMAND_CATALOG_CAPACITY>,
 }
 
-/// Bounded protocol-provider contributions observed by one interface.
+/// Bounded distinct device keys observed by one interface.
 ///
-/// This bounds metadata, not packet storage. Overflow fails closed by omitting
-/// shadow demand for the excess provider; synchronous `transmit_for` admission
-/// remains authoritative and preserves packet progress.
+/// A SoftAP interface has at most fifteen unicast peers plus one group domain.
+/// Provider/socket count and packet backlog consume no additional catalog
+/// slots. Overflow omits excess shadow demand while synchronous `transmit_for`
+/// admission remains authoritative.
 #[cfg(feature = "tx-egress-metadata")]
-const EGRESS_DEMAND_CATALOG_CAPACITY: usize = 64;
+const EGRESS_DEMAND_CATALOG_CAPACITY: usize = 16;
 
 /// The device independent part of an Ethernet network interface.
 ///
@@ -1117,12 +1118,7 @@ impl Interface {
                             return;
                         };
                         let key = device.egress_key(route);
-                        if let Err(error) =
-                            self.egress_demands
-                                .observe(handle, key, ready_units, |update| {
-                                    device.update_egress_demand(update)
-                                })
-                        {
+                        if let Err(error) = self.egress_demands.observe(handle, key, ready_units) {
                             net_debug!("failed to observe UDP egress demand: {:?}", error);
                         }
                     });
@@ -1131,12 +1127,8 @@ impl Interface {
             }
         }
 
-        if let Err(error) = self
-            .egress_demands
-            .finish_observation(|update| device.update_egress_demand(update))
-        {
-            net_debug!("failed to finish egress demand observation: {:?}", error);
-        }
+        self.egress_demands
+            .finish_observation(|update| device.update_egress_demand(update));
     }
 }
 

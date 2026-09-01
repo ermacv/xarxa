@@ -1,10 +1,10 @@
 //! Interface-owned generic egress-demand lifecycle.
 //!
-//! This is stack state, not radio policy. Multiple protocol providers may
-//! contribute work to the same opaque device key. The catalog gives every
-//! provider an affine handle, aggregates their queue levels into one nonempty
-//! key lifetime, and coalesces packet-frequency changes through a high/low
-//! watermark pair.
+//! Multiple protocol providers may contribute work to the same opaque device
+//! key. Provider queues retain a generation-validated lookup handle, while the
+//! catalog rebuilds aggregate levels from bounded queue metadata once per
+//! interface observation. It retains no per-provider entries and never scans
+//! packet payload.
 
 use core::num::{NonZeroU16, NonZeroU32};
 
@@ -12,21 +12,20 @@ use crate::phy::{
     EgressDemand, EgressDemandId, EgressDemandLevel, EgressDemandUpdate, EgressKey, EgressSchedule,
 };
 
-/// Affine identity of one protocol provider's active contribution.
+/// Cached identity of one aggregate demand slot.
 ///
-/// This handle is stack-local. A radio grant names the aggregate
-/// [`EgressDemandId`], never an individual provider.
+/// This is an O(1) lookup hint, not provider ownership. Provider lifetime
+/// remains in the protocol queue.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct EgressDemandHandle {
-    provider_slot: u16,
-    provider_activation: NonZeroU32,
+    demand_slot: u16,
+    demand_activation: NonZeroU32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum EgressDemandCatalogError {
     NotConfigured,
     Full,
-    StaleHandle,
     ActivationSerialExhausted,
     EpochNotAdvanced,
 }
@@ -35,30 +34,21 @@ pub(super) enum EgressDemandCatalogError {
 struct DemandEntry {
     key: EgressKey,
     id: EgressDemandId,
-    /// Exact aggregate used internally. The published observation saturates.
-    ready_units: u32,
+    committed_ready_units: u32,
+    observed_ready_units: u32,
     horizon_ready: bool,
 }
 
 impl DemandEntry {
-    fn demand(self) -> EgressDemand {
-        let ready_units = NonZeroU16::new(self.ready_units.min(u32::from(u16::MAX)) as u16)
+    fn demand(self, ready_units: u32, horizon_ready: bool) -> EgressDemand {
+        let ready_units = NonZeroU16::new(ready_units.min(u32::from(u16::MAX)) as u16)
             .expect("an active demand is nonempty");
         EgressDemand::new(
             self.id,
             self.key,
-            EgressDemandLevel::new(ready_units, self.horizon_ready),
+            EgressDemandLevel::new(ready_units, horizon_ready),
         )
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ProviderEntry {
-    activation: NonZeroU32,
-    demand_slot: u16,
-    demand_id: EgressDemandId,
-    ready_units: NonZeroU16,
-    observed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,8 +65,6 @@ impl DemandWatermarks {
     }
 
     const fn next_horizon_ready(self, was_ready: bool, ready_units: u32) -> bool {
-        // With a one-unit horizon every nonempty demand is ready. Applying the
-        // generic high/low hysteresis would otherwise alternate at count one.
         if self.high.get() == 1 {
             return true;
         }
@@ -88,20 +76,17 @@ impl DemandWatermarks {
     }
 }
 
-/// Bounded generic demand owners for one Xarxa interface.
+/// Bounded aggregate demand state for one Xarxa interface.
 ///
-/// Empty-to-nonempty provider activation may scan the fixed tables once.
-/// Every later provider mutation uses its affine handle and validates both
-/// the provider activation and aggregate demand identity in O(1). Therefore a
-/// packet-frequency update never searches all active keys. Multiple providers
-/// for the same key share one aggregate nonempty lifetime.
+/// Capacity bounds distinct device keys, not sockets or packet backlog. A
+/// provider uses its cached handle in O(1); only first activation or a stale
+/// handle scans the fixed table. Recomputing aggregates makes socket removal
+/// safe without provider-sized state in an async-owned interface.
 pub(super) struct EgressDemandCatalog<const CAPACITY: usize> {
     schedule: Option<EgressSchedule>,
     watermarks: Option<DemandWatermarks>,
     next_demand_activation: u32,
-    next_provider_activation: u32,
     demands: [Option<DemandEntry>; CAPACITY],
-    providers: [Option<ProviderEntry>; CAPACITY],
 }
 
 impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
@@ -115,16 +100,10 @@ impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
             schedule: None,
             watermarks: None,
             next_demand_activation: 1,
-            next_provider_activation: 1,
             demands: [None; CAPACITY],
-            providers: [None; CAPACITY],
         }
     }
 
-    /// Begin or replace the device-owned scheduling epoch.
-    ///
-    /// A schedule geometry change without an epoch advance is rejected. This
-    /// keeps one unambiguous reset value at a future asynchronous boundary.
     pub(super) fn configure(
         &mut self,
         schedule: EgressSchedule,
@@ -141,281 +120,142 @@ impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
         self.schedule = Some(schedule);
         self.watermarks = Some(DemandWatermarks::from_schedule(schedule));
         self.demands.fill(None);
-        self.providers.fill(None);
         Ok(Some(EgressDemandUpdate::Reset {
             schedule_epoch: schedule.epoch(),
         }))
     }
 
-    fn serial(next: u32) -> Result<(NonZeroU32, u32), EgressDemandCatalogError> {
-        let serial =
-            NonZeroU32::new(next).ok_or(EgressDemandCatalogError::ActivationSerialExhausted)?;
-        let following = next
-            .checked_add(1)
-            .ok_or(EgressDemandCatalogError::ActivationSerialExhausted)?;
-        Ok((serial, following))
-    }
-
-    /// Activate one independently owned provider contribution.
-    ///
-    /// The first provider for a key starts and publishes a new demand lifetime.
-    /// Further providers join that lifetime and publish only if their addition
-    /// crosses the useful high watermark.
-    pub(super) fn activate(
-        &mut self,
-        key: EgressKey,
-        ready_units: NonZeroU16,
-    ) -> Result<(EgressDemandHandle, Option<EgressDemandUpdate>), EgressDemandCatalogError> {
+    fn next_id(&mut self) -> Result<EgressDemandId, EgressDemandCatalogError> {
         let schedule = self
             .schedule
             .ok_or(EgressDemandCatalogError::NotConfigured)?;
-        let watermarks = self
-            .watermarks
-            .expect("configured demand catalog owns watermarks");
-        let provider_slot = self
-            .providers
+        let activation = NonZeroU32::new(self.next_demand_activation)
+            .ok_or(EgressDemandCatalogError::ActivationSerialExhausted)?;
+        self.next_demand_activation = self
+            .next_demand_activation
+            .checked_add(1)
+            .ok_or(EgressDemandCatalogError::ActivationSerialExhausted)?;
+        Ok(EgressDemandId::new(schedule.epoch(), activation))
+    }
+
+    pub(super) fn begin_observation(&mut self) {
+        for demand in self.demands.iter_mut().flatten() {
+            demand.observed_ready_units = 0;
+        }
+    }
+
+    fn handle_slot(&self, handle: EgressDemandHandle, key: EgressKey) -> Option<usize> {
+        let slot = usize::from(handle.demand_slot);
+        self.demands
+            .get(slot)
+            .copied()
+            .flatten()
+            .filter(|demand| {
+                demand.id.activation() == handle.demand_activation && demand.key == key
+            })
+            .map(|_| slot)
+    }
+
+    fn demand_slot(&mut self, key: EgressKey) -> Result<usize, EgressDemandCatalogError> {
+        if let Some(slot) = self
+            .demands
+            .iter()
+            .position(|demand| demand.is_some_and(|demand| demand.key == key))
+        {
+            return Ok(slot);
+        }
+        let slot = self
+            .demands
             .iter()
             .position(Option::is_none)
             .ok_or(EgressDemandCatalogError::Full)?;
-        let demand_slot = self
-            .demands
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.key == key))
-            .or_else(|| self.demands.iter().position(Option::is_none))
-            .ok_or(EgressDemandCatalogError::Full)?;
-
-        let (provider_activation, next_provider_activation) =
-            Self::serial(self.next_provider_activation)?;
-
-        let update = if let Some(mut demand) = self.demands[demand_slot] {
-            demand.ready_units = demand
-                .ready_units
-                .checked_add(u32::from(ready_units.get()))
-                .expect("bounded providers cannot overflow u32 aggregate demand");
-            let horizon_ready =
-                watermarks.next_horizon_ready(demand.horizon_ready, demand.ready_units);
-            let publish = horizon_ready != demand.horizon_ready;
-            demand.horizon_ready = horizon_ready;
-            self.demands[demand_slot] = Some(demand);
-            publish.then(|| EgressDemandUpdate::Active(demand.demand()))
-        } else {
-            let (activation, next_demand_activation) = Self::serial(self.next_demand_activation)?;
-            self.next_demand_activation = next_demand_activation;
-            let id = EgressDemandId::new(schedule.epoch(), activation);
-            let demand = DemandEntry {
-                key,
-                id,
-                ready_units: u32::from(ready_units.get()),
-                horizon_ready: watermarks.next_horizon_ready(false, u32::from(ready_units.get())),
-            };
-            self.demands[demand_slot] = Some(demand);
-            Some(EgressDemandUpdate::Active(demand.demand()))
-        };
-
-        self.next_provider_activation = next_provider_activation;
-        let demand = self.demands[demand_slot].expect("activation installed demand");
-        self.providers[provider_slot] = Some(ProviderEntry {
-            activation: provider_activation,
-            demand_slot: u16::try_from(demand_slot).expect("catalog capacity was checked"),
-            demand_id: demand.id,
-            ready_units,
-            observed: false,
+        let id = self.next_id()?;
+        self.demands[slot] = Some(DemandEntry {
+            key,
+            id,
+            committed_ready_units: 0,
+            observed_ready_units: 0,
+            horizon_ready: false,
         });
-        Ok((
-            EgressDemandHandle {
-                provider_slot: u16::try_from(provider_slot).expect("catalog capacity was checked"),
-                provider_activation,
-            },
-            update,
-        ))
+        Ok(slot)
     }
 
-    /// Update one provider and return only a useful aggregate transition.
-    ///
-    /// `None` coalesces packet-frequency count changes inside the current
-    /// hysteresis band. Zero ends this provider contribution. Only the last
-    /// provider ending publishes the terminal key lifetime.
-    pub(super) fn update(
-        &mut self,
-        handle: EgressDemandHandle,
-        ready_units: u16,
-    ) -> Result<Option<EgressDemandUpdate>, EgressDemandCatalogError> {
-        let provider_slot = usize::from(handle.provider_slot);
-        let mut provider = self
-            .providers
-            .get(provider_slot)
-            .copied()
-            .flatten()
-            .filter(|provider| provider.activation == handle.provider_activation)
-            .ok_or(EgressDemandCatalogError::StaleHandle)?;
-        let demand_slot = usize::from(provider.demand_slot);
-        let mut demand = self
-            .demands
-            .get(demand_slot)
-            .copied()
-            .flatten()
-            .filter(|demand| demand.id == provider.demand_id)
-            .ok_or(EgressDemandCatalogError::StaleHandle)?;
-
-        let previous = u32::from(provider.ready_units.get());
-        if ready_units == 0 {
-            self.providers[provider_slot] = None;
-            demand.ready_units -= previous;
-            if demand.ready_units == 0 {
-                self.demands[demand_slot] = None;
-                return Ok(Some(EgressDemandUpdate::Inactive {
-                    id: demand.id,
-                    key: demand.key,
-                }));
-            }
-        } else {
-            let ready_units = NonZeroU16::new(ready_units).unwrap();
-            if ready_units == provider.ready_units {
-                return Ok(None);
-            }
-            provider.ready_units = ready_units;
-            self.providers[provider_slot] = Some(provider);
-            demand.ready_units = demand.ready_units - previous + u32::from(ready_units.get());
-        }
-
-        let watermarks = self
-            .watermarks
-            .expect("configured demand catalog owns watermarks");
-        let horizon_ready = watermarks.next_horizon_ready(demand.horizon_ready, demand.ready_units);
-        let publish = horizon_ready != demand.horizon_ready;
-        demand.horizon_ready = horizon_ready;
-        self.demands[demand_slot] = Some(demand);
-        Ok(publish.then(|| EgressDemandUpdate::Active(demand.demand())))
-    }
-
-    fn demand_for(
-        &self,
-        handle: EgressDemandHandle,
-    ) -> Result<DemandEntry, EgressDemandCatalogError> {
-        let provider = self
-            .providers
-            .get(usize::from(handle.provider_slot))
-            .copied()
-            .flatten()
-            .filter(|provider| provider.activation == handle.provider_activation)
-            .ok_or(EgressDemandCatalogError::StaleHandle)?;
-        self.demands
-            .get(usize::from(provider.demand_slot))
-            .copied()
-            .flatten()
-            .filter(|demand| demand.id == provider.demand_id)
-            .ok_or(EgressDemandCatalogError::StaleHandle)
-    }
-
-    fn mark_observed(
-        &mut self,
-        handle: EgressDemandHandle,
-    ) -> Result<(), EgressDemandCatalogError> {
-        let provider = self
-            .providers
-            .get_mut(usize::from(handle.provider_slot))
-            .and_then(Option::as_mut)
-            .filter(|provider| provider.activation == handle.provider_activation)
-            .ok_or(EgressDemandCatalogError::StaleHandle)?;
-        provider.observed = true;
-        Ok(())
-    }
-
-    /// Begin one complete observation of protocol-owned egress providers.
-    pub(super) fn begin_observation(&mut self) {
-        for provider in self.providers.iter_mut().flatten() {
-            provider.observed = false;
-        }
-    }
-
-    /// Reconcile one live protocol provider through its affine socket-owned handle.
-    ///
-    /// A route-to-key change ends the old contribution before starting the new
-    /// one. This is safe even when a generic device violates the stronger
-    /// schedule-epoch stability recommendation.
     pub(super) fn observe(
         &mut self,
         handle: &mut Option<EgressDemandHandle>,
         key: EgressKey,
         ready_units: NonZeroU16,
-        mut publish: impl FnMut(EgressDemandUpdate),
     ) -> Result<(), EgressDemandCatalogError> {
-        if let Some(current) = *handle {
-            match self.demand_for(current) {
-                Ok(demand) if demand.key == key => {
-                    if let Some(update) = self.update(current, ready_units.get())? {
-                        publish(update);
-                    }
-                    self.mark_observed(current)?;
-                    return Ok(());
-                }
-                Ok(_) => {
-                    if let Some(update) = self.update(current, 0)? {
-                        publish(update);
-                    }
-                    *handle = None;
-                }
-                Err(EgressDemandCatalogError::StaleHandle) => {
-                    *handle = None;
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        let (new_handle, update) = self.activate(key, ready_units)?;
-        self.mark_observed(new_handle)?;
-        *handle = Some(new_handle);
-        if let Some(update) = update {
-            publish(update);
-        }
+        self.schedule
+            .ok_or(EgressDemandCatalogError::NotConfigured)?;
+        let slot = handle
+            .and_then(|handle| self.handle_slot(handle, key))
+            .map(Ok)
+            .unwrap_or_else(|| self.demand_slot(key))?;
+        let demand = self.demands[slot]
+            .as_mut()
+            .expect("resolved demand slot remains active");
+        demand.observed_ready_units = demand
+            .observed_ready_units
+            .checked_add(u32::from(ready_units.get()))
+            .expect("bounded queue metadata cannot overflow aggregate demand");
+        *handle = Some(EgressDemandHandle {
+            demand_slot: u16::try_from(slot).expect("catalog capacity was checked"),
+            demand_activation: demand.id.activation(),
+        });
         Ok(())
     }
 
-    /// End one complete observation and reclaim every disappeared provider.
-    pub(super) fn finish_observation(
-        &mut self,
-        mut publish: impl FnMut(EgressDemandUpdate),
-    ) -> Result<(), EgressDemandCatalogError> {
-        for provider_slot in 0..CAPACITY {
-            let Some(provider) = self.providers[provider_slot] else {
+    pub(super) fn finish_observation(&mut self, mut publish: impl FnMut(EgressDemandUpdate)) {
+        let watermarks = self
+            .watermarks
+            .expect("configured demand catalog owns watermarks");
+        for slot in 0..CAPACITY {
+            let Some(mut demand) = self.demands[slot] else {
                 continue;
             };
-            if provider.observed {
+            let observed = demand.observed_ready_units;
+            if observed == 0 {
+                if demand.committed_ready_units != 0 {
+                    publish(EgressDemandUpdate::Inactive {
+                        id: demand.id,
+                        key: demand.key,
+                    });
+                }
+                self.demands[slot] = None;
                 continue;
             }
-            let handle = EgressDemandHandle {
-                provider_slot: u16::try_from(provider_slot).expect("catalog capacity was checked"),
-                provider_activation: provider.activation,
-            };
-            if let Some(update) = self.update(handle, 0)? {
-                publish(update);
+
+            let horizon_ready = watermarks.next_horizon_ready(demand.horizon_ready, observed);
+            if demand.committed_ready_units == 0 || horizon_ready != demand.horizon_ready {
+                publish(EgressDemandUpdate::Active(
+                    demand.demand(observed, horizon_ready),
+                ));
             }
+            demand.committed_ready_units = observed;
+            demand.observed_ready_units = 0;
+            demand.horizon_ready = horizon_ready;
+            self.demands[slot] = Some(demand);
         }
-        Ok(())
     }
 
-    /// Disable observation and terminate every published demand lifetime.
     pub(super) fn disable(&mut self, mut publish: impl FnMut(EgressDemandUpdate)) {
         for demand in self.demands.iter().flatten() {
-            publish(EgressDemandUpdate::Inactive {
-                id: demand.id,
-                key: demand.key,
-            });
+            if demand.committed_ready_units != 0 {
+                publish(EgressDemandUpdate::Inactive {
+                    id: demand.id,
+                    key: demand.key,
+                });
+            }
         }
         self.schedule = None;
         self.watermarks = None;
         self.demands.fill(None);
-        self.providers.fill(None);
     }
 
     #[cfg(test)]
     fn active_demands(&self) -> usize {
         self.demands.iter().flatten().count()
-    }
-
-    #[cfg(test)]
-    fn active_providers(&self) -> usize {
-        self.providers.iter().flatten().count()
     }
 }
 
@@ -444,147 +284,164 @@ mod tests {
         }
     }
 
+    fn observe(
+        catalog: &mut EgressDemandCatalog<4>,
+        handle: &mut Option<EgressDemandHandle>,
+        key: EgressKey,
+        ready: u16,
+    ) {
+        catalog
+            .observe(handle, key, NonZeroU16::new(ready).unwrap())
+            .unwrap();
+    }
+
     #[test]
-    fn activation_before_configuration_fails_closed() {
+    fn observation_before_configuration_fails_closed() {
         let mut catalog = EgressDemandCatalog::<1>::new();
         assert_eq!(
-            catalog.activate(key(1), NonZeroU16::new(1).unwrap()),
+            catalog.observe(&mut None, key(1), NonZeroU16::new(1).unwrap()),
             Err(EgressDemandCatalogError::NotConfigured)
         );
     }
 
     #[test]
-    fn sparse_activation_is_immediate_and_packet_count_changes_are_coalesced() {
-        let mut catalog = EgressDemandCatalog::<4>::new();
-        assert_eq!(
-            catalog.configure(schedule(32, 7)).unwrap(),
-            Some(EgressDemandUpdate::Reset { schedule_epoch: 7 })
+    fn softap_catalog_does_not_scale_with_provider_count() {
+        assert!(
+            core::mem::size_of::<EgressDemandCatalog<16>>() <= 1024,
+            "aggregate catalog must stay out of provider-sized async frames"
         );
-        let (handle, update) = catalog
-            .activate(key(1), NonZeroU16::new(1).unwrap())
-            .unwrap();
-        let demand = active(update.unwrap());
+    }
+
+    #[test]
+    fn sparse_activation_is_immediate_and_counts_are_coalesced() {
+        let mut catalog = EgressDemandCatalog::<4>::new();
+        catalog.configure(schedule(32, 7)).unwrap();
+        let mut handle = None;
+        let mut updates = std::vec::Vec::new();
+
+        catalog.begin_observation();
+        observe(&mut catalog, &mut handle, key(1), 1);
+        catalog.finish_observation(|update| updates.push(update));
+        let demand = active(updates.pop().unwrap());
         assert_eq!(demand.level().ready_units().get(), 1);
         assert!(!demand.level().horizon_ready());
 
         for ready in 2..32 {
-            assert_eq!(catalog.update(handle, ready).unwrap(), None);
+            catalog.begin_observation();
+            observe(&mut catalog, &mut handle, key(1), ready);
+            catalog.finish_observation(|update| updates.push(update));
+            assert!(updates.is_empty());
         }
-        let demand = active(catalog.update(handle, 32).unwrap().unwrap());
+        catalog.begin_observation();
+        observe(&mut catalog, &mut handle, key(1), 32);
+        catalog.finish_observation(|update| updates.push(update));
+        let demand = active(updates.pop().unwrap());
         assert_eq!(demand.level().ready_units().get(), 32);
         assert!(demand.level().horizon_ready());
     }
 
     #[test]
-    fn high_low_hysteresis_avoids_one_publication_per_saturated_packet() {
-        let mut catalog = EgressDemandCatalog::<2>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
-        let (handle, update) = catalog
-            .activate(key(1), NonZeroU16::new(40).unwrap())
-            .unwrap();
-        assert!(active(update.unwrap()).level().horizon_ready());
-
-        for ready in (9..40).rev() {
-            assert_eq!(catalog.update(handle, ready).unwrap(), None);
-        }
-        let demand = active(catalog.update(handle, 8).unwrap().unwrap());
-        assert_eq!(demand.level().ready_units().get(), 8);
-        assert!(!demand.level().horizon_ready());
-
-        for ready in 9..32 {
-            assert_eq!(catalog.update(handle, ready).unwrap(), None);
-        }
-        assert!(
-            active(catalog.update(handle, 32).unwrap().unwrap())
-                .level()
-                .horizon_ready()
-        );
-    }
-
-    #[test]
-    fn multiple_providers_share_one_key_lifetime_and_aggregate_level() {
+    fn multiple_providers_share_one_aggregate_observation() {
         let mut catalog = EgressDemandCatalog::<4>::new();
         catalog.configure(schedule(8, 3)).unwrap();
-        let (a, first) = catalog
-            .activate(key(1), NonZeroU16::new(3).unwrap())
-            .unwrap();
-        let first = active(first.unwrap());
-        let (b, high) = catalog
-            .activate(key(1), NonZeroU16::new(5).unwrap())
-            .unwrap();
-        let high = active(high.unwrap());
-        assert_eq!(high.id(), first.id());
-        assert_eq!(high.level().ready_units().get(), 8);
-        assert!(high.level().horizon_ready());
-        assert_eq!(catalog.active_demands(), 1);
-        assert_eq!(catalog.active_providers(), 2);
+        let mut a = None;
+        let mut b = None;
+        let mut updates = std::vec::Vec::new();
+        catalog.begin_observation();
+        observe(&mut catalog, &mut a, key(1), 3);
+        observe(&mut catalog, &mut b, key(1), 5);
+        catalog.finish_observation(|update| updates.push(update));
 
-        assert_eq!(catalog.update(a, 0).unwrap(), None);
-        let low = active(catalog.update(b, 2).unwrap().unwrap());
-        assert_eq!(low.id(), first.id());
-        assert!(!low.level().horizon_ready());
-        assert_eq!(
-            catalog.update(b, 0).unwrap(),
-            Some(EgressDemandUpdate::Inactive {
-                id: first.id(),
-                key: key(1),
-            })
-        );
-        assert_eq!(catalog.active_demands(), 0);
-        assert_eq!(catalog.active_providers(), 0);
+        assert_eq!(updates.len(), 1);
+        let demand = active(updates[0]);
+        assert_eq!(demand.level().ready_units().get(), 8);
+        assert!(demand.level().horizon_ready());
+        assert_eq!(catalog.active_demands(), 1);
+
+        catalog.begin_observation();
+        observe(&mut catalog, &mut b, key(1), 5);
+        catalog.finish_observation(|update| updates.push(update));
+        assert_eq!(updates.len(), 1, "one provider ending is not terminal");
+
+        catalog.begin_observation();
+        catalog.finish_observation(|update| updates.push(update));
+        assert!(matches!(
+            updates.last(),
+            Some(EgressDemandUpdate::Inactive { id, key: ended })
+                if *id == demand.id() && *ended == key(1)
+        ));
     }
 
     #[test]
-    fn inactive_is_terminal_and_provider_slot_reuse_rejects_old_handle() {
+    fn high_low_hysteresis_avoids_packet_frequency_publication() {
+        let mut catalog = EgressDemandCatalog::<4>::new();
+        catalog.configure(schedule(32, 1)).unwrap();
+        let mut handle = None;
+        let mut updates = std::vec::Vec::new();
+
+        for ready in [40, 39, 9, 8, 9, 31, 32] {
+            catalog.begin_observation();
+            observe(&mut catalog, &mut handle, key(1), ready);
+            catalog.finish_observation(|update| updates.push(update));
+        }
+        assert_eq!(updates.len(), 3);
+        assert!(active(updates[0]).level().horizon_ready());
+        assert!(!active(updates[1]).level().horizon_ready());
+        assert!(active(updates[2]).level().horizon_ready());
+    }
+
+    #[test]
+    fn stale_slot_handle_rebinds_to_a_later_lifetime() {
         let mut catalog = EgressDemandCatalog::<1>::new();
         catalog.configure(schedule(32, 1)).unwrap();
-        let (old, old_update) = catalog
-            .activate(key(1), NonZeroU16::new(1).unwrap())
+        let mut stale = None;
+        catalog.begin_observation();
+        catalog
+            .observe(&mut stale, key(1), NonZeroU16::new(1).unwrap())
             .unwrap();
-        let old_id = active(old_update.unwrap()).id();
-        assert_eq!(
-            catalog.update(old, 0).unwrap(),
-            Some(EgressDemandUpdate::Inactive {
-                id: old_id,
-                key: key(1)
-            })
-        );
-        let (new, _) = catalog
-            .activate(key(2), NonZeroU16::new(1).unwrap())
+        catalog.finish_observation(|_| {});
+        let old = stale.unwrap();
+        catalog.begin_observation();
+        catalog.finish_observation(|_| {});
+
+        let mut current = None;
+        catalog.begin_observation();
+        catalog
+            .observe(&mut current, key(2), NonZeroU16::new(1).unwrap())
             .unwrap();
-        assert_ne!(old.provider_activation, new.provider_activation);
-        assert_eq!(
-            catalog.update(old, 1),
-            Err(EgressDemandCatalogError::StaleHandle)
-        );
-        assert_eq!(catalog.active_demands(), 1);
+        catalog.finish_observation(|_| {});
+        assert_ne!(old.demand_activation, current.unwrap().demand_activation);
+
+        catalog.begin_observation();
+        catalog
+            .observe(&mut stale, key(2), NonZeroU16::new(1).unwrap())
+            .unwrap();
+        catalog.finish_observation(|_| {});
+        assert_eq!(stale, current);
     }
 
     #[test]
-    fn epoch_reset_invalidates_every_affine_handle_even_without_new_demand() {
-        let mut catalog = EgressDemandCatalog::<2>::new();
+    fn epoch_reset_invalidates_cached_handles() {
+        let mut catalog = EgressDemandCatalog::<1>::new();
         catalog.configure(schedule(32, 11)).unwrap();
-        let (a, _) = catalog
-            .activate(key(1), NonZeroU16::new(4).unwrap())
+        let mut handle = None;
+        catalog.begin_observation();
+        catalog
+            .observe(&mut handle, key(1), NonZeroU16::new(1).unwrap())
             .unwrap();
-        let (b, _) = catalog
-            .activate(key(2), NonZeroU16::new(4).unwrap())
-            .unwrap();
+        catalog.finish_observation(|_| {});
+        let old = handle.unwrap();
 
         assert_eq!(
             catalog.configure(schedule(32, 12)).unwrap(),
             Some(EgressDemandUpdate::Reset { schedule_epoch: 12 })
         );
-        assert_eq!(catalog.active_demands(), 0);
-        assert_eq!(catalog.active_providers(), 0);
-        assert_eq!(
-            catalog.update(a, 1),
-            Err(EgressDemandCatalogError::StaleHandle)
-        );
-        assert_eq!(
-            catalog.update(b, 1),
-            Err(EgressDemandCatalogError::StaleHandle)
-        );
+        catalog.begin_observation();
+        catalog
+            .observe(&mut handle, key(1), NonZeroU16::new(1).unwrap())
+            .unwrap();
+        catalog.finish_observation(|_| {});
+        assert_ne!(old.demand_activation, handle.unwrap().demand_activation);
     }
 
     #[test]
@@ -598,143 +455,107 @@ mod tests {
     }
 
     #[test]
-    fn full_catalog_fails_closed_without_overwriting_a_live_provider() {
+    fn full_distinct_key_catalog_preserves_existing_demand() {
         let mut catalog = EgressDemandCatalog::<1>::new();
         catalog.configure(schedule(32, 1)).unwrap();
-        let (handle, _) = catalog
-            .activate(key(1), NonZeroU16::new(1).unwrap())
+        let mut a = None;
+        let mut b = None;
+        catalog.begin_observation();
+        catalog
+            .observe(&mut a, key(1), NonZeroU16::new(1).unwrap())
             .unwrap();
         assert_eq!(
-            catalog.activate(key(2), NonZeroU16::new(1).unwrap()),
+            catalog.observe(&mut b, key(2), NonZeroU16::new(1).unwrap()),
             Err(EgressDemandCatalogError::Full)
         );
-        assert_eq!(catalog.update(handle, 2).unwrap(), None);
+        catalog.finish_observation(|_| {});
         assert_eq!(catalog.active_demands(), 1);
-        assert_eq!(catalog.active_providers(), 1);
     }
 
     #[test]
-    fn one_unit_horizon_remains_ready_for_every_nonempty_level() {
+    fn one_unit_horizon_stays_ready_for_every_nonempty_level() {
         let mut catalog = EgressDemandCatalog::<1>::new();
         catalog.configure(schedule(1, 1)).unwrap();
-        let (handle, update) = catalog
-            .activate(key(1), NonZeroU16::new(1).unwrap())
-            .unwrap();
-        assert!(active(update.unwrap()).level().horizon_ready());
+        let mut handle = None;
+        let mut updates = std::vec::Vec::new();
+        for ready in [1, 2, 1] {
+            catalog.begin_observation();
+            catalog
+                .observe(&mut handle, key(1), NonZeroU16::new(ready).unwrap())
+                .unwrap();
+            catalog.finish_observation(|update| updates.push(update));
+        }
+        assert_eq!(updates.len(), 1);
+        assert!(active(updates[0]).level().horizon_ready());
+    }
 
-        assert_eq!(catalog.update(handle, 2).unwrap(), None);
-        assert_eq!(catalog.update(handle, 1).unwrap(), None);
+    #[test]
+    fn aggregate_publication_saturates_without_corrupting_reclamation() {
+        let mut catalog = EgressDemandCatalog::<1>::new();
+        catalog.configure(schedule(32, 1)).unwrap();
+        let mut a = None;
+        let mut b = None;
+        let mut updates = std::vec::Vec::new();
+        catalog.begin_observation();
+        catalog
+            .observe(&mut a, key(1), NonZeroU16::new(u16::MAX).unwrap())
+            .unwrap();
+        catalog
+            .observe(&mut b, key(1), NonZeroU16::new(u16::MAX).unwrap())
+            .unwrap();
+        catalog.finish_observation(|update| updates.push(update));
+        assert_eq!(
+            active(updates[0]).level().ready_units(),
+            NonZeroU16::new(u16::MAX).unwrap()
+        );
+
+        catalog.begin_observation();
+        catalog.finish_observation(|update| updates.push(update));
         assert!(matches!(
-            catalog.update(handle, 0).unwrap(),
+            updates.last(),
             Some(EgressDemandUpdate::Inactive { .. })
         ));
     }
 
     #[test]
-    fn saturated_and_sparse_keys_have_independent_demand_lifetimes() {
-        let mut catalog = EgressDemandCatalog::<2>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
-        let (saturated, saturated_update) = catalog
-            .activate(key(1), NonZeroU16::new(64).unwrap())
-            .unwrap();
-        let (sparse, sparse_update) = catalog
-            .activate(key(2), NonZeroU16::new(1).unwrap())
-            .unwrap();
-        assert!(active(saturated_update.unwrap()).level().horizon_ready());
-        assert!(!active(sparse_update.unwrap()).level().horizon_ready());
-
-        assert!(matches!(
-            catalog.update(sparse, 0).unwrap(),
-            Some(EgressDemandUpdate::Inactive { key: ended, .. }) if ended == key(2)
-        ));
-        assert_eq!(catalog.update(saturated, 63).unwrap(), None);
-        assert_eq!(catalog.active_demands(), 1);
-    }
-
-    #[test]
-    fn published_level_saturates_without_corrupting_internal_reclamation() {
-        let mut catalog = EgressDemandCatalog::<2>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
-        let (a, _) = catalog
-            .activate(key(1), NonZeroU16::new(u16::MAX).unwrap())
-            .unwrap();
-        let (b, _) = catalog
-            .activate(key(1), NonZeroU16::new(1).unwrap())
-            .unwrap();
-
-        let sparse = active(catalog.update(a, 0).unwrap().unwrap());
-        assert_eq!(sparse.level().ready_units().get(), 1);
-        assert!(!sparse.level().horizon_ready());
-        assert!(matches!(
-            catalog.update(b, 0).unwrap(),
-            Some(EgressDemandUpdate::Inactive { key: ended, .. }) if ended == key(1)
-        ));
-    }
-
-    #[test]
-    fn observation_rekeys_one_provider_with_terminal_then_new_lifetime() {
+    fn rekey_publishes_terminal_then_new_lifetime() {
         let mut catalog = EgressDemandCatalog::<2>::new();
         catalog.configure(schedule(32, 9)).unwrap();
         let mut handle = None;
         let mut updates = std::vec::Vec::new();
-
         catalog.begin_observation();
         catalog
-            .observe(&mut handle, key(1), NonZeroU16::new(3).unwrap(), |update| {
-                updates.push(update)
-            })
+            .observe(&mut handle, key(1), NonZeroU16::new(3).unwrap())
             .unwrap();
-        catalog.finish_observation(|_| unreachable!()).unwrap();
+        catalog.finish_observation(|update| updates.push(update));
         let first = active(updates.pop().unwrap());
 
         catalog.begin_observation();
         catalog
-            .observe(&mut handle, key(2), NonZeroU16::new(3).unwrap(), |update| {
-                updates.push(update)
-            })
+            .observe(&mut handle, key(2), NonZeroU16::new(3).unwrap())
             .unwrap();
-        catalog.finish_observation(|_| unreachable!()).unwrap();
-
+        catalog.finish_observation(|update| updates.push(update));
         assert_eq!(updates.len(), 2);
-        assert_eq!(
+        assert!(matches!(
             updates[0],
-            EgressDemandUpdate::Inactive {
-                id: first.id(),
-                key: key(1),
-            }
-        );
+            EgressDemandUpdate::Inactive { id, key: ended }
+                if id == first.id() && ended == key(1)
+        ));
         let second = active(updates[1]);
         assert_eq!(second.key(), key(2));
         assert_ne!(second.id(), first.id());
     }
 
     #[test]
-    fn observation_sweep_and_disable_publish_terminal_lifetimes_once() {
-        let mut catalog = EgressDemandCatalog::<2>::new();
+    fn disable_publishes_terminal_lifetime_once() {
+        let mut catalog = EgressDemandCatalog::<1>::new();
         catalog.configure(schedule(32, 3)).unwrap();
-        let mut a = None;
-        let mut b = None;
+        let mut handle = None;
         catalog.begin_observation();
         catalog
-            .observe(&mut a, key(1), NonZeroU16::new(1).unwrap(), |_| {})
+            .observe(&mut handle, key(1), NonZeroU16::new(1).unwrap())
             .unwrap();
-        catalog
-            .observe(&mut b, key(2), NonZeroU16::new(1).unwrap(), |_| {})
-            .unwrap();
-        catalog.finish_observation(|_| unreachable!()).unwrap();
-
-        let mut swept = std::vec::Vec::new();
-        catalog.begin_observation();
-        catalog
-            .observe(&mut a, key(1), NonZeroU16::new(1).unwrap(), |_| {})
-            .unwrap();
-        catalog
-            .finish_observation(|update| swept.push(update))
-            .unwrap();
-        assert!(matches!(
-            swept.as_slice(),
-            [EgressDemandUpdate::Inactive { key: ended, .. }] if *ended == key(2)
-        ));
+        catalog.finish_observation(|_| {});
 
         let mut disabled = std::vec::Vec::new();
         catalog.disable(|update| disabled.push(update));

@@ -195,24 +195,17 @@ fn udp_providers_from_two_sockets_share_one_demand_lifetime() {
 
     iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
 
-    assert_eq!(device.egress_demand_updates.len(), 3);
+    assert_eq!(device.egress_demand_updates.len(), 2);
     assert_eq!(
         device.egress_demand_updates[0],
         crate::phy::EgressDemandUpdate::Reset { schedule_epoch: 7 }
     );
-    let crate::phy::EgressDemandUpdate::Active(first) = device.egress_demand_updates[1] else {
-        panic!("first provider must activate demand");
+    let crate::phy::EgressDemandUpdate::Active(demand) = device.egress_demand_updates[1] else {
+        panic!("both providers must publish one aggregate demand");
     };
-    let crate::phy::EgressDemandUpdate::Active(full_horizon) = device.egress_demand_updates[2]
-    else {
-        panic!("second provider must cross the shared horizon");
-    };
-    assert_eq!(first.key(), shared_key);
-    assert_eq!(first.level().ready_units().get(), 20);
-    assert!(!first.level().horizon_ready());
-    assert_eq!(full_horizon.id(), first.id());
-    assert_eq!(full_horizon.level().ready_units().get(), 32);
-    assert!(full_horizon.level().horizon_ready());
+    assert_eq!(demand.key(), shared_key);
+    assert_eq!(demand.level().ready_units().get(), 32);
+    assert!(demand.level().horizon_ready());
 
     sockets.remove(socket_a);
     sockets.remove(socket_b);
@@ -220,7 +213,7 @@ fn udp_providers_from_two_sockets_share_one_demand_lifetime() {
     assert_eq!(
         device.egress_demand_updates.last(),
         Some(&crate::phy::EgressDemandUpdate::Inactive {
-            id: first.id(),
+            id: demand.id(),
             key: shared_key,
         })
     );

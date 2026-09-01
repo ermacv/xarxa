@@ -10,10 +10,11 @@ mod ethernet;
 #[cfg(feature = "medium-ieee802154")]
 mod ieee802154;
 
-// Phase-one host model. Phase two makes this production state when protocol
-// providers can own its affine handles without rescanning packet payloads.
-#[cfg(all(test, feature = "tx-egress-metadata"))]
+#[cfg(feature = "tx-egress-metadata")]
 mod egress_catalog;
+
+#[cfg(feature = "tx-egress-metadata")]
+pub(crate) use egress_catalog::EgressDemandHandle;
 
 #[cfg(feature = "proto-ipv4")]
 mod ipv4;
@@ -123,7 +124,17 @@ pub struct Interface {
     pub(crate) inner: InterfaceInner,
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
+    #[cfg(feature = "tx-egress-metadata")]
+    egress_demands: egress_catalog::EgressDemandCatalog<EGRESS_DEMAND_CATALOG_CAPACITY>,
 }
+
+/// Bounded protocol-provider contributions observed by one interface.
+///
+/// This bounds metadata, not packet storage. Overflow fails closed by omitting
+/// shadow demand for the excess provider; synchronous `transmit_for` admission
+/// remains authoritative and preserves packet progress.
+#[cfg(feature = "tx-egress-metadata")]
+const EGRESS_DEMAND_CATALOG_CAPACITY: usize = 64;
 
 /// The device independent part of an Ethernet network interface.
 ///
@@ -376,6 +387,8 @@ impl Interface {
                 reassembly_timeout: Duration::from_secs(60),
             },
             fragmenter: Fragmenter::new(),
+            #[cfg(feature = "tx-egress-metadata")]
+            egress_demands: egress_catalog::EgressDemandCatalog::new(),
             inner: InterfaceInner {
                 now,
                 caps,
@@ -828,6 +841,8 @@ impl Interface {
                 self.inner.egress_burst.disable();
             }
         }
+        #[cfg(feature = "tx-egress-metadata")]
+        self.reconcile_egress_demands(device, sockets, egress_schedule);
 
         enum EgressError {
             Exhausted,
@@ -1058,6 +1073,70 @@ impl Interface {
             result = PollResult::SocketStateChanged;
         }
         result
+    }
+
+    /// Publish one coalesced shadow view of protocol-owned UDP demand.
+    ///
+    /// The interface resolves route and device key because UDP enqueue has
+    /// neither context. Socket queues retain only an affine catalog handle;
+    /// payload bytes are not scanned. This remains observational: the existing
+    /// keyed dispatcher and `transmit_for` are still the only TX authority.
+    #[cfg(feature = "tx-egress-metadata")]
+    fn reconcile_egress_demands(
+        &mut self,
+        device: &mut (impl Device + ?Sized),
+        sockets: &mut SocketSet<'_>,
+        schedule: Option<EgressSchedule>,
+    ) {
+        let Some(schedule) = schedule else {
+            self.egress_demands
+                .disable(|update| device.update_egress_demand(update));
+            return;
+        };
+
+        match self.egress_demands.configure(schedule) {
+            Ok(Some(update)) => device.update_egress_demand(update),
+            Ok(None) => {}
+            Err(error) => {
+                net_debug!("invalid egress demand schedule: {:?}", error);
+                self.egress_demands
+                    .disable(|update| device.update_egress_demand(update));
+                return;
+            }
+        }
+
+        self.egress_demands.begin_observation();
+        for item in sockets.items_mut() {
+            #[allow(unreachable_patterns)]
+            match &mut item.socket {
+                #[cfg(feature = "socket-udp")]
+                Socket::Udp(socket) => {
+                    socket.prepare_egress_demand_epoch(schedule.epoch());
+                    socket.for_each_egress_demand_provider(|handle, destination, ready_units| {
+                        let Some(route) = self.inner.resolved_egress_route(&destination) else {
+                            return;
+                        };
+                        let key = device.egress_key(route);
+                        if let Err(error) =
+                            self.egress_demands
+                                .observe(handle, key, ready_units, |update| {
+                                    device.update_egress_demand(update)
+                                })
+                        {
+                            net_debug!("failed to observe UDP egress demand: {:?}", error);
+                        }
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        if let Err(error) = self
+            .egress_demands
+            .finish_observation(|update| device.update_egress_demand(update))
+        {
+            net_debug!("failed to finish egress demand observation: {:?}", error);
+        }
     }
 }
 

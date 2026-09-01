@@ -24,6 +24,8 @@ pub use self::interface::{
     Config, Interface, InterfaceInner as Context, PollIngressSingleResult, PollResult,
 };
 
+#[cfg(feature = "tx-egress-metadata")]
+pub(crate) use self::interface::EgressDemandHandle;
 pub use self::route::{Route, RouteTableFull, Routes};
 #[cfg(feature = "proto-ipv6-slaac")]
 pub use self::slaac::Slaac;

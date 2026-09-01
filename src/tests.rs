@@ -63,6 +63,8 @@ pub struct TestingDevice {
     #[cfg(feature = "tx-egress-metadata")]
     egress_key_override: Option<phy::EgressKey>,
     #[cfg(feature = "tx-egress-metadata")]
+    egress_schedule: Option<phy::EgressSchedule>,
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) egress_demand_updates: Vec<phy::EgressDemandUpdate>,
 }
 
@@ -93,6 +95,8 @@ impl TestingDevice {
             #[cfg(feature = "tx-egress-metadata")]
             egress_key_override: None,
             #[cfg(feature = "tx-egress-metadata")]
+            egress_schedule: None,
+            #[cfg(feature = "tx-egress-metadata")]
             egress_demand_updates: Vec::new(),
         }
     }
@@ -100,6 +104,11 @@ impl TestingDevice {
     #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn set_egress_key_override(&mut self, key: Option<phy::EgressKey>) {
         self.egress_key_override = key;
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn set_egress_schedule(&mut self, schedule: Option<phy::EgressSchedule>) {
+        self.egress_schedule = schedule;
     }
 }
 
@@ -134,6 +143,11 @@ impl Device for TestingDevice {
     fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
         self.egress_key_override
             .unwrap_or_else(|| phy::EgressKey::from_route(route))
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
+        self.egress_schedule
     }
 
     #[cfg(feature = "tx-egress-metadata")]

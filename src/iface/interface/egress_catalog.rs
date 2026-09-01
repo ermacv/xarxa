@@ -17,7 +17,7 @@ use crate::phy::{
 /// This handle is stack-local. A radio grant names the aggregate
 /// [`EgressDemandId`], never an individual provider.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct EgressDemandHandle {
+pub(crate) struct EgressDemandHandle {
     provider_slot: u16,
     provider_activation: NonZeroU32,
 }
@@ -58,6 +58,7 @@ struct ProviderEntry {
     demand_slot: u16,
     demand_id: EgressDemandId,
     ready_units: NonZeroU16,
+    observed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -218,6 +219,7 @@ impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
             demand_slot: u16::try_from(demand_slot).expect("catalog capacity was checked"),
             demand_id: demand.id,
             ready_units,
+            observed: false,
         });
         Ok((
             EgressDemandHandle {
@@ -284,6 +286,126 @@ impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
         demand.horizon_ready = horizon_ready;
         self.demands[demand_slot] = Some(demand);
         Ok(publish.then(|| EgressDemandUpdate::Active(demand.demand())))
+    }
+
+    fn demand_for(
+        &self,
+        handle: EgressDemandHandle,
+    ) -> Result<DemandEntry, EgressDemandCatalogError> {
+        let provider = self
+            .providers
+            .get(usize::from(handle.provider_slot))
+            .copied()
+            .flatten()
+            .filter(|provider| provider.activation == handle.provider_activation)
+            .ok_or(EgressDemandCatalogError::StaleHandle)?;
+        self.demands
+            .get(usize::from(provider.demand_slot))
+            .copied()
+            .flatten()
+            .filter(|demand| demand.id == provider.demand_id)
+            .ok_or(EgressDemandCatalogError::StaleHandle)
+    }
+
+    fn mark_observed(
+        &mut self,
+        handle: EgressDemandHandle,
+    ) -> Result<(), EgressDemandCatalogError> {
+        let provider = self
+            .providers
+            .get_mut(usize::from(handle.provider_slot))
+            .and_then(Option::as_mut)
+            .filter(|provider| provider.activation == handle.provider_activation)
+            .ok_or(EgressDemandCatalogError::StaleHandle)?;
+        provider.observed = true;
+        Ok(())
+    }
+
+    /// Begin one complete observation of protocol-owned egress providers.
+    pub(super) fn begin_observation(&mut self) {
+        for provider in self.providers.iter_mut().flatten() {
+            provider.observed = false;
+        }
+    }
+
+    /// Reconcile one live protocol provider through its affine socket-owned handle.
+    ///
+    /// A route-to-key change ends the old contribution before starting the new
+    /// one. This is safe even when a generic device violates the stronger
+    /// schedule-epoch stability recommendation.
+    pub(super) fn observe(
+        &mut self,
+        handle: &mut Option<EgressDemandHandle>,
+        key: EgressKey,
+        ready_units: NonZeroU16,
+        mut publish: impl FnMut(EgressDemandUpdate),
+    ) -> Result<(), EgressDemandCatalogError> {
+        if let Some(current) = *handle {
+            match self.demand_for(current) {
+                Ok(demand) if demand.key == key => {
+                    if let Some(update) = self.update(current, ready_units.get())? {
+                        publish(update);
+                    }
+                    self.mark_observed(current)?;
+                    return Ok(());
+                }
+                Ok(_) => {
+                    if let Some(update) = self.update(current, 0)? {
+                        publish(update);
+                    }
+                    *handle = None;
+                }
+                Err(EgressDemandCatalogError::StaleHandle) => {
+                    *handle = None;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        let (new_handle, update) = self.activate(key, ready_units)?;
+        self.mark_observed(new_handle)?;
+        *handle = Some(new_handle);
+        if let Some(update) = update {
+            publish(update);
+        }
+        Ok(())
+    }
+
+    /// End one complete observation and reclaim every disappeared provider.
+    pub(super) fn finish_observation(
+        &mut self,
+        mut publish: impl FnMut(EgressDemandUpdate),
+    ) -> Result<(), EgressDemandCatalogError> {
+        for provider_slot in 0..CAPACITY {
+            let Some(provider) = self.providers[provider_slot] else {
+                continue;
+            };
+            if provider.observed {
+                continue;
+            }
+            let handle = EgressDemandHandle {
+                provider_slot: u16::try_from(provider_slot).expect("catalog capacity was checked"),
+                provider_activation: provider.activation,
+            };
+            if let Some(update) = self.update(handle, 0)? {
+                publish(update);
+            }
+        }
+        Ok(())
+    }
+
+    /// Disable observation and terminate every published demand lifetime.
+    pub(super) fn disable(&mut self, mut publish: impl FnMut(EgressDemandUpdate)) {
+        for demand in self.demands.iter().flatten() {
+            publish(EgressDemandUpdate::Inactive {
+                id: demand.id,
+                key: demand.key,
+            });
+        }
+        self.schedule = None;
+        self.watermarks = None;
+        self.demands.fill(None);
+        self.providers.fill(None);
     }
 
     #[cfg(test)]
@@ -547,5 +669,79 @@ mod tests {
             catalog.update(b, 0).unwrap(),
             Some(EgressDemandUpdate::Inactive { key: ended, .. }) if ended == key(1)
         ));
+    }
+
+    #[test]
+    fn observation_rekeys_one_provider_with_terminal_then_new_lifetime() {
+        let mut catalog = EgressDemandCatalog::<2>::new();
+        catalog.configure(schedule(32, 9)).unwrap();
+        let mut handle = None;
+        let mut updates = std::vec::Vec::new();
+
+        catalog.begin_observation();
+        catalog
+            .observe(&mut handle, key(1), NonZeroU16::new(3).unwrap(), |update| {
+                updates.push(update)
+            })
+            .unwrap();
+        catalog.finish_observation(|_| unreachable!()).unwrap();
+        let first = active(updates.pop().unwrap());
+
+        catalog.begin_observation();
+        catalog
+            .observe(&mut handle, key(2), NonZeroU16::new(3).unwrap(), |update| {
+                updates.push(update)
+            })
+            .unwrap();
+        catalog.finish_observation(|_| unreachable!()).unwrap();
+
+        assert_eq!(updates.len(), 2);
+        assert_eq!(
+            updates[0],
+            EgressDemandUpdate::Inactive {
+                id: first.id(),
+                key: key(1),
+            }
+        );
+        let second = active(updates[1]);
+        assert_eq!(second.key(), key(2));
+        assert_ne!(second.id(), first.id());
+    }
+
+    #[test]
+    fn observation_sweep_and_disable_publish_terminal_lifetimes_once() {
+        let mut catalog = EgressDemandCatalog::<2>::new();
+        catalog.configure(schedule(32, 3)).unwrap();
+        let mut a = None;
+        let mut b = None;
+        catalog.begin_observation();
+        catalog
+            .observe(&mut a, key(1), NonZeroU16::new(1).unwrap(), |_| {})
+            .unwrap();
+        catalog
+            .observe(&mut b, key(2), NonZeroU16::new(1).unwrap(), |_| {})
+            .unwrap();
+        catalog.finish_observation(|_| unreachable!()).unwrap();
+
+        let mut swept = std::vec::Vec::new();
+        catalog.begin_observation();
+        catalog
+            .observe(&mut a, key(1), NonZeroU16::new(1).unwrap(), |_| {})
+            .unwrap();
+        catalog
+            .finish_observation(|update| swept.push(update))
+            .unwrap();
+        assert!(matches!(
+            swept.as_slice(),
+            [EgressDemandUpdate::Inactive { key: ended, .. }] if *ended == key(2)
+        ));
+
+        let mut disabled = std::vec::Vec::new();
+        catalog.disable(|update| disabled.push(update));
+        assert!(matches!(
+            disabled.as_slice(),
+            [EgressDemandUpdate::Inactive { key: ended, .. }] if *ended == key(1)
+        ));
+        catalog.disable(|_| panic!("disabled catalog must not publish twice"));
     }
 }

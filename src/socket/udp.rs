@@ -1,10 +1,14 @@
 use core::cmp::min;
+#[cfg(feature = "tx-egress-metadata")]
+use core::num::NonZeroU16;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
 #[cfg(feature = "tx-egress-metadata")]
 use super::{KeyedDispatchError, KeyedEmitError};
 use crate::iface::Context;
+#[cfg(feature = "tx-egress-metadata")]
+use crate::iface::EgressDemandHandle;
 use crate::phy::PacketMeta;
 #[cfg(feature = "tx-egress-metadata")]
 use crate::phy::{Device, EgressKey};
@@ -127,6 +131,7 @@ struct EgressQueue {
     destination: IpAddress,
     head: PacketHandle,
     tail: PacketHandle,
+    ready_units: usize,
 }
 
 /// Queue identity used before final device backing is requested.
@@ -151,6 +156,8 @@ pub struct Socket<'a> {
     tx_egress_index_enabled: bool,
     tx_egress_index_blocked: bool,
     tx_egress_queues: [Option<EgressQueue>; EGRESS_QUEUE_CAPACITY],
+    #[cfg(feature = "tx-egress-metadata")]
+    tx_egress_demand_handles: [Option<EgressDemandHandle>; EGRESS_QUEUE_CAPACITY],
     tx_egress_current: Option<u8>,
     #[cfg(feature = "tx-egress-metadata")]
     tx_device_egress_current: Option<DeviceEgressQueueKey>,
@@ -172,9 +179,14 @@ impl<'a> Socket<'a> {
             rx_buffer,
             tx_buffer,
             hop_limit: None,
-            tx_egress_index_enabled: false,
+            // A keyed build records every enqueue from the start. This avoids
+            // reconstructing provider queues from packet payload ownership
+            // before the first scheduling observation.
+            tx_egress_index_enabled: cfg!(feature = "tx-egress-metadata"),
             tx_egress_index_blocked: false,
             tx_egress_queues: [None; EGRESS_QUEUE_CAPACITY],
+            #[cfg(feature = "tx-egress-metadata")]
+            tx_egress_demand_handles: [None; EGRESS_QUEUE_CAPACITY],
             tx_egress_current: None,
             #[cfg(feature = "tx-egress-metadata")]
             tx_device_egress_current: None,
@@ -204,6 +216,10 @@ impl<'a> Socket<'a> {
         queues[index] = Some(if let Some(queue) = queues[index] {
             EgressQueue {
                 tail: handle,
+                ready_units: queue
+                    .ready_units
+                    .checked_add(1)
+                    .expect("packet arena bounds UDP egress queue length"),
                 ..queue
             }
         } else {
@@ -211,6 +227,7 @@ impl<'a> Socket<'a> {
                 destination,
                 head: handle,
                 tail: handle,
+                ready_units: 1,
             }
         });
     }
@@ -222,6 +239,10 @@ impl<'a> Socket<'a> {
         self.tx_egress_index_enabled = false;
         self.tx_egress_index_blocked = blocked;
         self.tx_egress_queues = [None; EGRESS_QUEUE_CAPACITY];
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            self.tx_egress_demand_handles = [None; EGRESS_QUEUE_CAPACITY];
+        }
         self.tx_egress_current = None;
         #[cfg(feature = "tx-egress-metadata")]
         {
@@ -240,6 +261,12 @@ impl<'a> Socket<'a> {
             self.tx_egress_cursor = 0;
             self.tx_egress_epoch = epoch;
         }
+    }
+
+    /// Synchronize queue-local scheduler state before interface observation.
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn prepare_egress_demand_epoch(&mut self, epoch: u32) {
+        self.begin_device_egress_epoch(epoch);
     }
 
     fn enable_egress_index(&mut self) -> bool {
@@ -370,8 +397,10 @@ impl<'a> Socket<'a> {
             "device egress scheduling preserves IP FIFO order"
         );
         let queue_emptied = if let Some(next) = next {
+            debug_assert!(queue.ready_units > 1);
             self.tx_egress_queues[queue_index] = Some(EgressQueue {
                 head: next,
+                ready_units: queue.ready_units - 1,
                 ..queue
             });
             false
@@ -392,6 +421,34 @@ impl<'a> Socket<'a> {
         // boundary. Emptying one IP FIFO is not such a boundary when another
         // IP FIFO resolves to the same radio key and the burst has credit.
         burst_completed || queue_emptied
+    }
+
+    /// Visit bounded queue metadata used by the interface demand catalog.
+    ///
+    /// Payload bytes are never inspected. The affine handle remains in its
+    /// queue slot across an empty interval so one interface observation can
+    /// terminate the old lifetime before a later activation reuses the slot.
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn for_each_egress_demand_provider(
+        &mut self,
+        mut visit: impl FnMut(&mut Option<EgressDemandHandle>, IpAddress, NonZeroU16),
+    ) {
+        if !self.enable_egress_index() {
+            return;
+        }
+
+        for index in 0..EGRESS_QUEUE_CAPACITY {
+            let Some(queue) = self.tx_egress_queues[index] else {
+                continue;
+            };
+            let ready_units = NonZeroU16::new(queue.ready_units.min(usize::from(u16::MAX)) as u16)
+                .expect("a live egress queue is nonempty");
+            visit(
+                &mut self.tx_egress_demand_handles[index],
+                queue.destination,
+                ready_units,
+            );
+        }
     }
 
     /// Register a waker for receive operations.

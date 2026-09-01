@@ -143,6 +143,89 @@ fn resolved_burst_epoch_discards_the_previous_lifecycle_phase() {
     assert!(burst.prepare(b));
 }
 
+#[cfg(all(
+    feature = "tx-egress-metadata",
+    feature = "socket-udp",
+    feature = "proto-ipv4",
+    feature = "medium-ethernet"
+))]
+#[test]
+fn udp_providers_from_two_sockets_share_one_demand_lifetime() {
+    use crate::socket::udp;
+
+    fn udp_socket(packet_capacity: usize) -> udp::Socket<'static> {
+        udp::Socket::new(
+            udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 1]),
+            udp::PacketBuffer::new_indexed_slots(
+                vec![udp::PacketMetadata::EMPTY; packet_capacity],
+                vec![0; 8 * packet_capacity],
+            ),
+        )
+    }
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    let destination_a = Ipv4Address::new(192, 168, 1, 10);
+    let destination_b = Ipv4Address::new(192, 168, 1, 11);
+    for (destination, suffix) in [(destination_a, 10), (destination_b, 11)] {
+        iface.inner.neighbor_cache.fill(
+            IpAddress::Ipv4(destination),
+            HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, suffix])),
+            Instant::ZERO,
+        );
+    }
+
+    let shared_key = resolved_key(42);
+    device.set_egress_key_override(Some(shared_key));
+    device.set_egress_schedule(Some(egress_schedule(32, 1, 7)));
+
+    let socket_a = sockets.add(udp_socket(20));
+    let socket_b = sockets.add(udp_socket(12));
+    for (handle, destination, count) in [
+        (socket_a, destination_a, 20_usize),
+        (socket_b, destination_b, 12_usize),
+    ] {
+        let socket = sockets.get_mut::<udp::Socket>(handle);
+        socket.bind(1234).unwrap();
+        for _ in 0..count {
+            socket
+                .send_slice(&[0x5a; 8], (IpAddress::Ipv4(destination), 4321))
+                .unwrap();
+        }
+    }
+
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+
+    assert_eq!(device.egress_demand_updates.len(), 3);
+    assert_eq!(
+        device.egress_demand_updates[0],
+        crate::phy::EgressDemandUpdate::Reset { schedule_epoch: 7 }
+    );
+    let crate::phy::EgressDemandUpdate::Active(first) = device.egress_demand_updates[1] else {
+        panic!("first provider must activate demand");
+    };
+    let crate::phy::EgressDemandUpdate::Active(full_horizon) = device.egress_demand_updates[2]
+    else {
+        panic!("second provider must cross the shared horizon");
+    };
+    assert_eq!(first.key(), shared_key);
+    assert_eq!(first.level().ready_units().get(), 20);
+    assert!(!first.level().horizon_ready());
+    assert_eq!(full_horizon.id(), first.id());
+    assert_eq!(full_horizon.level().ready_units().get(), 32);
+    assert!(full_horizon.level().horizon_ready());
+
+    sockets.remove(socket_a);
+    sockets.remove(socket_b);
+    iface.poll_egress(Instant::ZERO, &mut device, &mut sockets);
+    assert_eq!(
+        device.egress_demand_updates.last(),
+        Some(&crate::phy::EgressDemandUpdate::Inactive {
+            id: first.id(),
+            key: shared_key,
+        })
+    );
+}
+
 #[cfg(feature = "tx-egress-metadata")]
 #[test]
 fn sparse_peer_sends_a_partial_run_without_waiting_for_ba32() {

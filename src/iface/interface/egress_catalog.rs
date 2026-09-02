@@ -239,6 +239,19 @@ impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
         }
     }
 
+    /// Return the exact level from the most recent synchronous interface
+    /// observation for one still-live demand identity.
+    pub(super) fn exact_demand(&self, id: EgressDemandId, key: EgressKey) -> Option<EgressDemand> {
+        self.demands
+            .iter()
+            .flatten()
+            .copied()
+            .find(|demand| {
+                demand.id == id && demand.key == key && demand.committed_ready_units != 0
+            })
+            .map(|demand| demand.demand(demand.committed_ready_units, demand.horizon_ready))
+    }
+
     pub(super) fn disable(&mut self, mut publish: impl FnMut(EgressDemandUpdate)) {
         for demand in self.demands.iter().flatten() {
             if demand.committed_ready_units != 0 {
@@ -270,6 +283,7 @@ mod tests {
             NonZeroU8::new(max_packets).unwrap(),
             NonZeroU8::new(1).unwrap(),
             epoch,
+            crate::phy::EgressGrantMode::StackSelected,
         )
     }
 

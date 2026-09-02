@@ -23,8 +23,9 @@ pub use xarxa_driver::{
 };
 #[cfg(feature = "tx-egress-metadata")]
 pub use xarxa_driver::{
-    EgressAdmission, EgressDemand, EgressDemandId, EgressDemandLevel, EgressDemandUpdate,
-    EgressHardwareAddress, EgressKey, EgressRoute, EgressSchedule,
+    EgressAdmission, EgressBurstGrant, EgressDemand, EgressDemandId, EgressDemandLevel,
+    EgressDemandUpdate, EgressGrantCompletion, EgressGrantMode, EgressHardwareAddress, EgressKey,
+    EgressRoute, EgressSchedule,
 };
 
 /// Type of medium of a driver, as reported in [`DeviceCapabilities::medium`].

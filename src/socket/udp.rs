@@ -1138,6 +1138,7 @@ mod test {
             core::num::NonZeroU8::new(max_packets_per_key).unwrap(),
             core::num::NonZeroU8::new(dispatch_quantum).unwrap(),
             epoch,
+            crate::phy::EgressGrantMode::StackSelected,
         )
     }
 

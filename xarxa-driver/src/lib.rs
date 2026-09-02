@@ -181,6 +181,20 @@ pub struct EgressSchedule {
     max_packets_per_key: NonZeroU8,
     dispatch_quantum: NonZeroU8,
     epoch: u32,
+    grant_mode: EgressGrantMode,
+}
+
+/// How a keyed interface treats a radio-issued egress quantum.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub enum EgressGrantMode {
+    /// Preserve interface-owned key selection and do not poll radio grants.
+    StackSelected,
+    /// Observe and report a radio grant without changing packet selection.
+    Shadow,
+    /// Emit only the exact key and bounded prefix named by a radio grant.
+    Authoritative,
 }
 
 #[cfg(feature = "tx-egress-metadata")]
@@ -190,11 +204,13 @@ impl EgressSchedule {
         max_packets_per_key: NonZeroU8,
         dispatch_quantum: NonZeroU8,
         epoch: u32,
+        grant_mode: EgressGrantMode,
     ) -> Self {
         Self {
             max_packets_per_key,
             dispatch_quantum,
             epoch,
+            grant_mode,
         }
     }
 
@@ -211,6 +227,11 @@ impl EgressSchedule {
     /// Driver-owned lifecycle epoch for this scheduling domain.
     pub const fn epoch(self) -> u32 {
         self.epoch
+    }
+
+    /// Select stack-owned, observational or authoritative grant behavior.
+    pub const fn grant_mode(self) -> EgressGrantMode {
+        self.grant_mode
     }
 }
 
@@ -349,6 +370,96 @@ pub enum EgressDemandUpdate {
         /// Opaque key retained for direct consumer lookup.
         key: EgressKey,
     },
+}
+
+/// One bounded radio-selected egress quantum.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct EgressBurstGrant {
+    serial: NonZeroU32,
+    demand: EgressDemand,
+    frame_credits: NonZeroU8,
+    airtime_hundred_nanoseconds: NonZeroU32,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressBurstGrant {
+    /// Construct one identity-bound, non-zero radio quantum.
+    pub const fn new(
+        serial: NonZeroU32,
+        demand: EgressDemand,
+        frame_credits: NonZeroU8,
+        airtime_hundred_nanoseconds: NonZeroU32,
+    ) -> Self {
+        Self {
+            serial,
+            demand,
+            frame_credits,
+            airtime_hundred_nanoseconds,
+        }
+    }
+
+    /// Monotonic radio-owner grant identity.
+    pub const fn serial(self) -> NonZeroU32 {
+        self.serial
+    }
+
+    /// Exact software-demand lifetime selected by the radio owner.
+    pub const fn demand(self) -> EgressDemand {
+        self.demand
+    }
+
+    /// Maximum number of final packets which may spend this quantum.
+    pub const fn frame_credits(self) -> NonZeroU8 {
+        self.frame_credits
+    }
+
+    /// Conservative complete-quantum airtime reservation in 100 ns units.
+    pub const fn airtime_hundred_nanoseconds(self) -> NonZeroU32 {
+        self.airtime_hundred_nanoseconds
+    }
+}
+
+/// Exact stack-side close record for one radio-issued quantum.
+#[cfg(feature = "tx-egress-metadata")]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+pub struct EgressGrantCompletion {
+    serial: NonZeroU32,
+    used_frames: u8,
+    remaining: Option<EgressDemandLevel>,
+}
+
+#[cfg(feature = "tx-egress-metadata")]
+impl EgressGrantCompletion {
+    /// Construct one terminal stack-side grant record.
+    pub const fn new(
+        serial: NonZeroU32,
+        used_frames: u8,
+        remaining: Option<EgressDemandLevel>,
+    ) -> Self {
+        Self {
+            serial,
+            used_frames,
+            remaining,
+        }
+    }
+
+    /// Exact radio-owner grant identity being closed.
+    pub const fn serial(self) -> NonZeroU32 {
+        self.serial
+    }
+
+    /// Number of final packets materialized from this grant.
+    pub const fn used_frames(self) -> u8 {
+        self.used_frames
+    }
+
+    /// Exact remaining level for the same demand, or `None` when it ended.
+    pub const fn remaining(self) -> Option<EgressDemandLevel> {
+        self.remaining
+    }
 }
 
 /// Metadata associated to a packet.
@@ -666,6 +777,22 @@ pub trait Device {
     #[allow(unused_variables)]
     fn update_egress_demand(&mut self, update: EgressDemandUpdate) {}
 
+    /// Poll one radio-selected quantum after publishing software demand.
+    ///
+    /// A returned grant is retained by the device as well as observed by the
+    /// stack. The stack must close it exactly once with
+    /// [`Self::finish_egress_grant`].
+    #[cfg(feature = "tx-egress-metadata")]
+    fn poll_egress_grant(&mut self) -> Option<EgressBurstGrant> {
+        None
+    }
+
+    /// Close one exact radio-issued quantum with the stack's final remaining
+    /// demand snapshot.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn finish_egress_grant(&mut self, completion: EgressGrantCompletion) {}
+
     /// Poll for the timestamp of an already-transmitted packet.
     ///
     /// Returns the transmit timestamp of a packet previously sent with
@@ -734,6 +861,16 @@ impl<T: ?Sized + Device> Device for &mut T {
     #[cfg(feature = "tx-egress-metadata")]
     fn update_egress_demand(&mut self, update: EgressDemandUpdate) {
         T::update_egress_demand(self, update)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn poll_egress_grant(&mut self) -> Option<EgressBurstGrant> {
+        T::poll_egress_grant(self)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn finish_egress_grant(&mut self, completion: EgressGrantCompletion) {
+        T::finish_egress_grant(self, completion)
     }
 
     #[cfg(feature = "packetmeta-timestamp")]

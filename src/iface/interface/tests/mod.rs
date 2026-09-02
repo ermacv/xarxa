@@ -34,6 +34,7 @@ fn egress_schedule(max_packets_per_key: u8, dispatch_quantum: u8, epoch: u32) ->
         core::num::NonZeroU8::new(max_packets_per_key).unwrap(),
         core::num::NonZeroU8::new(dispatch_quantum).unwrap(),
         epoch,
+        crate::phy::EgressGrantMode::StackSelected,
     )
 }
 

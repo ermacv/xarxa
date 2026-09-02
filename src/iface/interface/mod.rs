@@ -1284,7 +1284,7 @@ impl Interface {
                         Some(EgressPreparedAdmission::StackSelected) => {
                             Device::transmit_for(device, egress)
                         }
-                        None => unreachable!("a scheduled key has a prepared admission"),
+                        None => Device::transmit_for(device, egress),
                     },
                     (_, None) => match Device::transmit(device) {
                         Some(token) => EgressAdmission::Granted(token),

@@ -247,16 +247,15 @@ impl EgressBurstState {
         self.grant
     }
 
-    fn grant_complete_after_round(&self) -> bool {
+    fn grant_complete(&self) -> bool {
         let Some(grant) = self.grant else {
             return false;
         };
-        let mode = self
-            .schedule
-            .expect("an installed grant retains its schedule")
-            .grant_mode();
-        mode == crate::phy::EgressGrantMode::Shadow
-            || self.grant_used >= grant.frame_credits().get()
+        // A burst grant is a cross-round credit lease. In particular, the
+        // stack dispatch quantum may be smaller than the radio aggregation
+        // horizon, so a poll boundary must not turn one radio grant into a
+        // per-dispatch (and eventually per-packet) handshake.
+        self.grant_used >= grant.frame_credits().get()
     }
 
     fn take_grant_completion(
@@ -425,7 +424,7 @@ mod egress_grant_tests {
     }
 
     #[test]
-    fn shadow_grant_observes_without_changing_stack_selection() {
+    fn shadow_grant_survives_rounds_until_its_credits_are_spent() {
         let mut state = EgressBurstState::default();
         assert_eq!(state.configure(schedule(EgressGrantMode::Shadow, 7)), None);
         let grant = grant(1, key(2), 2);
@@ -435,14 +434,28 @@ mod egress_grant_tests {
         state.commit(key(1));
         assert!(state.prepare(key(1)));
         state.commit(key(1));
-        assert!(state.grant_complete_after_round());
+        assert!(!state.grant_complete());
         assert!(!state.finish_round(false));
-        assert!(state.grant_complete_after_round());
+        assert!(!state.grant_complete());
+
+        assert!(!state.prepare(key(2)));
+        assert!(state.finish_round(false));
+        assert!(!state.grant_complete());
+
+        assert!(state.prepare(key(2)));
+        state.commit(key(2));
+        assert!(!state.grant_complete());
+        assert!(!state.finish_round(false));
+        assert!(!state.grant_complete());
+
+        assert!(state.prepare(key(2)));
+        state.commit(key(2));
+        assert!(state.grant_complete());
         assert_eq!(
             state.take_grant_completion(Some(grant.demand().level())),
             Some(crate::phy::EgressGrantCompletion::new(
                 grant.serial(),
-                0,
+                2,
                 Some(grant.demand().level()),
             ))
         );
@@ -461,7 +474,7 @@ mod egress_grant_tests {
             state.commit(key(2));
         }
         assert!(!state.prepare(key(2)));
-        assert!(state.grant_complete_after_round());
+        assert!(state.grant_complete());
         let completion = state.take_grant_completion(None).unwrap();
         assert_eq!(completion.serial(), grant.serial());
         assert_eq!(completion.used_frames(), 2);
@@ -1291,11 +1304,11 @@ impl Interface {
             result = PollResult::SocketStateChanged;
         }
         #[cfg(feature = "tx-egress-metadata")]
-        if self.inner.egress_burst.grant_complete_after_round() {
-            // Rebuild exact queue levels after the synchronous dispatch turn.
-            // The ordinary demand callback and this completion therefore
-            // share device publication order, while no per-packet level
-            // update is introduced.
+        if self.inner.egress_burst.grant_complete() {
+            // Rebuild exact queue levels after the synchronous turn that
+            // spent the final credit. The ordinary demand callback and this
+            // completion therefore share device publication order, while no
+            // per-packet level update is introduced.
             self.reconcile_egress_demands(device, sockets, egress_schedule);
             let remaining = self.inner.egress_burst.active_grant().and_then(|grant| {
                 self.egress_demands

@@ -70,6 +70,10 @@ pub struct TestingDevice {
     pub(crate) egress_grants: VecDeque<phy::EgressBurstGrant>,
     #[cfg(feature = "tx-egress-metadata")]
     pub(crate) egress_grant_completions: Vec<phy::EgressGrantCompletion>,
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) ordinary_transmit_calls: usize,
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) control_transmit_calls: usize,
 }
 
 #[allow(clippy::new_without_default)]
@@ -106,6 +110,10 @@ impl TestingDevice {
             egress_grants: VecDeque::new(),
             #[cfg(feature = "tx-egress-metadata")]
             egress_grant_completions: Vec::new(),
+            #[cfg(feature = "tx-egress-metadata")]
+            ordinary_transmit_calls: 0,
+            #[cfg(feature = "tx-egress-metadata")]
+            control_transmit_calls: 0,
         }
     }
 
@@ -147,6 +155,18 @@ impl Device for TestingDevice {
     }
 
     fn transmit(&mut self) -> Option<Self::TxToken<'_>> {
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            self.ordinary_transmit_calls = self.ordinary_transmit_calls.saturating_add(1);
+        }
+        Some(TxToken {
+            queue: &mut self.tx_queue,
+        })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self) -> Option<Self::TxToken<'_>> {
+        self.control_transmit_calls = self.control_transmit_calls.saturating_add(1);
         Some(TxToken {
             queue: &mut self.tx_queue,
         })

@@ -265,6 +265,7 @@ fn authoritative_udp_schedule_does_not_gate_uncatalogued_dhcp_control() {
     );
     assert!(device.egress_grants.is_empty());
     assert!(device.egress_grant_completions.is_empty());
+    assert_eq!(device.control_transmit_calls, 1);
     assert_eq!(sockets.get::<udp::Socket>(udp_handle).send_queue(), 8);
     assert_eq!(device.egress_demand_updates.len(), 2);
     assert_eq!(

@@ -278,6 +278,18 @@ impl<D: Device> Device for FaultInjector<D> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self) -> Option<Self::TxToken<'_>> {
+        let clock = self.clock;
+        self.inner.transmit_control().map(|token| TxToken {
+            state: &mut self.state,
+            config: self.config,
+            token,
+            junk: [0; MTU],
+            clock,
+        })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
         self.inner.egress_key(route)
     }

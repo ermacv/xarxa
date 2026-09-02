@@ -1095,7 +1095,10 @@ impl Interface {
             Catalogued,
             /// The provider has no selectable queue head yet. It must not be
             /// deadlocked behind a grant which it has no way to request.
-            Uncatalogued,
+            UncataloguedBulk,
+            /// Bounded network-control work which may use a driver's fixed
+            /// reserve while bulk keyed queues occupy the ordinary horizon.
+            Control,
         }
 
         #[cfg(feature = "tx-egress-metadata")]
@@ -1130,9 +1133,10 @@ impl Interface {
                 let egress_key = egress_route.map(|route| Device::egress_key(device, route));
                 #[cfg(feature = "tx-egress-metadata")]
                 let scheduled_key = match (coverage, egress_schedule) {
-                    (EgressProviderCoverage::Uncatalogued, Some(schedule))
-                        if schedule.grant_mode() == crate::phy::EgressGrantMode::Authoritative =>
-                    {
+                    (
+                        EgressProviderCoverage::UncataloguedBulk | EgressProviderCoverage::Control,
+                        Some(schedule),
+                    ) if schedule.grant_mode() == crate::phy::EgressGrantMode::Authoritative => {
                         None
                     }
                     _ => egress_key,
@@ -1144,9 +1148,15 @@ impl Interface {
                     return Err(KeyedEmitError::KeyDeferred);
                 }
                 #[cfg(feature = "tx-egress-metadata")]
-                let admission = match scheduled_key {
-                    Some(egress) => Device::transmit_for(device, egress),
-                    None => match Device::transmit(device) {
+                let admission = match (coverage, scheduled_key) {
+                    (EgressProviderCoverage::Control, None) => {
+                        match Device::transmit_control(device) {
+                            Some(token) => EgressAdmission::Granted(token),
+                            None => EgressAdmission::GlobalExhausted,
+                        }
+                    }
+                    (_, Some(egress)) => Device::transmit_for(device, egress),
+                    (_, None) => match Device::transmit(device) {
                         Some(token) => EgressAdmission::Granted(token),
                         None => EgressAdmission::GlobalExhausted,
                     },
@@ -1203,20 +1213,15 @@ impl Interface {
                 Ok(())
             };
 
-            macro_rules! respond_global {
-                ($inner:expr, $meta:expr, $packet:expr) => {{
+            macro_rules! respond_uncatalogued {
+                ($coverage:expr, $inner:expr, $meta:expr, $packet:expr) => {{
                     #[cfg(feature = "tx-egress-metadata")]
                     {
-                        respond(
-                            $inner,
-                            device,
-                            EgressProviderCoverage::Uncatalogued,
-                            $meta,
-                            $packet,
-                        )
-                        .map_err(|error| match error {
-                            KeyedEmitError::KeyDeferred => EgressError::AllKeysDeferred,
-                            KeyedEmitError::Global(error) => error,
+                        respond($inner, device, $coverage, $meta, $packet).map_err(|error| {
+                            match error {
+                                KeyedEmitError::KeyDeferred => EgressError::AllKeysDeferred,
+                                KeyedEmitError::Global(error) => error,
+                            }
                         })
                     }
                     #[cfg(not(feature = "tx-egress-metadata"))]
@@ -1226,10 +1231,27 @@ impl Interface {
                 }};
             }
 
+            macro_rules! respond_bulk {
+                ($inner:expr, $meta:expr, $packet:expr) => {
+                    respond_uncatalogued!(
+                        EgressProviderCoverage::UncataloguedBulk,
+                        $inner,
+                        $meta,
+                        $packet
+                    )
+                };
+            }
+
+            macro_rules! respond_control {
+                ($inner:expr, $meta:expr, $packet:expr) => {
+                    respond_uncatalogued!(EgressProviderCoverage::Control, $inner, $meta, $packet)
+                };
+            }
+
             let result = match &mut item.socket {
                 #[cfg(feature = "socket-raw")]
                 Socket::Raw(socket) => socket.dispatch(&mut self.inner, |inner, (ip, raw)| {
-                    respond_global!(
+                    respond_bulk!(
                         inner,
                         PacketMeta::default(),
                         Packet::new(ip, IpPayload::Raw(raw))
@@ -1239,13 +1261,13 @@ impl Interface {
                 Socket::Icmp(socket) => {
                     socket.dispatch(&mut self.inner, |inner, response| match response {
                         #[cfg(feature = "proto-ipv4")]
-                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond_global!(
+                        (IpRepr::Ipv4(ipv4_repr), IcmpRepr::Ipv4(icmpv4_repr)) => respond_control!(
                             inner,
                             PacketMeta::default(),
                             Packet::new_ipv4(ipv4_repr, IpPayload::Icmpv4(icmpv4_repr))
                         ),
                         #[cfg(feature = "proto-ipv6")]
-                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond_global!(
+                        (IpRepr::Ipv6(ipv6_repr), IcmpRepr::Ipv6(icmpv6_repr)) => respond_control!(
                             inner,
                             PacketMeta::default(),
                             Packet::new_ipv6(ipv6_repr, IpPayload::Icmpv6(icmpv6_repr))
@@ -1292,7 +1314,7 @@ impl Interface {
                 }
                 #[cfg(feature = "socket-tcp")]
                 Socket::Tcp(socket) => socket.dispatch(&mut self.inner, |inner, (ip, tcp)| {
-                    respond_global!(
+                    respond_bulk!(
                         inner,
                         PacketMeta::default(),
                         Packet::new(ip, IpPayload::Tcp(tcp))
@@ -1301,7 +1323,7 @@ impl Interface {
                 #[cfg(feature = "socket-dhcpv4")]
                 Socket::Dhcpv4(socket) => {
                     socket.dispatch(&mut self.inner, |inner, (ip, udp, dhcp)| {
-                        respond_global!(
+                        respond_control!(
                             inner,
                             PacketMeta::default(),
                             Packet::new_ipv4(ip, IpPayload::Dhcpv4(udp, dhcp))
@@ -1310,7 +1332,7 @@ impl Interface {
                 }
                 #[cfg(feature = "socket-dns")]
                 Socket::Dns(socket) => socket.dispatch(&mut self.inner, |inner, (ip, udp, dns)| {
-                    respond_global!(
+                    respond_control!(
                         inner,
                         PacketMeta::default(),
                         Packet::new(ip, IpPayload::Udp(udp, dns))

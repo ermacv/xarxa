@@ -728,6 +728,18 @@ pub trait Device {
     /// if there is no free space and fail later.
     fn transmit(&mut self) -> Option<Self::TxToken<'_>>;
 
+    /// Construct a token for bounded network-control traffic.
+    ///
+    /// Drivers with one shared packet pool may keep the default. A device
+    /// whose bulk scheduler can consume every ordinary credit may override
+    /// this operation with a small, fixed reserve. The stack must use it only
+    /// for control providers such as DHCP, DNS and ICMP, never as an escape
+    /// from keyed scheduling for TCP, raw sockets or other bulk traffic.
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self) -> Option<Self::TxToken<'_>> {
+        self.transmit()
+    }
+
     /// Canonicalize a stack-resolved route into the device scheduling domain.
     ///
     /// The default preserves one distinct key per link destination and traffic
@@ -837,6 +849,11 @@ impl<T: ?Sized + Device> Device for &mut T {
 
     fn transmit(&mut self) -> Option<Self::TxToken<'_>> {
         T::transmit(self)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self) -> Option<Self::TxToken<'_>> {
+        T::transmit_control(self)
     }
 
     #[cfg(feature = "tx-egress-metadata")]

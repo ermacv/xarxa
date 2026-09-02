@@ -219,6 +219,19 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_control(&mut self) -> Option<Self::TxToken<'_>> {
+        let sink = &self.sink;
+        let mode = self.mode;
+        let clock = self.clock;
+        self.lower.transmit_control().map(move |token| TxToken {
+            token,
+            sink,
+            mode,
+            clock,
+        })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
         self.lower.egress_key(route)
     }

@@ -310,20 +310,32 @@ impl EgressBurstState {
     }
 
     fn commit(&mut self, egress: EgressKey) {
-        if let Some(grant) = self.grant
-            && grant.demand().key() == egress
-            && self.grant_used < grant.frame_credits().get()
-        {
-            self.grant_used = self.grant_used.saturating_add(1);
-        }
         if self
             .schedule
             .expect("configured egress scheduler")
             .grant_mode()
             == crate::phy::EgressGrantMode::Authoritative
         {
+            // `commit` is reached only after `prepare` authorized this exact
+            // key and the device accepted the packet. No scheduler state can
+            // change inside that synchronous emission transaction. Keep the
+            // invariant visible in debug builds without repeating the full
+            // 128-bit key and credit checks on every production packet.
+            debug_assert!(self.grant.is_some_and(|grant| {
+                grant.demand().key() == egress && self.grant_used < grant.frame_credits().get()
+            }));
+            self.grant_used += 1;
             self.granted_in_round = true;
             return;
+        }
+
+        // A shadow grant observes stack-selected work, so unlike an
+        // authoritative grant it may legitimately not match this packet.
+        if let Some(grant) = self.grant
+            && grant.demand().key() == egress
+            && self.grant_used < grant.frame_credits().get()
+        {
+            self.grant_used = self.grant_used.saturating_add(1);
         }
         let max_packets = self
             .schedule

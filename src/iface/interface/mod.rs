@@ -1047,6 +1047,8 @@ impl Interface {
         #[cfg(feature = "tx-egress-metadata")]
         let egress_schedule = device.egress_schedule();
         #[cfg(feature = "tx-egress-metadata")]
+        let mut grant_state_changed = false;
+        #[cfg(feature = "tx-egress-metadata")]
         let displaced_grant = match egress_schedule {
             Some(schedule) => self.inner.egress_burst.configure(schedule),
             None => self.inner.egress_burst.disable(),
@@ -1054,6 +1056,7 @@ impl Interface {
         #[cfg(feature = "tx-egress-metadata")]
         if let Some(completion) = displaced_grant {
             device.finish_egress_grant(completion);
+            grant_state_changed = true;
         }
         #[cfg(feature = "tx-egress-metadata")]
         self.reconcile_egress_demands(device, sockets, egress_schedule);
@@ -1063,6 +1066,7 @@ impl Interface {
             && let Err(completion) = self.inner.egress_burst.install_grant(grant)
         {
             device.finish_egress_grant(completion);
+            grant_state_changed = true;
         }
         #[cfg(feature = "tx-egress-metadata")]
         if let Some(grant) = self.inner.egress_burst.active_grant()
@@ -1073,6 +1077,7 @@ impl Interface {
             && let Some(completion) = self.inner.egress_burst.take_grant_completion(None)
         {
             device.finish_egress_grant(completion);
+            grant_state_changed = true;
         }
 
         enum EgressError {
@@ -1082,6 +1087,13 @@ impl Interface {
             AllKeysDeferred,
         }
 
+        #[cfg(feature = "tx-egress-metadata")]
+        let mut result = if grant_state_changed {
+            PollResult::SocketStateChanged
+        } else {
+            PollResult::None
+        };
+        #[cfg(not(feature = "tx-egress-metadata"))]
         let mut result = PollResult::None;
         #[cfg(feature = "tx-egress-metadata")]
         let mut globally_exhausted = false;

@@ -66,6 +66,10 @@ pub struct TestingDevice {
     egress_schedule: Option<phy::EgressSchedule>,
     #[cfg(feature = "tx-egress-metadata")]
     pub(crate) egress_demand_updates: Vec<phy::EgressDemandUpdate>,
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) egress_grants: VecDeque<phy::EgressBurstGrant>,
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) egress_grant_completions: Vec<phy::EgressGrantCompletion>,
 }
 
 #[allow(clippy::new_without_default)]
@@ -98,6 +102,10 @@ impl TestingDevice {
             egress_schedule: None,
             #[cfg(feature = "tx-egress-metadata")]
             egress_demand_updates: Vec::new(),
+            #[cfg(feature = "tx-egress-metadata")]
+            egress_grants: VecDeque::new(),
+            #[cfg(feature = "tx-egress-metadata")]
+            egress_grant_completions: Vec::new(),
         }
     }
 
@@ -109,6 +117,11 @@ impl TestingDevice {
     #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn set_egress_schedule(&mut self, schedule: Option<phy::EgressSchedule>) {
         self.egress_schedule = schedule;
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn push_egress_grant(&mut self, grant: phy::EgressBurstGrant) {
+        self.egress_grants.push_back(grant);
     }
 }
 
@@ -153,6 +166,16 @@ impl Device for TestingDevice {
     #[cfg(feature = "tx-egress-metadata")]
     fn update_egress_demand(&mut self, update: phy::EgressDemandUpdate) {
         self.egress_demand_updates.push(update);
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn poll_egress_grant(&mut self) -> Option<phy::EgressBurstGrant> {
+        self.egress_grants.pop_front()
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn finish_egress_grant(&mut self, completion: phy::EgressGrantCompletion) {
+        self.egress_grant_completions.push(completion);
     }
 }
 

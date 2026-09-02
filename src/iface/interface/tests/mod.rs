@@ -220,6 +220,161 @@ fn udp_providers_from_two_sockets_share_one_demand_lifetime() {
     );
 }
 
+#[cfg(all(
+    feature = "tx-egress-metadata",
+    feature = "socket-udp",
+    feature = "proto-ipv4",
+    feature = "medium-ethernet"
+))]
+#[test]
+fn authoritative_current_and_standby_grants_drain_without_an_external_wake() {
+    use crate::socket::udp;
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    let destination = Ipv4Address::new(192, 168, 1, 10);
+    iface.inner.neighbor_cache.fill(
+        IpAddress::Ipv4(destination),
+        HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 10])),
+        Instant::ZERO,
+    );
+    let selected = resolved_key(42);
+    device.set_egress_key_override(Some(selected));
+    device.set_egress_schedule(Some(EgressSchedule::new(
+        core::num::NonZeroU8::new(32).unwrap(),
+        core::num::NonZeroU8::MIN,
+        7,
+        crate::phy::EgressGrantMode::Authoritative,
+    )));
+
+    let socket = udp::Socket::new(
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 1]),
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY; 2], vec![0; 16]),
+    );
+    let handle = sockets.add(socket);
+    let socket = sockets.get_mut::<udp::Socket>(handle);
+    socket.bind(1234).unwrap();
+    for byte in [0x5a, 0x5b] {
+        socket
+            .send_slice(&[byte; 8], (IpAddress::Ipv4(destination), 4321))
+            .unwrap();
+    }
+
+    assert_eq!(
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets),
+        PollResult::None
+    );
+    let crate::phy::EgressDemandUpdate::Active(initial) = device.egress_demand_updates[1] else {
+        panic!("the first egress pass must publish its active demand");
+    };
+    let tx_before_grants = device.tx_queue.len();
+    let standby_demand = crate::phy::EgressDemand::new(
+        initial.id(),
+        initial.key(),
+        crate::phy::EgressDemandLevel::new(core::num::NonZeroU16::MIN, false),
+    );
+    for (serial, demand) in [(1, initial), (2, standby_demand)] {
+        device.push_egress_grant(crate::phy::EgressBurstGrant::new(
+            core::num::NonZeroU32::new(serial).unwrap(),
+            demand,
+            core::num::NonZeroU8::MIN,
+            core::num::NonZeroU32::new(1_000).unwrap(),
+        ));
+    }
+
+    assert_eq!(
+        iface.poll(Instant::ZERO, &mut device, &mut sockets),
+        PollResult::SocketStateChanged
+    );
+    assert_eq!(device.tx_queue.len() - tx_before_grants, 2);
+    assert!(device.egress_grants.is_empty());
+    assert_eq!(device.egress_grant_completions.len(), 2);
+    assert_eq!(
+        device
+            .egress_grant_completions
+            .iter()
+            .map(|completion| (completion.serial().get(), completion.used_frames()))
+            .collect::<Vec<_>>(),
+        vec![(1, 1), (2, 1)]
+    );
+}
+
+#[cfg(all(
+    feature = "tx-egress-metadata",
+    feature = "socket-udp",
+    feature = "proto-ipv4",
+    feature = "medium-ethernet"
+))]
+#[test]
+fn stale_current_grant_yields_to_a_valid_standby_without_sleeping() {
+    use crate::socket::udp;
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    let destination = Ipv4Address::new(192, 168, 1, 10);
+    iface.inner.neighbor_cache.fill(
+        IpAddress::Ipv4(destination),
+        HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 10])),
+        Instant::ZERO,
+    );
+    let selected = resolved_key(42);
+    device.set_egress_key_override(Some(selected));
+    device.set_egress_schedule(Some(EgressSchedule::new(
+        core::num::NonZeroU8::new(32).unwrap(),
+        core::num::NonZeroU8::MIN,
+        7,
+        crate::phy::EgressGrantMode::Authoritative,
+    )));
+    let socket = udp::Socket::new(
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 1]),
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 8]),
+    );
+    let handle = sockets.add(socket);
+    let socket = sockets.get_mut::<udp::Socket>(handle);
+    socket.bind(1234).unwrap();
+    socket
+        .send_slice(&[0x5a; 8], (IpAddress::Ipv4(destination), 4321))
+        .unwrap();
+
+    assert_eq!(
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets),
+        PollResult::None
+    );
+    let crate::phy::EgressDemandUpdate::Active(demand) = device.egress_demand_updates[1] else {
+        panic!("the first egress pass must publish its active demand");
+    };
+    let stale = crate::phy::EgressDemand::new(
+        crate::phy::EgressDemandId::new(
+            demand.id().schedule_epoch(),
+            core::num::NonZeroU32::new(demand.id().activation().get() + 1).unwrap(),
+        ),
+        demand.key(),
+        demand.level(),
+    );
+    for (serial, candidate) in [(1, stale), (2, demand)] {
+        device.push_egress_grant(crate::phy::EgressBurstGrant::new(
+            core::num::NonZeroU32::new(serial).unwrap(),
+            candidate,
+            core::num::NonZeroU8::MIN,
+            core::num::NonZeroU32::new(1_000).unwrap(),
+        ));
+    }
+    let tx_before_grants = device.tx_queue.len();
+
+    assert_eq!(
+        iface.poll(Instant::ZERO, &mut device, &mut sockets),
+        PollResult::SocketStateChanged
+    );
+    assert_eq!(device.tx_queue.len() - tx_before_grants, 1);
+    assert!(device.egress_grants.is_empty());
+    assert_eq!(
+        device
+            .egress_grant_completions
+            .iter()
+            .map(|completion| (completion.serial().get(), completion.used_frames()))
+            .collect::<Vec<_>>(),
+        vec![(1, 0), (2, 1)]
+    );
+}
+
 #[cfg(feature = "tx-egress-metadata")]
 #[test]
 fn sparse_peer_sends_a_partial_run_without_waiting_for_ba32() {

@@ -250,6 +250,24 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(
+        &mut self,
+        grant_serial: core::num::NonZeroU32,
+    ) -> phy::EgressAdmission<Self::TxToken<'_>> {
+        let sink = &self.sink;
+        let mode = self.mode;
+        let clock = self.clock;
+        self.lower
+            .transmit_granted(grant_serial)
+            .map(move |token| TxToken {
+                token,
+                sink,
+                mode,
+                clock,
+            })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.lower.egress_schedule()
     }

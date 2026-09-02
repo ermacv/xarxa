@@ -765,6 +765,20 @@ pub trait Device {
         }
     }
 
+    /// Spend one packet credit from an exact driver-issued grant.
+    ///
+    /// Xarxa has already selected a queue whose opaque key matches this
+    /// grant. An authoritative device must still validate the serial, epoch
+    /// and remaining credit, and must derive the packet's physical egress
+    /// metadata from its retained grant rather than trusting stack input.
+    /// The default rejects because a device without grant state cannot make
+    /// that proof.
+    #[cfg(feature = "tx-egress-metadata")]
+    #[allow(unused_variables)]
+    fn transmit_granted(&mut self, grant_serial: NonZeroU32) -> EgressAdmission<Self::TxToken<'_>> {
+        EgressAdmission::KeyDeferred
+    }
+
     /// Get a description of device capabilities.
     fn capabilities(&self) -> DeviceCapabilities;
 
@@ -864,6 +878,11 @@ impl<T: ?Sized + Device> Device for &mut T {
     #[cfg(feature = "tx-egress-metadata")]
     fn transmit_for(&mut self, egress: EgressKey) -> EgressAdmission<Self::TxToken<'_>> {
         T::transmit_for(self, egress)
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(&mut self, grant_serial: NonZeroU32) -> EgressAdmission<Self::TxToken<'_>> {
+        T::transmit_granted(self, grant_serial)
     }
 
     fn capabilities(&self) -> DeviceCapabilities {

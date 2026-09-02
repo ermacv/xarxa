@@ -307,6 +307,23 @@ impl<D: Device> Device for FaultInjector<D> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(
+        &mut self,
+        grant_serial: core::num::NonZeroU32,
+    ) -> phy::EgressAdmission<Self::TxToken<'_>> {
+        let clock = self.clock;
+        self.inner
+            .transmit_granted(grant_serial)
+            .map(|token| TxToken {
+                state: &mut self.state,
+                config: self.config,
+                token,
+                junk: [0; MTU],
+                clock,
+            })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.inner.egress_schedule()
     }

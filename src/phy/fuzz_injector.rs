@@ -111,6 +111,19 @@ where
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(
+        &mut self,
+        grant_serial: core::num::NonZeroU32,
+    ) -> phy::EgressAdmission<Self::TxToken<'_>> {
+        self.inner
+            .transmit_granted(grant_serial)
+            .map(|token| TxToken {
+                fuzzer: &mut self.fuzz_tx,
+                token,
+            })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.inner.egress_schedule()
     }

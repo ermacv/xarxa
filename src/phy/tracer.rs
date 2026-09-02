@@ -111,6 +111,21 @@ impl<D: Device> Device for Tracer<D> {
     }
 
     #[cfg(feature = "tx-egress-metadata")]
+    fn transmit_granted(
+        &mut self,
+        grant_serial: core::num::NonZeroU32,
+    ) -> phy::EgressAdmission<Self::TxToken<'_>> {
+        let medium = self.inner.capabilities().medium;
+        self.inner
+            .transmit_granted(grant_serial)
+            .map(|token| TxToken {
+                token,
+                medium,
+                writer: self.writer,
+            })
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn egress_schedule(&mut self) -> Option<phy::EgressSchedule> {
         self.inner.egress_schedule()
     }

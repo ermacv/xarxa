@@ -190,6 +190,13 @@ pub struct InterfaceInner {
 const EGRESS_GRANT_PIPELINE_DEPTH: usize = 2;
 
 #[cfg(feature = "tx-egress-metadata")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EgressPreparedAdmission {
+    StackSelected,
+    Authoritative(core::num::NonZeroU32),
+}
+
+#[cfg(feature = "tx-egress-metadata")]
 #[derive(Default)]
 struct EgressBurstState {
     current: Option<EgressKey>,
@@ -200,8 +207,8 @@ struct EgressBurstState {
     deferred_in_round: Option<EgressKey>,
     quota_blocked_in_round: bool,
     grant: Option<crate::phy::EgressBurstGrant>,
-    standby_grant: Option<crate::phy::EgressBurstGrant>,
     grant_used: u8,
+    standby_grant: Option<crate::phy::EgressBurstGrant>,
 }
 
 #[cfg(feature = "tx-egress-metadata")]
@@ -301,15 +308,16 @@ impl EgressBurstState {
         ))
     }
 
-    fn prepare(&mut self, egress: EgressKey) -> bool {
+    fn prepare_admission(&mut self, egress: EgressKey) -> Option<EgressPreparedAdmission> {
         if self
             .schedule
             .expect("configured egress scheduler")
             .grant_mode()
             == crate::phy::EgressGrantMode::Authoritative
         {
-            return self.grant.is_some_and(|grant| {
-                grant.demand().key() == egress && self.grant_used < grant.frame_credits().get()
+            return self.grant.and_then(|grant| {
+                (grant.demand().key() == egress && self.grant_used < grant.frame_credits().get())
+                    .then_some(EgressPreparedAdmission::Authoritative(grant.serial()))
             });
         }
         let max_packets = self
@@ -319,24 +327,29 @@ impl EgressBurstState {
             .get();
 
         let Some(current) = self.current else {
-            return true;
+            return Some(EgressPreparedAdmission::StackSelected);
         };
         if current == egress {
             if self.run_length < max_packets || !self.contended {
-                return true;
+                return Some(EgressPreparedAdmission::StackSelected);
             }
             self.quota_blocked_in_round = true;
-            return false;
+            return None;
         }
 
         self.contended = true;
         if self.run_length >= max_packets {
-            return true;
+            return Some(EgressPreparedAdmission::StackSelected);
         }
         if self.deferred_in_round.is_none() {
             self.deferred_in_round = Some(egress);
         }
-        false
+        None
+    }
+
+    #[cfg(test)]
+    fn prepare(&mut self, egress: EgressKey) -> bool {
+        self.prepare_admission(egress).is_some()
     }
 
     fn commit(&mut self, egress: EgressKey) {
@@ -1248,11 +1261,14 @@ impl Interface {
                     _ => egress_key,
                 };
                 #[cfg(feature = "tx-egress-metadata")]
-                if let (Some(egress), Some(_)) = (scheduled_key, egress_schedule)
-                    && !inner.egress_burst.prepare(egress)
-                {
-                    return Err(KeyedEmitError::KeyDeferred);
-                }
+                let prepared_admission = match (scheduled_key, egress_schedule) {
+                    (Some(egress), Some(_)) => inner
+                        .egress_burst
+                        .prepare_admission(egress)
+                        .ok_or(KeyedEmitError::KeyDeferred)?
+                        .into(),
+                    _ => None,
+                };
                 #[cfg(feature = "tx-egress-metadata")]
                 let admission = match (coverage, scheduled_key) {
                     (EgressProviderCoverage::Control, None) => {
@@ -1261,7 +1277,15 @@ impl Interface {
                             None => EgressAdmission::GlobalExhausted,
                         }
                     }
-                    (_, Some(egress)) => Device::transmit_for(device, egress),
+                    (_, Some(egress)) => match prepared_admission {
+                        Some(EgressPreparedAdmission::Authoritative(serial)) => {
+                            Device::transmit_granted(device, serial)
+                        }
+                        Some(EgressPreparedAdmission::StackSelected) => {
+                            Device::transmit_for(device, egress)
+                        }
+                        None => unreachable!("a scheduled key has a prepared admission"),
+                    },
                     (_, None) => match Device::transmit(device) {
                         Some(token) => EgressAdmission::Granted(token),
                         None => EgressAdmission::GlobalExhausted,

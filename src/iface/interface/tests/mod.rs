@@ -344,6 +344,14 @@ fn authoritative_current_and_standby_grants_drain_without_an_external_wake() {
         PollResult::SocketStateChanged
     );
     assert_eq!(device.tx_queue.len() - tx_before_grants, 2);
+    assert_eq!(
+        device
+            .granted_transmit_serials
+            .iter()
+            .map(|serial| serial.get())
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
     assert!(device.egress_grants.is_empty());
     assert_eq!(device.egress_grant_completions.len(), 2);
     assert_eq!(
@@ -422,6 +430,10 @@ fn stale_current_grant_yields_to_a_valid_standby_without_sleeping() {
         PollResult::SocketStateChanged
     );
     assert_eq!(device.tx_queue.len() - tx_before_grants, 1);
+    assert_eq!(
+        device.granted_transmit_serials,
+        [core::num::NonZeroU32::new(2).unwrap()]
+    );
     assert!(device.egress_grants.is_empty());
     assert_eq!(
         device

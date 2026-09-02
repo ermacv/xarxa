@@ -1088,6 +1088,17 @@ impl Interface {
         }
 
         #[cfg(feature = "tx-egress-metadata")]
+        #[derive(Clone, Copy, Eq, PartialEq)]
+        enum EgressProviderCoverage {
+            /// The provider participates in the interface demand catalogue,
+            /// so an authoritative driver grant may select its final backing.
+            Catalogued,
+            /// The provider has no selectable queue head yet. It must not be
+            /// deadlocked behind a grant which it has no way to request.
+            Uncatalogued,
+        }
+
+        #[cfg(feature = "tx-egress-metadata")]
         let mut result = if grant_state_changed {
             PollResult::SocketStateChanged
         } else {
@@ -1108,6 +1119,8 @@ impl Interface {
             let mut neighbor_addr = None;
             let mut respond = |inner: &mut InterfaceInner,
                                device: &mut _,
+                               #[cfg(feature = "tx-egress-metadata")]
+                               coverage: EgressProviderCoverage,
                                meta: PacketMeta,
                                response: Packet| {
                 neighbor_addr = Some(response.ip_repr().dst_addr());
@@ -1116,13 +1129,22 @@ impl Interface {
                 #[cfg(feature = "tx-egress-metadata")]
                 let egress_key = egress_route.map(|route| Device::egress_key(device, route));
                 #[cfg(feature = "tx-egress-metadata")]
-                if let (Some(egress), Some(_)) = (egress_key, egress_schedule)
+                let scheduled_key = match (coverage, egress_schedule) {
+                    (EgressProviderCoverage::Uncatalogued, Some(schedule))
+                        if schedule.grant_mode() == crate::phy::EgressGrantMode::Authoritative =>
+                    {
+                        None
+                    }
+                    _ => egress_key,
+                };
+                #[cfg(feature = "tx-egress-metadata")]
+                if let (Some(egress), Some(_)) = (scheduled_key, egress_schedule)
                     && !inner.egress_burst.prepare(egress)
                 {
                     return Err(KeyedEmitError::KeyDeferred);
                 }
                 #[cfg(feature = "tx-egress-metadata")]
-                let admission = match egress_key {
+                let admission = match scheduled_key {
                     Some(egress) => Device::transmit_for(device, egress),
                     None => match Device::transmit(device) {
                         Some(token) => EgressAdmission::Granted(token),
@@ -1172,7 +1194,7 @@ impl Interface {
                 })?;
 
                 #[cfg(feature = "tx-egress-metadata")]
-                if let (Some(egress), Some(_)) = (egress_key, egress_schedule) {
+                if let (Some(egress), Some(_)) = (scheduled_key, egress_schedule) {
                     inner.egress_burst.commit(egress);
                 }
 
@@ -1185,7 +1207,14 @@ impl Interface {
                 ($inner:expr, $meta:expr, $packet:expr) => {{
                     #[cfg(feature = "tx-egress-metadata")]
                     {
-                        respond($inner, device, $meta, $packet).map_err(|error| match error {
+                        respond(
+                            $inner,
+                            device,
+                            EgressProviderCoverage::Uncatalogued,
+                            $meta,
+                            $packet,
+                        )
+                        .map_err(|error| match error {
                             KeyedEmitError::KeyDeferred => EgressError::AllKeysDeferred,
                             KeyedEmitError::Global(error) => error,
                         })
@@ -1238,6 +1267,7 @@ impl Interface {
                                     respond(
                                         inner,
                                         device,
+                                        EgressProviderCoverage::Catalogued,
                                         meta,
                                         Packet::new(ip, IpPayload::Udp(udp, payload)),
                                     )

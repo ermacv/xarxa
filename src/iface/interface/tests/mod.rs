@@ -222,6 +222,63 @@ fn udp_providers_from_two_sockets_share_one_demand_lifetime() {
 
 #[cfg(all(
     feature = "tx-egress-metadata",
+    feature = "socket-dhcpv4",
+    feature = "socket-udp",
+    feature = "proto-ipv4",
+    feature = "medium-ethernet"
+))]
+#[test]
+fn authoritative_udp_schedule_does_not_gate_uncatalogued_dhcp_control() {
+    use crate::socket::{dhcpv4, udp};
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    let destination = Ipv4Address::new(192, 168, 1, 10);
+    iface.inner.neighbor_cache.fill(
+        IpAddress::Ipv4(destination),
+        HardwareAddress::Ethernet(EthernetAddress([2, 0, 0, 0, 0, 10])),
+        Instant::ZERO,
+    );
+    device.set_egress_schedule(Some(EgressSchedule::new(
+        core::num::NonZeroU8::new(32).unwrap(),
+        core::num::NonZeroU8::new(4).unwrap(),
+        7,
+        crate::phy::EgressGrantMode::Authoritative,
+    )));
+    let udp_handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 1]),
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 8]),
+    ));
+    let udp = sockets.get_mut::<udp::Socket>(udp_handle);
+    udp.bind(1234).unwrap();
+    udp.send_slice(&[0x5a; 8], (IpAddress::Ipv4(destination), 4321))
+        .unwrap();
+    sockets.add(dhcpv4::Socket::new());
+    let transmitted_before = device.tx_queue.len();
+
+    assert_eq!(
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets),
+        PollResult::SocketStateChanged
+    );
+    assert!(
+        device.tx_queue.len() > transmitted_before,
+        "DHCP DISCOVER must bypass a UDP data grant"
+    );
+    assert!(device.egress_grants.is_empty());
+    assert!(device.egress_grant_completions.is_empty());
+    assert_eq!(sockets.get::<udp::Socket>(udp_handle).send_queue(), 8);
+    assert_eq!(device.egress_demand_updates.len(), 2);
+    assert_eq!(
+        device.egress_demand_updates[0],
+        crate::phy::EgressDemandUpdate::Reset { schedule_epoch: 7 }
+    );
+    assert!(matches!(
+        device.egress_demand_updates[1],
+        crate::phy::EgressDemandUpdate::Active(_)
+    ));
+}
+
+#[cfg(all(
+    feature = "tx-egress-metadata",
     feature = "socket-udp",
     feature = "proto-ipv4",
     feature = "medium-ethernet"

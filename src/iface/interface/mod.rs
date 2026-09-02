@@ -187,6 +187,9 @@ pub struct InterfaceInner {
 /// two independently well-ordered sockets from being admitted to the device
 /// as `A, B, A, B, ...`.
 #[cfg(feature = "tx-egress-metadata")]
+const EGRESS_GRANT_PIPELINE_DEPTH: usize = 2;
+
+#[cfg(feature = "tx-egress-metadata")]
 #[derive(Default)]
 struct EgressBurstState {
     current: Option<EgressKey>,
@@ -197,21 +200,37 @@ struct EgressBurstState {
     deferred_in_round: Option<EgressKey>,
     quota_blocked_in_round: bool,
     grant: Option<crate::phy::EgressBurstGrant>,
+    standby_grant: Option<crate::phy::EgressBurstGrant>,
     grant_used: u8,
 }
 
 #[cfg(feature = "tx-egress-metadata")]
 impl EgressBurstState {
-    fn configure(&mut self, schedule: EgressSchedule) -> Option<crate::phy::EgressGrantCompletion> {
+    fn drain_grants(
+        &mut self,
+    ) -> [Option<crate::phy::EgressGrantCompletion>; EGRESS_GRANT_PIPELINE_DEPTH] {
+        let completions = [
+            self.take_grant_completion(None),
+            self.take_grant_completion(None),
+        ];
+        debug_assert!(self.grant.is_none());
+        debug_assert!(self.standby_grant.is_none());
+        completions
+    }
+
+    fn configure(
+        &mut self,
+        schedule: EgressSchedule,
+    ) -> [Option<crate::phy::EgressGrantCompletion>; EGRESS_GRANT_PIPELINE_DEPTH] {
         if self.schedule != Some(schedule) {
-            let completion = self.take_grant_completion(None);
+            let completions = self.drain_grants();
             *self = Self {
                 schedule: Some(schedule),
                 ..Self::default()
             };
-            return completion;
+            return completions;
         }
-        None
+        [None; 2]
     }
 
     fn install_grant(
@@ -221,8 +240,7 @@ impl EgressBurstState {
         let schedule = self
             .schedule
             .expect("a grant requires configured keyed scheduling");
-        if self.grant.is_some()
-            || schedule.grant_mode() == crate::phy::EgressGrantMode::StackSelected
+        if schedule.grant_mode() == crate::phy::EgressGrantMode::StackSelected
             || grant.demand().id().schedule_epoch() != schedule.epoch()
             || grant.frame_credits().get() > schedule.max_packets_per_key().get()
         {
@@ -232,15 +250,26 @@ impl EgressBurstState {
                 None,
             ));
         }
-        self.grant = Some(grant);
-        self.grant_used = 0;
-        Ok(())
+        if self.grant.is_none() {
+            self.grant = Some(grant);
+            self.grant_used = 0;
+            return Ok(());
+        }
+        if self.standby_grant.is_none() {
+            self.standby_grant = Some(grant);
+            return Ok(());
+        }
+        Err(crate::phy::EgressGrantCompletion::new(
+            grant.serial(),
+            0,
+            None,
+        ))
     }
 
     fn needs_grant(&self) -> bool {
         self.schedule.is_some_and(|schedule| {
             schedule.grant_mode() != crate::phy::EgressGrantMode::StackSelected
-        }) && self.grant.is_none()
+        }) && self.standby_grant.is_none()
     }
 
     fn active_grant(&self) -> Option<crate::phy::EgressBurstGrant> {
@@ -264,6 +293,7 @@ impl EgressBurstState {
     ) -> Option<crate::phy::EgressGrantCompletion> {
         let grant = self.grant.take()?;
         let used = core::mem::replace(&mut self.grant_used, 0);
+        self.grant = self.standby_grant.take();
         Some(crate::phy::EgressGrantCompletion::new(
             grant.serial(),
             used,
@@ -392,10 +422,12 @@ impl EgressBurstState {
         retry
     }
 
-    fn disable(&mut self) -> Option<crate::phy::EgressGrantCompletion> {
-        let completion = self.take_grant_completion(None);
+    fn disable(
+        &mut self,
+    ) -> [Option<crate::phy::EgressGrantCompletion>; EGRESS_GRANT_PIPELINE_DEPTH] {
+        let completions = self.drain_grants();
         *self = Self::default();
-        completion
+        completions
     }
 }
 
@@ -403,7 +435,7 @@ impl EgressBurstState {
 mod egress_grant_tests {
     use core::num::{NonZeroU8, NonZeroU16, NonZeroU32};
 
-    use super::EgressBurstState;
+    use super::{EGRESS_GRANT_PIPELINE_DEPTH, EgressBurstState};
     use crate::phy::{
         EgressBurstGrant, EgressDemand, EgressDemandId, EgressDemandLevel, EgressGrantMode,
         EgressKey, EgressSchedule,
@@ -438,7 +470,10 @@ mod egress_grant_tests {
     #[test]
     fn shadow_grant_survives_rounds_until_its_credits_are_spent() {
         let mut state = EgressBurstState::default();
-        assert_eq!(state.configure(schedule(EgressGrantMode::Shadow, 7)), None);
+        assert_eq!(
+            state.configure(schedule(EgressGrantMode::Shadow, 7)),
+            [None; 2]
+        );
         let grant = grant(1, key(2), 2);
         state.install_grant(grant).unwrap();
 
@@ -481,7 +516,7 @@ mod egress_grant_tests {
         state.install_grant(grant).unwrap();
 
         assert!(!state.prepare(key(1)));
-        for _ in 0..2 {
+        for _ in 0..EGRESS_GRANT_PIPELINE_DEPTH {
             assert!(state.prepare(key(2)));
             state.commit(key(2));
         }
@@ -500,13 +535,61 @@ mod egress_grant_tests {
         state.install_grant(grant).unwrap();
         state.commit(key(2));
 
-        let completion = state
-            .configure(schedule(EgressGrantMode::Authoritative, 8))
-            .unwrap();
+        let [completion, standby] = state.configure(schedule(EgressGrantMode::Authoritative, 8));
+        let completion = completion.unwrap();
+        assert_eq!(standby, None);
         assert_eq!(completion.serial(), grant.serial());
         assert_eq!(completion.used_frames(), 1);
         assert_eq!(completion.remaining(), None);
         assert!(state.needs_grant());
+    }
+
+    #[test]
+    fn completed_current_grant_promotes_standby_without_a_poll_boundary() {
+        let mut state = EgressBurstState::default();
+        let _ = state.configure(schedule(EgressGrantMode::Authoritative, 7));
+        let current = grant(6, key(2), 2);
+        let standby = grant(7, key(3), 2);
+        state.install_grant(current).unwrap();
+        state.install_grant(standby).unwrap();
+        assert!(!state.needs_grant());
+
+        for _ in 0..EGRESS_GRANT_PIPELINE_DEPTH {
+            assert!(state.prepare(key(2)));
+            state.commit(key(2));
+        }
+        let completion = state.take_grant_completion(None).unwrap();
+        assert_eq!(completion.serial(), current.serial());
+        assert_eq!(state.active_grant(), Some(standby));
+        assert_eq!(state.grant_used, 0);
+        assert!(state.needs_grant());
+
+        for _ in 0..EGRESS_GRANT_PIPELINE_DEPTH {
+            assert!(state.prepare(key(3)));
+            state.commit(key(3));
+        }
+        let completion = state.take_grant_completion(None).unwrap();
+        assert_eq!(completion.serial(), standby.serial());
+        assert_eq!(state.active_grant(), None);
+    }
+
+    #[test]
+    fn epoch_change_returns_current_and_standby_in_issue_order() {
+        let mut state = EgressBurstState::default();
+        let _ = state.configure(schedule(EgressGrantMode::Authoritative, 7));
+        let current = grant(8, key(2), 4);
+        let standby = grant(9, key(3), 4);
+        state.install_grant(current).unwrap();
+        state.install_grant(standby).unwrap();
+        state.commit(key(2));
+
+        let completions = state.configure(schedule(EgressGrantMode::Authoritative, 8));
+        assert_eq!(
+            completions.map(|completion| completion.map(|completion| completion.serial())),
+            [Some(current.serial()), Some(standby.serial())]
+        );
+        assert_eq!(completions[0].unwrap().used_frames(), 1);
+        assert_eq!(completions[1].unwrap().used_frames(), 0);
     }
 }
 
@@ -1061,35 +1144,46 @@ impl Interface {
         #[cfg(feature = "tx-egress-metadata")]
         let mut grant_state_changed = false;
         #[cfg(feature = "tx-egress-metadata")]
-        let displaced_grant = match egress_schedule {
+        let displaced_grants = match egress_schedule {
             Some(schedule) => self.inner.egress_burst.configure(schedule),
             None => self.inner.egress_burst.disable(),
         };
         #[cfg(feature = "tx-egress-metadata")]
-        if let Some(completion) = displaced_grant {
+        for completion in displaced_grants.into_iter().flatten() {
             device.finish_egress_grant(completion);
             grant_state_changed = true;
         }
         #[cfg(feature = "tx-egress-metadata")]
         self.reconcile_egress_demands(device, sockets, egress_schedule);
         #[cfg(feature = "tx-egress-metadata")]
-        if self.inner.egress_burst.needs_grant()
-            && let Some(grant) = device.poll_egress_grant()
-            && let Err(completion) = self.inner.egress_burst.install_grant(grant)
-        {
-            device.finish_egress_grant(completion);
-            grant_state_changed = true;
+        for _ in 0..EGRESS_GRANT_PIPELINE_DEPTH {
+            if !self.inner.egress_burst.needs_grant() {
+                break;
+            }
+            let Some(grant) = device.poll_egress_grant() else {
+                break;
+            };
+            if let Err(completion) = self.inner.egress_burst.install_grant(grant) {
+                device.finish_egress_grant(completion);
+                grant_state_changed = true;
+            }
         }
         #[cfg(feature = "tx-egress-metadata")]
-        if let Some(grant) = self.inner.egress_burst.active_grant()
-            && self
+        for _ in 0..EGRESS_GRANT_PIPELINE_DEPTH {
+            let Some(grant) = self.inner.egress_burst.active_grant() else {
+                break;
+            };
+            if self
                 .egress_demands
                 .exact_demand(grant.demand().id(), grant.demand().key())
-                .is_none()
-            && let Some(completion) = self.inner.egress_burst.take_grant_completion(None)
-        {
-            device.finish_egress_grant(completion);
-            grant_state_changed = true;
+                .is_some()
+            {
+                break;
+            }
+            if let Some(completion) = self.inner.egress_burst.take_grant_completion(None) {
+                device.finish_egress_grant(completion);
+                grant_state_changed = true;
+            }
         }
 
         enum EgressError {
@@ -1393,6 +1487,9 @@ impl Interface {
             });
             if let Some(completion) = self.inner.egress_burst.take_grant_completion(remaining) {
                 device.finish_egress_grant(completion);
+                // A locally retained standby is now the current affine grant.
+                // Re-enter egress without waiting for a device or socket wake.
+                result = PollResult::SocketStateChanged;
             }
         }
         result

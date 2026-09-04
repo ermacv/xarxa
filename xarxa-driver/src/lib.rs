@@ -12,7 +12,7 @@ mod meta;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
-pub use buf::PacketBuf;
+pub use buf::{PacketBuf, PacketPool, PacketPoolStorage};
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};

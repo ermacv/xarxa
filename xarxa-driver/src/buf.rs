@@ -3,7 +3,9 @@
 //! Every packet in the stack is a [`PacketBuf`]: one fixed-size buffer, owned by
 //! whoever holds it (the driver, the stack, a socket, the application).
 //!
-//! Buffers are allocated from a static pool.
+//! Buffers are allocated from static pools. The default pool backs
+//! [`PacketBuf::try_new`], while [`PacketPool`] and [`PacketPoolStorage`] let a
+//! system provide independently placed pools without changing the packet type.
 
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -27,7 +29,8 @@ const PACKET_BUF_COUNT: usize = if crate::config::PACKET_BUF_COUNT > 1024 {
     1024
 };
 
-const BITMAP_WORDS: usize = PACKET_BUF_COUNT.div_ceil(32);
+const MAX_PACKET_POOL_COUNT: usize = 1024;
+const MAX_BITMAP_WORDS: usize = MAX_PACKET_POOL_COUNT.div_ceil(32);
 
 cfg_select! {
     feature = "packet-buf-align-32" => { #[repr(C, align(32))] struct Data([u8; PACKET_BUF_SIZE]); }
@@ -52,6 +55,10 @@ impl DerefMut for Data {
 }
 
 struct PacketBufInner {
+    /// Pool control which must receive this slot when the packet is dropped.
+    origin: NonNull<PacketPoolHeader>,
+    /// Slot within the originating pool.
+    slot: usize,
     /// Offset of the first valid byte within `data`.
     headroom: u16,
     /// Number of valid bytes.
@@ -59,56 +66,174 @@ struct PacketBufInner {
     // invariant: headroom + len <= PACKET_BUF_SIZE
     /// Per-packet metadata. Zero-sized unless a `packetmeta-*` feature is enabled.
     meta: PacketMeta,
-    data: Data,
+    /// Independently placed payload storage owned by this control slot.
+    data: NonNull<Data>,
 }
 
-struct Pool {
-    /// Bit `i` is set while slot `i` is owned by a `PacketBuf`.
-    used: [AtomicU32; BITMAP_WORDS],
-    slots: [UnsafeCell<MaybeUninit<PacketBufInner>>; PACKET_BUF_COUNT],
+struct PacketPoolHeader {
+    release: unsafe fn(NonNull<PacketPoolHeader>, usize),
 }
 
-// SAFETY: a slot is handed to at most one `PacketBuf` at a time. Its bit is
-// set by the one CAS that wins it in `alloc_slot`, and cleared only by the
-// `PacketBuf` that owns it, in `Drop`. So no two threads ever touch the same
-// slot, and the bitmap is atomic.
-unsafe impl Sync for Pool {}
+/// Payload storage for one statically allocated packet pool.
+///
+/// This value contains only packet bytes, so a system may place it in a memory
+/// section independently from the pool's hot ownership and metadata control.
+/// Bind it exactly once with [`PacketPool::new`]. The unique `&'static mut`
+/// accepted there makes sharing one storage object between safe pools
+/// impossible.
+pub struct PacketPoolStorage<const COUNT: usize> {
+    data: [UnsafeCell<MaybeUninit<Data>>; COUNT],
+}
 
-static POOL: Pool = Pool {
-    used: [const { AtomicU32::new(0) }; BITMAP_WORDS],
-    slots: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; PACKET_BUF_COUNT],
-};
-
-/// Claim a free slot: the first zero bit of the bitmap, set with a CAS.
-fn alloc_slot() -> Option<usize> {
-    for (w, word) in POOL.used.iter().enumerate() {
-        let mut cur = word.load(Ordering::Relaxed);
-        loop {
-            let bit = cur.trailing_ones() as usize;
-            if bit >= 32 {
-                break;
-            }
-            let index = w * 32 + bit;
-            if index >= PACKET_BUF_COUNT {
-                // Only the last word can have bits past the end. Everything
-                // before it was full, so the pool is.
-                return None;
-            }
-            // Acquire pairs with the Release in `Drop`: the previous owner's
-            // writes to the slot are done before ours start.
-            match word.compare_exchange_weak(cur, cur | (1 << bit), Ordering::Acquire, Ordering::Relaxed) {
-                Ok(_) => return Some(index),
-                Err(actual) => cur = actual,
-            }
+impl<const COUNT: usize> PacketPoolStorage<COUNT> {
+    /// Create unclaimed static packet storage.
+    pub const fn new() -> Self {
+        Self {
+            data: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; COUNT],
         }
     }
-    None
 }
 
-/// Give a slot back: clear its bit.
-fn free_slot(index: usize) {
-    POOL.used[index / 32].fetch_and(!(1 << (index % 32)), Ordering::Release);
+impl<const COUNT: usize> Default for PacketPoolStorage<COUNT> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
+
+// SAFETY: storage has no public access path. `PacketPool::new` consumes a
+// unique static borrow, and the bound pool exposes a slot only after its one
+// atomic ownership transition has succeeded.
+unsafe impl<const COUNT: usize> Sync for PacketPoolStorage<COUNT> {}
+
+/// Hot ownership and metadata control for a static packet pool.
+///
+/// The pool and its [`PacketPoolStorage`] may be placed separately. This keeps
+/// atomic ownership state and packet metadata in fast memory while allowing
+/// the packet bytes themselves to live in a larger memory class.
+#[repr(C)]
+pub struct PacketPool<const COUNT: usize> {
+    // Must stay first: the type-erased release function casts this address back
+    // to the monomorphized pool type.
+    header: PacketPoolHeader,
+    used: [AtomicU32; MAX_BITMAP_WORDS],
+    controls: [UnsafeCell<MaybeUninit<PacketBufInner>>; COUNT],
+    storage: &'static PacketPoolStorage<COUNT>,
+}
+
+// SAFETY: every control and payload slot is published only to the one
+// `PacketBuf` whose compare-exchange changed `used[index]` from false to true.
+// Drop releases that same slot with Release ordering.
+unsafe impl<const COUNT: usize> Sync for PacketPool<COUNT> {}
+
+impl<const COUNT: usize> PacketPool<COUNT> {
+    /// Bind hot pool control to uniquely owned static payload storage.
+    ///
+    /// The returned control value must itself be placed at a stable address
+    /// before allocation. [`try_alloc`](Self::try_alloc) requires `&'static
+    /// self`, enforcing that requirement in safe code.
+    pub fn new(storage: &'static mut PacketPoolStorage<COUNT>) -> Self {
+        // SAFETY: consuming the unique static borrow prevents another safe pool
+        // from binding the same storage.
+        unsafe { Self::from_shared_storage(storage) }
+    }
+
+    const unsafe fn from_shared_storage(storage: &'static PacketPoolStorage<COUNT>) -> Self {
+        assert!(COUNT > 0, "a packet pool must contain at least one slot");
+        assert!(
+            COUNT <= MAX_PACKET_POOL_COUNT,
+            "a packet pool cannot contain more than 1024 slots"
+        );
+        Self {
+            header: PacketPoolHeader {
+                release: release_slot::<COUNT>,
+            },
+            used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+            controls: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; COUNT],
+            storage,
+        }
+    }
+
+    /// Number of packet slots owned by this pool.
+    pub const fn capacity(&self) -> usize {
+        COUNT
+    }
+
+    /// Whether `buf` originated from this pool.
+    pub fn owns(&self, buf: &PacketBuf) -> bool {
+        core::ptr::eq(buf.inner().origin.as_ptr(), &self.header)
+    }
+
+    /// Allocate one empty packet from this pool.
+    pub fn try_alloc(&'static self) -> Option<PacketBuf> {
+        let index = self.alloc_slot()?;
+        let ptr = self.controls[index].get().cast::<PacketBufInner>();
+        let data = self.storage.data[index].get().cast::<Data>();
+        // SAFETY:
+        // - the ownership CAS above uniquely claimed both slots at `index`;
+        // - both pointers refer to statically allocated, correctly aligned
+        //   `MaybeUninit` storage for their target types;
+        // - every field read through PacketBuf is initialized here.
+        unsafe {
+            (&raw mut (*ptr).origin).write(NonNull::from(&self.header));
+            (&raw mut (*ptr).slot).write(index);
+            (&raw mut (*ptr).headroom).write(0);
+            (&raw mut (*ptr).len).write(0);
+            (&raw mut (*ptr).meta).write(PacketMeta::default());
+            (&raw mut (*ptr).data).write(NonNull::new_unchecked(data));
+            // Catch code that relies on fresh buffers being zeroed.
+            #[cfg(test)]
+            (*data).fill(0xa5);
+        }
+        Some(PacketBuf {
+            // SAFETY: a pointer into static pool control is never null.
+            inner: unsafe { NonNull::new_unchecked(ptr) },
+        })
+    }
+
+    /// Claim the first free slot using the same compact bitmap protocol as the
+    /// original global packet pool.
+    fn alloc_slot(&self) -> Option<usize> {
+        for (word_index, word) in self.used[..COUNT.div_ceil(32)].iter().enumerate() {
+            let mut current = word.load(Ordering::Relaxed);
+            loop {
+                let bit = current.trailing_ones() as usize;
+                if bit >= 32 {
+                    break;
+                }
+                let index = word_index * 32 + bit;
+                if index >= COUNT {
+                    // Only the final bitmap word can contain indices outside
+                    // this pool. Every real slot before this one is occupied.
+                    return None;
+                }
+                // Acquire pairs with the Release in `release_slot`: the
+                // previous owner is finished before this owner initializes the
+                // reused control slot and accesses its payload.
+                match word.compare_exchange_weak(current, current | (1 << bit), Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => return Some(index),
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        None
+    }
+}
+
+unsafe fn release_slot<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, index: usize) {
+    // SAFETY: `origin` is written only by `PacketPool<COUNT>::try_alloc` and
+    // points at the first field of that stable `#[repr(C)]` pool.
+    let pool = unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() };
+    debug_assert!(index < COUNT);
+    let bit = 1 << (index % 32);
+    let previous = pool.used[index / 32].fetch_and(!bit, Ordering::Release);
+    debug_assert_ne!(previous & bit, 0, "a packet pool slot was released twice");
+}
+
+static DEFAULT_PACKET_STORAGE: PacketPoolStorage<PACKET_BUF_COUNT> = PacketPoolStorage::new();
+// SAFETY: this private storage is named only here and is permanently bound to
+// this one pool. Public pools require a unique static borrow instead.
+static DEFAULT_PACKET_POOL: PacketPool<PACKET_BUF_COUNT> =
+    unsafe { PacketPool::from_shared_storage(&DEFAULT_PACKET_STORAGE) };
 
 /// An owned network packet buffer.
 ///
@@ -130,24 +255,7 @@ impl PacketBuf {
     /// - Default metadata.
     /// - **Uninitialized** data.
     pub fn try_new() -> Option<Self> {
-        let index = alloc_slot()?;
-        let ptr = POOL.slots[index].get().cast::<PacketBufInner>();
-        // SAFETY:
-        // - the slot is ours (its bit is set), and nothing else points into it.
-        // - `data` is valid thanks to `MaybeUninit::zeroed()`, we don't have to initialize it.
-        // - We do initialize the header.
-        unsafe {
-            (&raw mut (*ptr).headroom).write(0);
-            (&raw mut (*ptr).len).write(0);
-            (&raw mut (*ptr).meta).write(PacketMeta::default());
-            // Catch code that relies on fresh buffers being zeroed.
-            #[cfg(test)]
-            (*ptr).data.fill(0xa5);
-        }
-        Some(Self {
-            // SAFETY: a pointer into a static is never null.
-            inner: unsafe { NonNull::new_unchecked(ptr) },
-        })
+        DEFAULT_PACKET_POOL.try_alloc()
     }
 
     #[inline]
@@ -161,6 +269,21 @@ impl PacketBuf {
         // SAFETY: we own the slot for as long as `self` exists, and `&mut self`
         // makes this the only reference.
         unsafe { self.inner.as_mut() }
+    }
+
+    #[inline]
+    fn data(&self) -> &Data {
+        // SAFETY: the originating pool exclusively assigned this payload slot
+        // to this PacketBuf for its entire lifetime.
+        unsafe { self.inner().data.as_ref() }
+    }
+
+    #[inline]
+    fn data_mut(&mut self) -> &mut Data {
+        let mut data = self.inner().data;
+        // SAFETY: `&mut self` proves this is the unique PacketBuf owner and the
+        // pool cannot republish the slot before Drop.
+        unsafe { data.as_mut() }
     }
 
     /// The packet's metadata.
@@ -249,14 +372,13 @@ impl PacketBuf {
         if self.headroom() >= headroom {
             return true;
         }
-        let inner = self.inner_mut();
-        let len = inner.len as usize;
+        let len = self.len();
         if headroom + len > PACKET_BUF_SIZE {
             return false;
         }
-        let old = inner.headroom as usize;
-        inner.data.copy_within(old..old + len, headroom);
-        inner.headroom = headroom as u16;
+        let old = self.headroom();
+        self.data_mut().copy_within(old..old + len, headroom);
+        self.inner_mut().headroom = headroom as u16;
         true
     }
 
@@ -274,16 +396,18 @@ impl PacketBuf {
     /// The returned slice is aligned to [`PACKET_BUF_ALIGN`](crate::config::PACKET_BUF_ALIGN), and its length
     /// ([`PACKET_BUF_SIZE`]) is a multiple of it.
     pub fn storage_mut(&mut self) -> &mut [u8] {
-        &mut self.inner_mut().data[..]
+        &mut self.data_mut()[..]
     }
 }
 
 impl Drop for PacketBuf {
     fn drop(&mut self) {
-        let base = POOL.slots.as_ptr() as usize;
-        let index =
-            (self.inner.as_ptr() as usize - base) / core::mem::size_of::<UnsafeCell<MaybeUninit<PacketBufInner>>>();
-        free_slot(index);
+        let inner = self.inner();
+        let origin = inner.origin;
+        let release = unsafe { origin.as_ref().release };
+        // SAFETY: the originating pool installed this exact release function
+        // and slot identity before publishing the PacketBuf.
+        unsafe { release(origin, inner.slot) };
     }
 }
 
@@ -293,15 +417,15 @@ impl Deref for PacketBuf {
         let inner = self.inner();
         let start = inner.headroom as usize;
         let end = start + inner.len as usize;
-        &inner.data[start..end]
+        &self.data()[start..end]
     }
 }
 impl DerefMut for PacketBuf {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        let inner = self.inner_mut();
+        let inner = self.inner();
         let start = inner.headroom as usize;
         let end = start + inner.len as usize;
-        &mut inner.data[start..end]
+        &mut self.data_mut()[start..end]
     }
 }
 
@@ -325,6 +449,74 @@ impl defmt::Format for PacketBuf {
 mod tests {
     use super::*;
     use crate::config::PACKET_BUF_ALIGN;
+    use std::boxed::Box;
+
+    fn new_pool<const COUNT: usize>() -> &'static PacketPool<COUNT> {
+        let storage = Box::leak(Box::new(PacketPoolStorage::new()));
+        Box::leak(Box::new(PacketPool::new(storage)))
+    }
+
+    #[test]
+    fn packet_handle_stays_one_pointer() {
+        assert_eq!(
+            core::mem::size_of::<PacketBuf>(),
+            core::mem::size_of::<NonNull<PacketBufInner>>()
+        );
+    }
+
+    #[test]
+    fn custom_pool_exhausts_and_reuses_exact_capacity() {
+        let pool = new_pool::<33>();
+        let mut buffers = (0..pool.capacity())
+            .map(|_| pool.try_alloc().expect("every configured slot must allocate"))
+            .collect::<std::vec::Vec<_>>();
+
+        assert!(pool.try_alloc().is_none());
+        assert!(buffers.iter().all(|buffer| pool.owns(buffer)));
+
+        let mut returned = buffers.pop().unwrap();
+        returned.reserve(17);
+        returned.set_len(3);
+        returned.copy_from_slice(&[1, 2, 3]);
+        drop(returned);
+
+        let reused = pool.try_alloc().expect("dropping must return one slot");
+        assert!(pool.owns(&reused));
+        assert_eq!(reused.headroom(), 0);
+        assert_eq!(reused.len(), 0);
+        assert_eq!(reused.meta(), PacketMeta::default());
+        assert!(pool.try_alloc().is_none());
+    }
+
+    #[test]
+    fn independent_pools_return_to_their_origin() {
+        let first = new_pool::<1>();
+        let second = new_pool::<1>();
+
+        let first_buffer = first.try_alloc().unwrap();
+        let second_buffer = second.try_alloc().unwrap();
+        assert!(first.owns(&first_buffer));
+        assert!(!second.owns(&first_buffer));
+        assert!(second.owns(&second_buffer));
+        assert!(!first.owns(&second_buffer));
+        assert!(first.try_alloc().is_none());
+        assert!(second.try_alloc().is_none());
+
+        drop(first_buffer);
+        assert!(first.try_alloc().is_some());
+        assert!(second.try_alloc().is_none());
+    }
+
+    #[test]
+    fn packet_can_return_to_its_pool_from_another_thread() {
+        let pool = new_pool::<1>();
+        let buffer = pool.try_alloc().unwrap();
+        assert!(pool.try_alloc().is_none());
+
+        std::thread::spawn(move || drop(buffer)).join().unwrap();
+
+        assert!(pool.try_alloc().is_some());
+    }
 
     #[test]
     fn push_pull() {

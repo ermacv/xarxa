@@ -110,6 +110,17 @@ impl PacketBufAllocator {
         self.origin == buf.inner().origin
     }
 
+    /// Whether at least one packet slot can currently be allocated.
+    ///
+    /// This is only a level-state observation: another owner may claim the
+    /// slot before a later [`try_alloc`](Self::try_alloc). Async users combine
+    /// it with [`PacketPoolWaiter::register`] using register-then-recheck.
+    #[cfg(feature = "async")]
+    pub fn has_available(self) -> bool {
+        let header = unsafe { self.origin.as_ref() };
+        unsafe { (header.has_available)(self.origin) }
+    }
+
     /// Claim the pool's unique asynchronous availability waiter.
     ///
     /// A single async stack may wait on one pool. Synchronous allocation and
@@ -680,9 +691,11 @@ mod tests {
         let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
 
         let held = allocator.try_alloc().unwrap();
+        assert!(!allocator.has_available());
         waiter.register(&waker);
         assert_eq!(wakes.load(StdOrdering::Relaxed), 0);
         drop(held);
+        assert!(allocator.has_available());
         assert_eq!(wakes.load(StdOrdering::Relaxed), 1);
 
         // A release before registration remains visible through the

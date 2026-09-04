@@ -105,6 +105,13 @@ impl fmt::Debug for PacketBufAllocator {
     }
 }
 
+#[cfg(feature = "defmt")]
+impl defmt::Format for PacketBufAllocator {
+    fn format(&self, fmt: defmt::Formatter) {
+        defmt::write!(fmt, "PacketBufAllocator {{ .. }}")
+    }
+}
+
 /// Payload storage for one statically allocated packet pool.
 ///
 /// This value contains only packet bytes, so a system may place it in a memory

@@ -63,6 +63,8 @@ pub struct TestingDevice {
     #[cfg(feature = "tx-egress-metadata")]
     egress_key_override: Option<phy::EgressKey>,
     #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) egress_key_calls: usize,
+    #[cfg(feature = "tx-egress-metadata")]
     egress_schedule: Option<phy::EgressSchedule>,
     #[cfg(feature = "tx-egress-metadata")]
     pub(crate) egress_demand_updates: Vec<phy::EgressDemandUpdate>,
@@ -104,6 +106,8 @@ impl TestingDevice {
             medium,
             #[cfg(feature = "tx-egress-metadata")]
             egress_key_override: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            egress_key_calls: 0,
             #[cfg(feature = "tx-egress-metadata")]
             egress_schedule: None,
             #[cfg(feature = "tx-egress-metadata")]
@@ -190,6 +194,7 @@ impl Device for TestingDevice {
 
     #[cfg(feature = "tx-egress-metadata")]
     fn egress_key(&mut self, route: phy::EgressRoute) -> phy::EgressKey {
+        self.egress_key_calls = self.egress_key_calls.saturating_add(1);
         self.egress_key_override
             .unwrap_or_else(|| phy::EgressKey::from_route(route))
     }

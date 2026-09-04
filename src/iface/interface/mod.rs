@@ -1242,6 +1242,9 @@ impl Interface {
             let mut neighbor_addr = None;
             let mut respond = |inner: &mut InterfaceInner,
                                device: &mut _,
+                               #[cfg(feature = "tx-egress-metadata")] classified_egress: Option<
+                EgressKey,
+            >,
                                #[cfg(feature = "tx-egress-metadata")]
                                coverage: EgressProviderCoverage,
                                meta: PacketMeta,
@@ -1250,7 +1253,8 @@ impl Interface {
                 #[cfg(feature = "tx-egress-metadata")]
                 let egress_route = inner.resolved_egress_route(&response.ip_repr().dst_addr());
                 #[cfg(feature = "tx-egress-metadata")]
-                let egress_key = egress_route.map(|route| Device::egress_key(device, route));
+                let egress_key = classified_egress
+                    .or_else(|| egress_route.map(|route| Device::egress_key(device, route)));
                 #[cfg(feature = "tx-egress-metadata")]
                 let scheduled_key = match (coverage, egress_schedule) {
                     (
@@ -1348,7 +1352,7 @@ impl Interface {
                 ($coverage:expr, $inner:expr, $meta:expr, $packet:expr) => {{
                     #[cfg(feature = "tx-egress-metadata")]
                     {
-                        respond($inner, device, $coverage, $meta, $packet).map_err(|error| {
+                        respond($inner, device, None, $coverage, $meta, $packet).map_err(|error| {
                             match error {
                                 KeyedEmitError::KeyDeferred => EgressError::AllKeysDeferred,
                                 KeyedEmitError::Global(error) => error,
@@ -1416,10 +1420,11 @@ impl Interface {
                                 &mut self.inner,
                                 device,
                                 egress_schedule,
-                                |inner, device, meta, (ip, udp, payload)| {
+                                |inner, device, classified_egress, meta, (ip, udp, payload)| {
                                     respond(
                                         inner,
                                         device,
+                                        classified_egress,
                                         EgressProviderCoverage::Catalogued,
                                         meta,
                                         Packet::new(ip, IpPayload::Udp(udp, payload)),

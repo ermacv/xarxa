@@ -919,6 +919,7 @@ impl<'a> Socket<'a> {
         F: FnMut(
             &mut Context,
             &mut D,
+            Option<EgressKey>,
             PacketMeta,
             (IpRepr, UdpRepr, &[u8]),
         ) -> Result<(), KeyedEmitError<E>>,
@@ -926,7 +927,7 @@ impl<'a> Socket<'a> {
         let Some(schedule) = schedule else {
             self.disable_egress_scheduling();
             return self
-                .dispatch(cx, |cx, meta, packet| emit(cx, device, meta, packet))
+                .dispatch(cx, |cx, meta, packet| emit(cx, device, None, meta, packet))
                 .map_err(|error| match error {
                     KeyedEmitError::KeyDeferred => KeyedDispatchError::AllKeysDeferred,
                     KeyedEmitError::Global(error) => KeyedDispatchError::Global(error),
@@ -971,7 +972,13 @@ impl<'a> Socket<'a> {
                                 repr.header_len() + payload_buf.len(),
                                 hop_limit,
                             );
-                            emit(cx, device, packet_meta.meta, (ip_repr, repr, payload_buf))
+                            emit(
+                                cx,
+                                device,
+                                None,
+                                packet_meta.meta,
+                                (ip_repr, repr, payload_buf),
+                            )
                         });
                 return match result {
                     Ok(()) => {
@@ -989,6 +996,9 @@ impl<'a> Socket<'a> {
                 };
             };
 
+            let queue_key = self.tx_egress_queues[queue_index]
+                .expect("a selected device egress queue remains active")
+                .key;
             let dispatch_packet = |packet_meta: &mut UdpMetadata, payload_buf: &mut [u8]| {
                 let src_addr = if let Some(s) = packet_meta.local_address {
                     s
@@ -1028,7 +1038,13 @@ impl<'a> Socket<'a> {
                     hop_limit,
                 );
 
-                emit(cx, device, packet_meta.meta, (ip_repr, repr, payload_buf))
+                emit(
+                    cx,
+                    device,
+                    Some(queue_key),
+                    packet_meta.meta,
+                    (ip_repr, repr, payload_buf),
+                )
             };
             let (result, next) = self.tx_buffer.dequeue_handle_with(handle, dispatch_packet);
             match result {
@@ -1364,7 +1380,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, _, (ip, _, payload)| {
+                    |_, _, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1428,7 +1444,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(4, 1, 0)),
-                    |_, _, _, (_, _, payload)| {
+                    |_, _, _, _, (_, _, payload)| {
                         observed.push(payload.to_vec());
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1476,7 +1492,7 @@ mod test {
                 cx,
                 &mut device,
                 Some(egress_schedule(4, 4, 0)),
-                |_, _, _, (_, _, payload)| {
+                |_, _, _, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 },
@@ -1493,7 +1509,7 @@ mod test {
                 cx,
                 &mut device,
                 Some(egress_schedule(4, 4, 0)),
-                |_, _, _, (_, _, payload)| {
+                |_, _, _, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 },
@@ -1530,7 +1546,7 @@ mod test {
                 cx,
                 &mut device,
                 Some(egress_schedule(2, 1, 0)),
-                |_, _, _, (ip, _, payload)| {
+                |_, _, _, _, (ip, _, payload)| {
                     observed = Some((ip.dst_addr(), payload.to_vec()));
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 },
@@ -1562,7 +1578,7 @@ mod test {
             0,
             crate::phy::EgressGrantMode::StackSelected,
         );
-        let _ = socket.dispatch_keyed(cx, &mut device, Some(schedule), |_, _, _, _| {
+        let _ = socket.dispatch_keyed(cx, &mut device, Some(schedule), |_, _, _, _, _| {
             Result::<(), KeyedEmitError<()>>::Ok(())
         });
     }
@@ -1587,7 +1603,7 @@ mod test {
                 cx,
                 &mut device,
                 Some(egress_schedule(3, 1, 0)),
-                |_, _, _, (_, _, payload)| {
+                |_, _, _, _, (_, _, payload)| {
                     assert_eq!(payload, b"a0");
                     Result::<(), KeyedEmitError<()>>::Err(KeyedEmitError::Global(()))
                 },
@@ -1607,7 +1623,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(3, 1, 0)),
-                    |_, _, _, (ip, _, payload)| {
+                    |_, _, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1656,7 +1672,7 @@ mod test {
                         cx,
                         &mut device,
                         Some(egress_schedule(2, 1, 0)),
-                        |_, _, _, (ip, _, payload)| {
+                        |_, _, _, _, (ip, _, payload)| {
                             if ip.dst_addr() == REMOTE_ADDR.into() {
                                 Err(KeyedEmitError::<()>::KeyDeferred)
                             } else {
@@ -1675,7 +1691,7 @@ mod test {
                 cx,
                 &mut device,
                 Some(egress_schedule(2, 1, 0)),
-                |_, _, _, _| Err(KeyedEmitError::<()>::KeyDeferred),
+                |_, _, _, _, _| Err(KeyedEmitError::<()>::KeyDeferred),
             ),
             Err(KeyedDispatchError::AllKeysDeferred)
         ));
@@ -1687,7 +1703,7 @@ mod test {
                 cx,
                 &mut device,
                 Some(egress_schedule(2, 1, 0)),
-                |_, _, _, (_, _, payload)| {
+                |_, _, _, _, (_, _, payload)| {
                     assert_eq!(payload, b"a0");
                     Err(KeyedEmitError::Global(()))
                 },
@@ -1701,7 +1717,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, _, (_, _, payload)| {
+                    |_, _, _, _, (_, _, payload)| {
                         assert_eq!(payload, expected);
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1742,7 +1758,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(PACKETS_PER_PEER as u8, 1, 0)),
-                    |_, _, _, (ip, _, payload)| {
+                    |_, _, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1794,7 +1810,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(PACKETS_PER_PEER as u8, 1, 0)),
-                    |_, _, _, (ip, _, payload)| {
+                    |_, _, _, _, (ip, _, payload)| {
                         observed.push((ip.dst_addr(), payload.to_vec()));
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1840,7 +1856,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(32, 1, 0)),
-                    |_, _, _, (_, _, payload)| {
+                    |_, _, _, _, (_, _, payload)| {
                         observed.push(payload[0]);
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1882,7 +1898,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, _, (_, _, _)| Result::<(), KeyedEmitError<()>>::Err(
+                    |_, _, _, _, (_, _, _)| Result::<(), KeyedEmitError<()>>::Err(
                         KeyedEmitError::Global(()),
                     ),
                 )
@@ -1892,7 +1908,7 @@ mod test {
         let mut observed = Vec::new();
         for _ in 0..3 {
             socket
-                .dispatch_keyed(cx, &mut device, None, |_, _, _, (_, _, payload)| {
+                .dispatch_keyed(cx, &mut device, None, |_, _, _, _, (_, _, payload)| {
                     observed.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 })
@@ -1930,7 +1946,7 @@ mod test {
                     cx,
                     &mut device,
                     Some(egress_schedule(2, 1, 0)),
-                    |_, _, _, (_, _, payload)| {
+                    |_, _, _, _, (_, _, payload)| {
                         selected.push(payload.to_vec());
                         Result::<(), KeyedEmitError<()>>::Ok(())
                     },
@@ -1944,7 +1960,7 @@ mod test {
         let mut fifo = Vec::new();
         for _ in 0..4 {
             socket
-                .dispatch_keyed(cx, &mut device, None, |_, _, _, (_, _, payload)| {
+                .dispatch_keyed(cx, &mut device, None, |_, _, _, _, (_, _, payload)| {
                     fifo.push(payload.to_vec());
                     Result::<(), KeyedEmitError<()>>::Ok(())
                 })

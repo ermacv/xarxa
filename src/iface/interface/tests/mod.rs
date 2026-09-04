@@ -269,6 +269,7 @@ fn authoritative_udp_catalogue_is_bounded_by_device_keys_not_ip_destinations() {
         iface.poll_egress(Instant::ZERO, &mut device, &mut sockets),
         PollResult::None
     );
+    assert_eq!(device.egress_key_calls, DESTINATIONS);
     assert_eq!(device.egress_demand_updates.len(), 2);
     let crate::phy::EgressDemandUpdate::Active(demand) = device.egress_demand_updates[1] else {
         panic!("one physical egress key must remain visible regardless of IP cardinality");
@@ -403,6 +404,10 @@ fn authoritative_current_and_standby_grants_drain_without_an_external_wake() {
         PollResult::SocketStateChanged
     );
     assert_eq!(device.tx_queue.len() - tx_before_grants, 2);
+    assert_eq!(
+        device.egress_key_calls, 2,
+        "classified UDP packets must retain their device key through final admission"
+    );
     assert_eq!(
         device
             .granted_transmit_serials

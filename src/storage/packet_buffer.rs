@@ -417,8 +417,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     pub fn enqueue(&mut self, size: usize, header: H) -> Result<&mut [u8], Full> {
         #[cfg(feature = "tx-egress-metadata")]
         {
-            self
-                .enqueue_tracked(size, header)
+            self.enqueue_tracked(size, header)
                 .map(|(_, payload)| payload)
         }
         #[cfg(not(feature = "tx-egress-metadata"))]
@@ -553,8 +552,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     {
         #[cfg(feature = "tx-egress-metadata")]
         {
-            self
-                .enqueue_with_infallible_tracked(max_size, header, f)
+            self.enqueue_with_infallible_tracked(max_size, header, f)
                 .map(|(size, _)| size)
         }
         #[cfg(not(feature = "tx-egress-metadata"))]

@@ -141,12 +141,23 @@ pub(crate) struct StackInner {
     /// `Stack::poll` wakes the send wakers of every packet socket when set.
     #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
     pub(crate) tx_starved: bool,
+    /// Set when packet materialization observed the general pool empty.
+    ///
+    /// The async wrapper consumes this edge and arms the pool's unique waiter;
+    /// packet release is then the event which schedules another stack poll.
+    #[cfg(feature = "async")]
+    packet_allocator_starved: bool,
 }
 
 impl StackInner {
     /// Allocate a packet owned by the stack's configured memory domain.
-    pub(crate) fn alloc_packet(&self) -> Option<PacketBuf> {
-        self.packet_allocator.try_alloc()
+    pub(crate) fn alloc_packet(&mut self) -> Option<PacketBuf> {
+        let packet = self.packet_allocator.try_alloc();
+        #[cfg(feature = "async")]
+        if packet.is_none() {
+            self.packet_allocator_starved = true;
+        }
+        packet
     }
 
     /// Note that a socket send was held back for lack of a packet buffer or
@@ -201,7 +212,7 @@ pub(crate) struct EgressRoute {
 impl TxContext<'_, '_> {
     /// Allocate a packet owned by the stack's configured memory domain.
     #[cfg(any(feature = "udp", feature = "raw"))]
-    pub(crate) fn alloc_packet(&self) -> Option<PacketBuf> {
+    pub(crate) fn alloc_packet(&mut self) -> Option<PacketBuf> {
         self.inner.alloc_packet()
     }
 
@@ -451,6 +462,8 @@ impl<'d> Stack<'d> {
                 ipv4_id,
                 #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
                 tx_starved: false,
+                #[cfg(feature = "async")]
+                packet_allocator_starved: false,
             },
             ifaces: Slab::new(),
             sockets: Sockets {
@@ -900,6 +913,17 @@ impl<'d> Stack<'d> {
     /// becomes ready after this call returns.
     pub fn poll_bounded(&mut self, timestamp: Instant, budget: PollBudget) -> PollOutcome {
         self.poll_inner(timestamp, Some(budget))
+    }
+
+    /// Take the indication that packet materialization stopped on an empty
+    /// general pool.
+    ///
+    /// An async wrapper uses this after a poll to arm the allocator's release
+    /// waiter. It is an edge owned by that wrapper, not a request to spin the
+    /// synchronous stack poller.
+    #[cfg(feature = "async")]
+    pub fn take_packet_allocator_starved(&mut self) -> bool {
+        core::mem::take(&mut self.inner.packet_allocator_starved)
     }
 
     fn poll_inner(&mut self, timestamp: Instant, budget: Option<PollBudget>) -> PollOutcome {
@@ -1415,11 +1439,10 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
             return;
         };
-        let Some(buf) =
-            crate::tcp::build_tcp_packet(self.inner.packet_allocator, repr, &src_addr, &dst_addr, &checksum_caps)
-        else {
+        let Some(buf) = self.inner.alloc_packet() else {
             return;
         };
+        let buf = crate::tcp::build_tcp_packet(buf, repr, &src_addr, &dst_addr, &checksum_caps);
         self.transmit_reply(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, 64);
     }
 

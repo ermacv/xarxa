@@ -12,6 +12,8 @@ mod meta;
 #[cfg(feature = "async")]
 use core::task::Waker;
 
+#[cfg(feature = "async")]
+pub use buf::PacketPoolWaiter;
 pub use buf::{PacketBuf, PacketBufAllocator, PacketPool, PacketPoolStorage};
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]

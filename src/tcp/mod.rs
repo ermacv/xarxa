@@ -2300,24 +2300,23 @@ impl<'d> TcpSocketState<'d> {
 /// headroom reserved for the IP and Ethernet headers below it. `None` if the
 /// pool is empty.
 pub(crate) fn build_tcp_packet(
-    allocator: crate::driver::PacketBufAllocator,
+    mut buf: PacketBuf,
     repr: &TcpRepr<'_>,
     src_addr: &IpAddress,
     dst_addr: &IpAddress,
     checksum_caps: &ChecksumCapabilities,
-) -> Option<PacketBuf> {
+) -> PacketBuf {
     let ip_header_len = match dst_addr {
         #[cfg(feature = "ipv4")]
         IpAddress::Ipv4(_) => IPV4_HEADER_LEN,
         #[cfg(feature = "ipv6")]
         IpAddress::Ipv6(_) => IPV6_HEADER_LEN,
     };
-    let mut buf = allocator.try_alloc()?;
     buf.reserve(LINK_HEADER_LEN + ip_header_len);
     buf.set_len(repr.buffer_len());
     let mut packet = TcpPacket::new_unchecked(&mut buf);
     repr.emit(&mut packet, src_addr, dst_addr, checksum_caps);
-    Some(buf)
+    buf
 }
 
 /// Deliver an ICMP error to the TCP connection whose segment provoked it: exact
@@ -2394,16 +2393,11 @@ pub(crate) fn flush(
                 trace!("device has no room for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             }
-            let Some(buf) = build_tcp_packet(
-                cx.inner.packet_allocator,
-                &repr,
-                &src_addr,
-                &dst_addr,
-                &cx.checksum_caps(route.iface),
-            ) else {
+            let Some(buf) = cx.inner.alloc_packet() else {
                 trace!("no packet buffer for segment to {}, holding it back", dst_addr);
                 return Err(Blocked);
             };
+            let buf = build_tcp_packet(buf, &repr, &src_addr, &dst_addr, &cx.checksum_caps(route.iface));
             cx.transmit_ip(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, hop_limit);
             Ok(())
         })?;
@@ -11336,13 +11330,12 @@ mod stack_test {
     /// checksums filled, ready for injection into the device RX queue.
     fn tcp_packet(repr: &TcpRepr) -> Vec<u8> {
         let mut buf = build_tcp_packet(
-            crate::test_device::packet_allocator(),
+            crate::test_device::packet_allocator().try_alloc().unwrap(),
             repr,
             &REMOTE_ADDR.into(),
             &LOCAL_ADDR.into(),
             &ChecksumCapabilities::default(),
-        )
-        .unwrap();
+        );
         crate::stack::push_ipv4_header(
             &mut buf,
             REMOTE_ADDR,

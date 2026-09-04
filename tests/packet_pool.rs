@@ -47,6 +47,8 @@ fn configured_stack_pool_exhaustion_and_recovery() {
         stack.udp_socket(udp).send_slice(b"hello", dst),
         Err(SendError::NoBuffer)
     );
+    assert!(stack.take_packet_allocator_starved());
+    assert!(!stack.take_packet_allocator_starved());
     assert!(stack.udp_socket(udp).is_open());
 
     // Freeing one buffer is enough for a send. Taking it back starves sends again.

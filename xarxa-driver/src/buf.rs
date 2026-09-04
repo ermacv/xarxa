@@ -12,7 +12,13 @@ use core::fmt;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
+#[cfg(feature = "async")]
+use core::task::Waker;
 
+#[cfg(feature = "async")]
+use atomic_waker::AtomicWaker;
+#[cfg(feature = "async")]
+use portable_atomic::AtomicBool;
 use portable_atomic::{AtomicU32, Ordering};
 
 use crate::config::PACKET_BUF_SIZE;
@@ -62,6 +68,12 @@ struct PacketBufInner {
 struct PacketPoolHeader {
     allocate: unsafe fn(NonNull<PacketPoolHeader>) -> Option<PacketBuf>,
     release: unsafe fn(NonNull<PacketPoolHeader>, usize),
+    #[cfg(feature = "async")]
+    has_available: unsafe fn(NonNull<PacketPoolHeader>) -> bool,
+    #[cfg(feature = "async")]
+    waiter_claimed: AtomicBool,
+    #[cfg(feature = "async")]
+    waiter: AtomicWaker,
 }
 
 /// A small, copyable capability for allocating owned packet buffers.
@@ -96,6 +108,61 @@ impl PacketBufAllocator {
     /// Whether `buf` originated from this allocator's pool.
     pub fn owns(self, buf: &PacketBuf) -> bool {
         self.origin == buf.inner().origin
+    }
+
+    /// Claim the pool's unique asynchronous availability waiter.
+    ///
+    /// A single async stack may wait on one pool. Synchronous allocation and
+    /// any number of packet owners remain unrestricted. Requiring a unique
+    /// waiter makes sharing one pool between independent executor tasks an
+    /// explicit composition error instead of silently losing one task's
+    /// registration.
+    #[cfg(feature = "async")]
+    pub fn try_claim_waiter(self) -> Option<PacketPoolWaiter> {
+        let header = unsafe { self.origin.as_ref() };
+        header
+            .waiter_claimed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| PacketPoolWaiter { origin: self.origin })
+    }
+}
+
+/// Unique async notification capability for one packet pool.
+///
+/// The stack registers it only after allocation failed. A release racing
+/// before, during, or after registration is observed through a register-then-
+/// recheck protocol.
+#[cfg(feature = "async")]
+pub struct PacketPoolWaiter {
+    origin: NonNull<PacketPoolHeader>,
+}
+
+#[cfg(feature = "async")]
+unsafe impl Send for PacketPoolWaiter {}
+#[cfg(feature = "async")]
+unsafe impl Sync for PacketPoolWaiter {}
+
+#[cfg(feature = "async")]
+impl PacketPoolWaiter {
+    /// Register the task waiting for the pool to become nonempty.
+    pub fn register(&self, waker: &Waker) {
+        let header = unsafe { self.origin.as_ref() };
+        header.waiter.register(waker);
+        let available = unsafe { (header.has_available)(self.origin) };
+        if available {
+            header.waiter.wake();
+        }
+    }
+}
+
+#[cfg(feature = "async")]
+impl Drop for PacketPoolWaiter {
+    fn drop(&mut self) {
+        let header = unsafe { self.origin.as_ref() };
+        drop(header.waiter.take());
+        let claimed = header.waiter_claimed.swap(false, Ordering::AcqRel);
+        debug_assert!(claimed, "packet-pool waiter was released twice");
     }
 }
 
@@ -187,6 +254,12 @@ impl<const COUNT: usize> PacketPool<COUNT> {
             header: PacketPoolHeader {
                 allocate: allocate_from_pool::<COUNT>,
                 release: release_slot::<COUNT>,
+                #[cfg(feature = "async")]
+                has_available: has_available_in_pool::<COUNT>,
+                #[cfg(feature = "async")]
+                waiter_claimed: AtomicBool::new(false),
+                #[cfg(feature = "async")]
+                waiter: AtomicWaker::new(),
             },
             used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
             controls: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; COUNT],
@@ -265,12 +338,31 @@ impl<const COUNT: usize> PacketPool<COUNT> {
         }
         None
     }
+
+    #[cfg(feature = "async")]
+    fn has_available(&self) -> bool {
+        self.used[..COUNT.div_ceil(32)]
+            .iter()
+            .enumerate()
+            .any(|(word_index, word)| {
+                let used = word.load(Ordering::Acquire);
+                let valid = (COUNT - word_index * 32).min(32);
+                used.count_ones() < valid as u32
+            })
+    }
 }
 
 unsafe fn allocate_from_pool<const COUNT: usize>(origin: NonNull<PacketPoolHeader>) -> Option<PacketBuf> {
     // SAFETY: `origin` is produced from the first field of a stable
     // `PacketPool<COUNT>` by that same pool's `allocator` method.
     unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() }.try_alloc()
+}
+
+#[cfg(feature = "async")]
+unsafe fn has_available_in_pool<const COUNT: usize>(origin: NonNull<PacketPoolHeader>) -> bool {
+    // SAFETY: paired with the monomorphized function stored by
+    // `PacketPool::<COUNT>::from_storage`.
+    unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() }.has_available()
 }
 
 unsafe fn release_slot<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, index: usize) {
@@ -281,6 +373,8 @@ unsafe fn release_slot<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, in
     let bit = 1 << (index % 32);
     let previous = pool.used[index / 32].fetch_and(!bit, Ordering::Release);
     debug_assert_ne!(previous & bit, 0, "a packet pool slot was released twice");
+    #[cfg(feature = "async")]
+    pool.header.waiter.wake();
 }
 
 /// An owned network packet buffer.
@@ -489,6 +583,27 @@ mod tests {
     use super::*;
     use crate::config::PACKET_BUF_ALIGN;
     use std::boxed::Box;
+    #[cfg(feature = "async")]
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering as StdOrdering},
+    };
+    #[cfg(feature = "async")]
+    use std::task::{Wake, Waker};
+
+    #[cfg(feature = "async")]
+    struct CountWake(Arc<AtomicUsize>);
+
+    #[cfg(feature = "async")]
+    impl Wake for CountWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, StdOrdering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, StdOrdering::Relaxed);
+        }
+    }
 
     fn new_pool<const COUNT: usize>() -> &'static PacketPool<COUNT> {
         let storage = Box::leak(Box::new(PacketPoolStorage::new()));
@@ -552,6 +667,33 @@ mod tests {
         drop(first_buffer);
         assert!(first.try_alloc().is_some());
         assert!(second.try_alloc().is_none());
+    }
+
+    #[cfg(feature = "async")]
+    #[test]
+    fn unique_pool_waiter_observes_release_on_both_sides_of_registration() {
+        let pool = new_pool::<1>();
+        let allocator = pool.allocator();
+        let waiter = allocator.try_claim_waiter().unwrap();
+        assert!(allocator.try_claim_waiter().is_none());
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+
+        let held = allocator.try_alloc().unwrap();
+        waiter.register(&waker);
+        assert_eq!(wakes.load(StdOrdering::Relaxed), 0);
+        drop(held);
+        assert_eq!(wakes.load(StdOrdering::Relaxed), 1);
+
+        // A release before registration remains visible through the
+        // register-then-recheck availability test.
+        let held = allocator.try_alloc().unwrap();
+        drop(held);
+        waiter.register(&waker);
+        assert_eq!(wakes.load(StdOrdering::Relaxed), 2);
+
+        drop(waiter);
+        assert!(allocator.try_claim_waiter().is_some());
     }
 
     #[test]

@@ -14,7 +14,7 @@ target = "x86_64-unknown-linux-gnu"
 defmt = ["dep:defmt"]
 
 ## Enable the async parts of the driver API: `Driver::register_waker`.
-async = []
+async = ["dep:atomic-waker"]
 
 #! ### Packet metadata
 ## Enable the `PacketMeta::id` field: an opaque number that travels with a packet
@@ -34,6 +34,7 @@ packet-buf-align-16 = []
 packet-buf-align-32 = []
 
 [dependencies]
+atomic-waker = { version = "1.1.2", optional = true, features = ["portable-atomic"] }
 document-features = "0.2.11"
 portable-atomic = { version = "1", default-features = false }
 defmt = { version = "1", optional = true }

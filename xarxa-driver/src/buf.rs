@@ -3,9 +3,9 @@
 //! Every packet in the stack is a [`PacketBuf`]: one fixed-size buffer, owned by
 //! whoever holds it (the driver, the stack, a socket, the application).
 //!
-//! Buffers are allocated from static pools. The default pool backs
-//! [`PacketBuf::try_new`], while [`PacketPool`] and [`PacketPoolStorage`] let a
-//! system provide independently placed pools without changing the packet type.
+//! Buffers are allocated from explicit static pools. [`PacketPool`] and
+//! [`PacketPoolStorage`] let a system independently place multiple pools
+//! without changing the packet type passed through drivers and the stack.
 
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -17,17 +17,6 @@ use portable_atomic::{AtomicU32, Ordering};
 
 use crate::config::PACKET_BUF_SIZE;
 use crate::meta::PacketMeta;
-
-#[cfg(not(test))]
-const PACKET_BUF_COUNT: usize = crate::config::PACKET_BUF_COUNT;
-// The unit tests run in parallel threads of one process, all sharing the one
-// pool. The default is too small.
-#[cfg(test)]
-const PACKET_BUF_COUNT: usize = if crate::config::PACKET_BUF_COUNT > 1024 {
-    crate::config::PACKET_BUF_COUNT
-} else {
-    1024
-};
 
 const MAX_PACKET_POOL_COUNT: usize = 1024;
 const MAX_BITMAP_WORDS: usize = MAX_PACKET_POOL_COUNT.div_ceil(32);
@@ -71,7 +60,49 @@ struct PacketBufInner {
 }
 
 struct PacketPoolHeader {
+    allocate: unsafe fn(NonNull<PacketPoolHeader>) -> Option<PacketBuf>,
     release: unsafe fn(NonNull<PacketPoolHeader>, usize),
+}
+
+/// A small, copyable capability for allocating owned packet buffers.
+///
+/// Allocators are created by [`PacketPool::allocator`]. They carry no memory
+/// policy themselves: each one remains permanently bound to the pool whose
+/// payload placement and capacity the system selected.
+#[derive(Clone, Copy)]
+pub struct PacketBufAllocator {
+    origin: NonNull<PacketPoolHeader>,
+}
+
+// SAFETY: an allocator is a shared reference in erased form to a static
+// `PacketPool`, whose allocation and release protocol is thread-safe.
+unsafe impl Send for PacketBufAllocator {}
+// SAFETY: see `Send`; allocating through shared copies is synchronized by the
+// originating pool's atomic bitmap.
+unsafe impl Sync for PacketBufAllocator {}
+
+impl PacketBufAllocator {
+    /// Allocate one empty packet from the bound pool.
+    ///
+    /// The packet has zero headroom and length and default metadata. Its storage
+    /// retains unspecified bytes from the preceding owner.
+    pub fn try_alloc(self) -> Option<PacketBuf> {
+        let allocate = unsafe { self.origin.as_ref().allocate };
+        // SAFETY: only `PacketPool::allocator` constructs this capability and
+        // installs the matching monomorphized allocation function.
+        unsafe { allocate(self.origin) }
+    }
+
+    /// Whether `buf` originated from this allocator's pool.
+    pub fn owns(self, buf: &PacketBuf) -> bool {
+        self.origin == buf.inner().origin
+    }
+}
+
+impl fmt::Debug for PacketBufAllocator {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PacketBufAllocator").finish_non_exhaustive()
+    }
 }
 
 /// Payload storage for one statically allocated packet pool.
@@ -131,13 +162,15 @@ impl<const COUNT: usize> PacketPool<COUNT> {
     /// The returned control value must itself be placed at a stable address
     /// before allocation. [`try_alloc`](Self::try_alloc) requires `&'static
     /// self`, enforcing that requirement in safe code.
+    ///
+    /// # Panics
+    ///
+    /// Panics unless `COUNT` is in `1..=1024`.
     pub fn new(storage: &'static mut PacketPoolStorage<COUNT>) -> Self {
-        // SAFETY: consuming the unique static borrow prevents another safe pool
-        // from binding the same storage.
-        unsafe { Self::from_shared_storage(storage) }
+        Self::from_storage(storage)
     }
 
-    const unsafe fn from_shared_storage(storage: &'static PacketPoolStorage<COUNT>) -> Self {
+    fn from_storage(storage: &'static PacketPoolStorage<COUNT>) -> Self {
         assert!(COUNT > 0, "a packet pool must contain at least one slot");
         assert!(
             COUNT <= MAX_PACKET_POOL_COUNT,
@@ -145,6 +178,7 @@ impl<const COUNT: usize> PacketPool<COUNT> {
         );
         Self {
             header: PacketPoolHeader {
+                allocate: allocate_from_pool::<COUNT>,
                 release: release_slot::<COUNT>,
             },
             used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
@@ -156,6 +190,13 @@ impl<const COUNT: usize> PacketPool<COUNT> {
     /// Number of packet slots owned by this pool.
     pub const fn capacity(&self) -> usize {
         COUNT
+    }
+
+    /// Create a copyable allocation capability bound to this pool.
+    pub fn allocator(&'static self) -> PacketBufAllocator {
+        PacketBufAllocator {
+            origin: NonNull::from(&self.header),
+        }
     }
 
     /// Whether `buf` originated from this pool.
@@ -219,6 +260,12 @@ impl<const COUNT: usize> PacketPool<COUNT> {
     }
 }
 
+unsafe fn allocate_from_pool<const COUNT: usize>(origin: NonNull<PacketPoolHeader>) -> Option<PacketBuf> {
+    // SAFETY: `origin` is produced from the first field of a stable
+    // `PacketPool<COUNT>` by that same pool's `allocator` method.
+    unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() }.try_alloc()
+}
+
 unsafe fn release_slot<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, index: usize) {
     // SAFETY: `origin` is written only by `PacketPool<COUNT>::try_alloc` and
     // points at the first field of that stable `#[repr(C)]` pool.
@@ -228,12 +275,6 @@ unsafe fn release_slot<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, in
     let previous = pool.used[index / 32].fetch_and(!bit, Ordering::Release);
     debug_assert_ne!(previous & bit, 0, "a packet pool slot was released twice");
 }
-
-static DEFAULT_PACKET_STORAGE: PacketPoolStorage<PACKET_BUF_COUNT> = PacketPoolStorage::new();
-// SAFETY: this private storage is named only here and is permanently bound to
-// this one pool. Public pools require a unique static borrow instead.
-static DEFAULT_PACKET_POOL: PacketPool<PACKET_BUF_COUNT> =
-    unsafe { PacketPool::from_shared_storage(&DEFAULT_PACKET_STORAGE) };
 
 /// An owned network packet buffer.
 ///
@@ -249,15 +290,6 @@ unsafe impl Send for PacketBuf {}
 unsafe impl Sync for PacketBuf {}
 
 impl PacketBuf {
-    /// Allocate a buffer.
-    ///
-    /// - Zero headroom, len.
-    /// - Default metadata.
-    /// - **Uninitialized** data.
-    pub fn try_new() -> Option<Self> {
-        DEFAULT_PACKET_POOL.try_alloc()
-    }
-
     #[inline]
     fn inner(&self) -> &PacketBufInner {
         // SAFETY: we own the slot for as long as `self` exists.
@@ -456,6 +488,10 @@ mod tests {
         Box::leak(Box::new(PacketPool::new(storage)))
     }
 
+    fn new_buffer() -> PacketBuf {
+        new_pool::<1>().try_alloc().unwrap()
+    }
+
     #[test]
     fn packet_handle_stays_one_pointer() {
         assert_eq!(
@@ -492,13 +528,17 @@ mod tests {
     fn independent_pools_return_to_their_origin() {
         let first = new_pool::<1>();
         let second = new_pool::<1>();
+        let first_allocator = first.allocator();
+        let second_allocator = second.allocator();
 
-        let first_buffer = first.try_alloc().unwrap();
-        let second_buffer = second.try_alloc().unwrap();
+        let first_buffer = first_allocator.try_alloc().unwrap();
+        let second_buffer = second_allocator.try_alloc().unwrap();
         assert!(first.owns(&first_buffer));
         assert!(!second.owns(&first_buffer));
         assert!(second.owns(&second_buffer));
         assert!(!first.owns(&second_buffer));
+        assert!(first_allocator.owns(&first_buffer));
+        assert!(!second_allocator.owns(&first_buffer));
         assert!(first.try_alloc().is_none());
         assert!(second.try_alloc().is_none());
 
@@ -520,7 +560,7 @@ mod tests {
 
     #[test]
     fn push_pull() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = new_buffer();
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.headroom(), 0);
         assert_eq!(buf.tailroom(), PACKET_BUF_SIZE);
@@ -545,7 +585,7 @@ mod tests {
 
     #[test]
     fn ensure_headroom() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = new_buffer();
         buf.reserve(10);
         buf.set_len(4);
         buf.copy_from_slice(&[1, 2, 3, 4]);
@@ -576,7 +616,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn push_beyond_headroom() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = new_buffer();
         buf.push_front(1);
     }
 
@@ -585,7 +625,7 @@ mod tests {
     /// layout.
     #[test]
     fn storage_is_dma_shaped() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = new_buffer();
         assert_eq!(buf.storage_mut().as_ptr() as usize % PACKET_BUF_ALIGN, 0);
         assert_eq!(buf.storage_mut().len() % PACKET_BUF_ALIGN, 0);
         assert!(buf.storage_mut().len() >= PACKET_BUF_SIZE);
@@ -596,13 +636,14 @@ mod tests {
     /// `packet_pool` integration test, which has a process's pool to itself.)
     #[test]
     fn fresh_buffer_is_reset() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let pool = new_pool::<1>();
+        let mut buf = pool.try_alloc().unwrap();
         buf.reserve(100);
         buf.set_len(200);
         buf.fill(0xff);
         drop(buf);
 
-        let buf = PacketBuf::try_new().unwrap();
+        let buf = pool.try_alloc().unwrap();
         assert_eq!(buf.len(), 0);
         assert_eq!(buf.headroom(), 0);
         assert_eq!(buf.meta(), PacketMeta::default());
@@ -613,7 +654,7 @@ mod tests {
     #[cfg(feature = "packetmeta-id")]
     #[test]
     fn meta_travels_with_the_buffer() {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = new_buffer();
         assert_eq!(buf.meta(), PacketMeta::default());
 
         buf.meta_mut().id = 0xdead_beef;

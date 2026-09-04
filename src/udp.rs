@@ -803,7 +803,7 @@ impl UdpSocket<'_, '_> {
             self.tx.inner.set_tx_starved();
             return Err(SendError::DeviceBusy);
         }
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = self.tx.alloc_packet() else {
             self.tx.inner.set_tx_starved();
             return Err(SendError::NoBuffer);
         };
@@ -1008,7 +1008,7 @@ mod test {
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Address, Ipv6Address};
 
     fn stack_with_socket() -> (Stack<'static>, UdpHandle) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_udp_socket().unwrap();
         (stack, handle)
     }
@@ -1025,7 +1025,7 @@ mod test {
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
     fn stack_with_iface() -> Stack<'static> {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -1037,7 +1037,7 @@ mod test {
     /// Build a queued-datagram buffer the way ingress does, as a full IPv4 + UDP packet.
     fn queued_packet_from(src_addr: Ipv4Address, src_port: u16, dst_addr: Ipv4Address, payload: &[u8]) -> PacketBuf {
         let udp_len = UDP_HEADER_LEN + payload.len();
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::test_device::packet_allocator().try_alloc().unwrap();
         buf.set_len(IPV4_HEADER_LEN + udp_len);
         {
             let mut ip = Ipv4Packet::new_unchecked(&mut buf);
@@ -1108,7 +1108,7 @@ mod test {
     fn test_bind_ephemeral() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
 
@@ -1125,7 +1125,7 @@ mod test {
 
     #[test]
     fn test_bind_conflicts() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
 
@@ -1185,7 +1185,7 @@ mod test {
 
     #[test]
     fn test_bind_conflicts_per_version() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
         let h3 = stack.add_udp_socket().unwrap();
@@ -1420,7 +1420,7 @@ mod test {
     fn test_packet_meta() {
         let driver = TestDevice::new(Medium::Ip);
         let sent = driver.tx_meta.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -1507,7 +1507,7 @@ mod test {
     #[cfg(not(feature = "alloc"))]
     #[test]
     fn test_socket_slab_full() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let mut handles = std::vec::Vec::new();
         for _ in 0..UDP_SOCKET_COUNT {
             handles.push(stack.add_udp_socket().unwrap());

@@ -447,6 +447,7 @@ impl Client {
     /// emits are tiny, so only an absurd `outgoing_options` can cause that.
     #[allow(clippy::too_many_arguments)]
     fn build(
+        allocator: crate::driver::PacketBufAllocator,
         config: &DhcpConfig,
         message_type: DhcpMessageType,
         transaction_id: u32,
@@ -464,7 +465,7 @@ impl Client {
         const MAX_IPV4_HEADER_LEN: usize = 60;
         let max_size = (ip_mtu - MAX_IPV4_HEADER_LEN - UDP_HEADER_LEN) as u16;
 
-        let mut buf = PacketBuf::try_new()?;
+        let mut buf = allocator.try_alloc()?;
         buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN + UDP_HEADER_LEN);
         let max_payload = buf.tailroom().min(ip_mtu - IPV4_HEADER_LEN - UDP_HEADER_LEN);
         buf.set_len(max_payload);
@@ -671,6 +672,7 @@ impl IfaceState<'_> {
                 client.transaction_id = Client::random_transaction_id(inner);
                 state.retry_at = now + DISCOVER_TIMEOUT;
                 let buf = Client::build(
+                    inner.packet_allocator,
                     &client.config,
                     DhcpMessageType::Discover,
                     client.transaction_id,
@@ -703,6 +705,7 @@ impl IfaceState<'_> {
                 state.retry_at = now + INITIAL_REQUEST_TIMEOUT * (1u32 << (state.retry as u32 / 2));
                 state.retry += 1;
                 let buf = Client::build(
+                    inner.packet_allocator,
                     &client.config,
                     DhcpMessageType::Request,
                     client.transaction_id,
@@ -757,6 +760,7 @@ impl IfaceState<'_> {
                 debug!("DHCP send renew to {}", dst_addr);
                 client.transaction_id = Client::random_transaction_id(inner);
                 let buf = Client::build(
+                    inner.packet_allocator,
                     &client.config,
                     DhcpMessageType::Request,
                     client.transaction_id,
@@ -884,7 +888,7 @@ mod test {
     fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(1);
+        let mut stack = Stack::new(1, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         assert_eq!(handle, IFACE);
         // Drain the solicited-node multicast report the link-local address triggers,

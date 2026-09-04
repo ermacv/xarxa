@@ -9,7 +9,7 @@ use crate::config::TCP_LISTENER_COUNT;
 use crate::config::TCP_SOCKET_COUNT;
 #[cfg(feature = "udp")]
 use crate::config::UDP_SOCKET_COUNT;
-use crate::driver::{ChecksumCapabilities, Driver, PacketBuf};
+use crate::driver::{ChecksumCapabilities, Driver, PacketBuf, PacketBufAllocator};
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
 #[cfg(all(feature = "icmp-errors", any(feature = "udp", feature = "tcp")))]
@@ -65,6 +65,9 @@ pub(crate) struct Sockets<'d> {
 /// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
+    /// Pool used for every packet the stack itself creates. Packets received
+    /// from a driver retain their own originating pool instead.
+    pub(crate) packet_allocator: PacketBufAllocator,
     pub(crate) now: Instant,
     #[cfg_attr(not(any(feature = "udp", feature = "tcp")), allow(dead_code))]
     pub(crate) rand: Rand,
@@ -82,6 +85,11 @@ pub(crate) struct StackInner {
 }
 
 impl StackInner {
+    /// Allocate a packet owned by the stack's configured memory domain.
+    pub(crate) fn alloc_packet(&self) -> Option<PacketBuf> {
+        self.packet_allocator.try_alloc()
+    }
+
     /// Note that a socket send was held back for lack of a packet buffer or
     /// device room, so `Stack::poll` wakes the packet sockets' send wakers.
     #[cfg(any(feature = "udp", feature = "raw"))]
@@ -132,6 +140,12 @@ pub(crate) struct EgressRoute {
 }
 
 impl TxContext<'_, '_> {
+    /// Allocate a packet owned by the stack's configured memory domain.
+    #[cfg(any(feature = "udp", feature = "raw"))]
+    pub(crate) fn alloc_packet(&self) -> Option<PacketBuf> {
+        self.inner.alloc_packet()
+    }
+
     /// The current time, as last set by [`Stack::poll`].
     #[cfg(feature = "tcp")]
     pub(crate) fn now(&self) -> Instant {
@@ -355,8 +369,9 @@ impl<'d> Stack<'d> {
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
     /// numbers and ephemeral ports. This should be random, or at least different
-    /// at every boot.
-    pub fn new(random_seed: u64) -> Self {
+    /// at every boot. `packet_allocator` supplies every packet created by the
+    /// stack; packets received from drivers retain their own pool origin.
+    pub fn new(random_seed: u64, packet_allocator: PacketBufAllocator) -> Self {
         #[cfg_attr(not(feature = "ipv4-fragmentation"), allow(unused_mut))]
         let mut rand = Rand::new(random_seed);
 
@@ -365,6 +380,7 @@ impl<'d> Stack<'d> {
 
         Self {
             inner: StackInner {
+                packet_allocator,
                 now: Instant::ZERO,
                 rand,
                 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -391,7 +407,7 @@ impl<'d> Stack<'d> {
                 _lent: core::marker::PhantomData,
             },
             #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
-            fragments: FragmentsBuffer::new(),
+            fragments: FragmentsBuffer::new(packet_allocator),
         }
     }
 
@@ -1266,7 +1282,9 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(arrival, &dst_addr) else {
             return;
         };
-        let Some(buf) = crate::tcp::build_tcp_packet(repr, &src_addr, &dst_addr, &checksum_caps) else {
+        let Some(buf) =
+            crate::tcp::build_tcp_packet(self.inner.packet_allocator, repr, &src_addr, &dst_addr, &checksum_caps)
+        else {
             return;
         };
         self.transmit_reply(&route, buf, src_addr, dst_addr, IpProtocol::Tcp, 64);
@@ -1700,6 +1718,7 @@ impl<'d> Stack<'d> {
                 // than transmitted, so no device is going to fill its checksums in.
                 let checksum_caps = ChecksumCapabilities::default();
                 let Some(mut reply) = build_icmpv4_error(
+                    self.inner.packet_allocator,
                     &orig,
                     Icmpv4Message::DstUnreachable,
                     Icmpv4DstUnreachable::HostUnreachable.into(),
@@ -1734,6 +1753,7 @@ impl<'d> Stack<'d> {
                 // The error is fed back through local ingress processing rather
                 // than transmitted, so no device is going to fill its checksums in.
                 let Some(mut reply) = build_icmpv6_error(
+                    self.inner.packet_allocator,
                     &orig,
                     &reply_src,
                     &src_addr,
@@ -1778,7 +1798,8 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddress::Ipv4(src_addr)) else {
             return;
         };
-        let Some(reply) = build_icmpv4_error(orig, msg_type, msg_code, &checksum_caps) else {
+        let Some(reply) = build_icmpv4_error(self.inner.packet_allocator, orig, msg_type, msg_code, &checksum_caps)
+        else {
             return;
         };
         self.transmit_reply(
@@ -1827,8 +1848,16 @@ impl<'d> Stack<'d> {
         let Some((route, checksum_caps)) = self.route_reply(iface, &IpAddress::Ipv6(src_addr)) else {
             return;
         };
-        let Some(reply) = build_icmpv6_error(orig, &reply_src, &src_addr, msg_type, msg_code, pointer, &checksum_caps)
-        else {
+        let Some(reply) = build_icmpv6_error(
+            self.inner.packet_allocator,
+            orig,
+            &reply_src,
+            &src_addr,
+            msg_type,
+            msg_code,
+            pointer,
+            &checksum_caps,
+        ) else {
             return;
         };
         self.transmit_reply(
@@ -1934,7 +1963,7 @@ impl StackInner {
         );
 
         if operation == ArpOperation::Request {
-            let Some(mut reply) = PacketBuf::try_new() else {
+            let Some(mut reply) = self.alloc_packet() else {
                 trace!("arp: no packet buffer for reply");
                 return;
             };
@@ -1985,7 +2014,7 @@ impl StackInner {
         if (iface.has_solicited_node(dst_addr) || iface.has_ip_addr(dst_addr)) && iface.has_ip_addr(target_addr) {
             // Neighbor advert: NA header (24 bytes) plus the target link-layer
             // address option.
-            let Some(mut reply) = PacketBuf::try_new() else {
+            let Some(mut reply) = self.alloc_packet() else {
                 trace!("ndisc: no packet buffer for neighbor advert");
                 return;
             };
@@ -2214,7 +2243,7 @@ impl StackInner {
             return;
         };
 
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = self.alloc_packet() else {
             // The retransmission timer sends the next one.
             trace!("arp: no packet buffer for request");
             return;
@@ -2243,7 +2272,7 @@ impl StackInner {
 
         // Neighbor solicit: NS header (24 bytes) plus the source link-layer
         // address option.
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = self.alloc_packet() else {
             // The retransmission timer sends the next one.
             trace!("ndisc: no packet buffer for neighbor solicit");
             return;
@@ -2526,13 +2555,14 @@ const ICMP_ERROR_HEADER_LEN: usize = 8;
 /// as fits within the minimum MTU (RFC 1812 §4.3.2.3).
 #[cfg(feature = "ipv4")]
 fn build_icmpv4_error(
+    allocator: PacketBufAllocator,
     orig: &[u8],
     msg_type: Icmpv4Message,
     msg_code: u8,
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
     let quote_len = orig.len().min(IPV4_MIN_MTU - IPV4_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
-    let mut reply = PacketBuf::try_new()?;
+    let mut reply = allocator.try_alloc()?;
     reply.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
     reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
     {
@@ -2556,6 +2586,7 @@ fn build_icmpv4_error(
 /// written for parameter problem messages.
 #[cfg(feature = "ipv6")]
 fn build_icmpv6_error(
+    allocator: PacketBufAllocator,
     orig: &[u8],
     src_addr: &Ipv6Address,
     dst_addr: &Ipv6Address,
@@ -2565,7 +2596,7 @@ fn build_icmpv6_error(
     checksum_caps: &ChecksumCapabilities,
 ) -> Option<PacketBuf> {
     let quote_len = orig.len().min(IPV6_MIN_MTU - IPV6_HEADER_LEN - ICMP_ERROR_HEADER_LEN);
-    let mut reply = PacketBuf::try_new()?;
+    let mut reply = allocator.try_alloc()?;
     reply.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN);
     reply.set_len(ICMP_ERROR_HEADER_LEN + quote_len);
     {
@@ -2765,7 +2796,7 @@ pub(crate) mod test {
     ) -> (Stack<'static>, Queue, Sent, Room) {
         let driver = TestDevice::new(medium).with_mtu(mtu).with_checksum(checksum);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(
             &mut stack,
             match medium {
@@ -2795,7 +2826,7 @@ pub(crate) mod test {
     fn test_iface_reports_device_state() {
         let driver = TestDevice::new(Medium::Ethernet);
         let link = driver.link.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
 
         // The hardware address is read from the device at add time.
@@ -3313,7 +3344,7 @@ pub(crate) mod test {
     fn test_stack_with_link(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         stack
             .iface(handle)
@@ -3722,7 +3753,7 @@ pub(crate) mod test {
     /// A stack with two IP-medium interfaces: the first owns [`OUR_V4`]/24,
     /// the second 10.0.0.1/24, and both own fe80::1/64.
     fn test_stack_two_ifaces() -> (Stack<'static>, [Queue; 2], [Sent; 2]) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let mut rxs = Vec::new();
         let mut txs = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
@@ -4165,7 +4196,7 @@ pub(crate) mod test {
             .with_rx_meta(rx_meta)
             .with_tx_stamp(TX_STAMP);
         let (rx, sent) = (driver.rx.clone(), driver.tx_meta.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
 
@@ -4972,7 +5003,7 @@ pub(crate) mod test {
                 let udp_packet_payload = vec![1; udp_packet_payload_len];
                 let datagram = udp_datagram(OUR_V4.into(), 12345, REMOTE_V4.into(), 54321, &udp_packet_payload);
 
-                let mut buf = PacketBuf::try_new().unwrap();
+                let mut buf = crate::test_device::packet_allocator().try_alloc().unwrap();
                 buf.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
                 buf.set_len(datagram.len());
                 buf.copy_from_slice(&datagram);

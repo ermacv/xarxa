@@ -11,8 +11,8 @@ use core::fmt;
 use core::result::Result;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
-use crate::driver::PacketBuf;
 use crate::driver::config::PACKET_BUF_SIZE;
+use crate::driver::{PacketBuf, PacketBufAllocator};
 use crate::stack::Stack;
 use crate::storage::Assembler;
 use crate::time::{Duration, Instant};
@@ -50,6 +50,7 @@ impl core::error::Error for AssemblerFullError {}
 /// first one arrives and handed out whole by [`assemble`](Self::assemble).
 #[derive(Debug)]
 pub struct PacketAssembler<K> {
+    allocator: PacketBufAllocator,
     key: Option<K>,
     buffer: Option<PacketBuf>,
 
@@ -60,8 +61,9 @@ pub struct PacketAssembler<K> {
 
 impl<K> PacketAssembler<K> {
     /// Create a new empty buffer for fragments.
-    pub const fn new() -> Self {
+    pub fn new(allocator: PacketBufAllocator) -> Self {
         Self {
+            allocator,
             key: None,
             buffer: None,
 
@@ -82,7 +84,7 @@ impl<K> PacketAssembler<K> {
     /// The buffer the fragments are assembled into, taken from the pool on first use.
     fn buffer(&mut self) -> Result<&mut PacketBuf, AssemblerError> {
         if self.buffer.is_none() {
-            self.buffer = Some(PacketBuf::try_new().ok_or(AssemblerError)?);
+            self.buffer = Some(self.allocator.try_alloc().ok_or(AssemblerError)?);
         }
         // NOTE(unwrap): filled in just above.
         Ok(unwrap!(self.buffer.as_mut()))
@@ -171,9 +173,9 @@ pub struct PacketAssemblerSet<K: Eq + Copy> {
 
 impl<K: Eq + Copy> PacketAssemblerSet<K> {
     /// Create a new set of packet assemblers.
-    pub fn new() -> Self {
+    pub fn new(allocator: PacketBufAllocator) -> Self {
         Self {
-            assemblers: [const { PacketAssembler::new() }; REASSEMBLY_BUFFER_COUNT],
+            assemblers: core::array::from_fn(|_| PacketAssembler::new(allocator)),
         }
     }
 
@@ -258,9 +260,9 @@ pub(crate) struct FragmentsBuffer {
 }
 
 impl FragmentsBuffer {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(allocator: PacketBufAllocator) -> Self {
         Self {
-            assembler: PacketAssemblerSet::new(),
+            assembler: PacketAssemblerSet::new(allocator),
             reassembly_timeout: Duration::from_secs(60),
         }
     }
@@ -354,7 +356,7 @@ mod tests {
 
     #[test]
     fn packet_assembler_overlap() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::new(crate::test_device::packet_allocator());
 
         p_assembler.set_total_size(5).unwrap();
 
@@ -367,7 +369,7 @@ mod tests {
 
     #[test]
     fn packet_assembler_assemble() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::new(crate::test_device::packet_allocator());
 
         let data = b"Hello World!";
 
@@ -383,7 +385,7 @@ mod tests {
 
     #[test]
     fn packet_assembler_out_of_order_assemble() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::new(crate::test_device::packet_allocator());
 
         let data = b"Hello World!";
 
@@ -399,7 +401,7 @@ mod tests {
 
     #[test]
     fn packet_assembler_too_large() {
-        let mut p_assembler = PacketAssembler::<Key>::new();
+        let mut p_assembler = PacketAssembler::<Key>::new(crate::test_device::packet_allocator());
 
         assert_eq!(p_assembler.set_total_size(PACKET_BUF_SIZE), Ok(()));
         assert_eq!(p_assembler.set_total_size(PACKET_BUF_SIZE), Ok(()));
@@ -412,14 +414,14 @@ mod tests {
     fn packet_assembler_set() {
         let key = Key { id: 1 };
 
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::new(crate::test_device::packet_allocator());
 
         assert!(set.get(&key, Instant::ZERO).is_ok());
     }
 
     #[test]
     fn packet_assembler_set_full() {
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::new(crate::test_device::packet_allocator());
         for i in 0..REASSEMBLY_BUFFER_COUNT {
             set.get(&Key { id: i }, Instant::ZERO).unwrap();
         }
@@ -436,7 +438,7 @@ mod tests {
 
     #[test]
     fn packet_assembler_set_expiry() {
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::new(crate::test_device::packet_allocator());
         let key = Key { id: 0 };
         set.get(&key, Instant::from_secs(10)).unwrap();
         assert_eq!(set.poll_at(), Instant::from_secs(10));
@@ -450,7 +452,7 @@ mod tests {
 
     #[test]
     fn packet_assembler_set_assembling_many() {
-        let mut set = PacketAssemblerSet::new();
+        let mut set = PacketAssemblerSet::new(crate::test_device::packet_allocator());
 
         let key = Key { id: 0 };
         let assr = set.get(&key, Instant::ZERO).unwrap();

@@ -5,7 +5,6 @@ dname = os.path.dirname(abspath)
 os.chdir(dname)
 
 features = []
-driver_features = []
 
 
 def _feature(into, name, default, min, max, pow2=None):
@@ -31,13 +30,6 @@ def _feature(into, name, default, min, max, pow2=None):
 def feature(name, default, min, max, pow2=None):
     _feature(features, name, default, min, max, pow2)
 
-
-def driver_feature(name, default, min, max, pow2=None):
-    _feature(driver_features, name, default, min, max, pow2)
-
-
-# Packet pool. Lives in `xarxa-driver`; `xarxa` forwards these features there.
-driver_feature("packet_buf_count", default=16, min=1, max=4096, pow2=8)
 
 # Interfaces and tables (only bounded without `alloc`).
 feature("iface_count", default=2, min=1, max=8)
@@ -129,7 +121,5 @@ def update_build_rs(path, feats):
         f.write(data)
 
 
-update_cargo_toml("Cargo.toml", [(driver_features, "xarxa-driver"), (features, None)])
+update_cargo_toml("Cargo.toml", [(features, None)])
 update_build_rs("build.rs", features)
-update_cargo_toml("xarxa-driver/Cargo.toml", [(driver_features, None)])
-update_build_rs("xarxa-driver/build.rs", driver_features)

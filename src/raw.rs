@@ -190,8 +190,8 @@ impl RawSocketState {
 /// Copy a packet into a freshly allocated buffer. Used when both a raw socket and
 /// the stack's own protocol handlers want an ingress packet. `None` if the pool
 /// is empty: the socket misses the packet, the stack still processes it.
-fn copy_packet(buf: &PacketBuf) -> Option<PacketBuf> {
-    let Some(mut copy) = PacketBuf::try_new() else {
+fn copy_packet(allocator: crate::driver::PacketBufAllocator, buf: &PacketBuf) -> Option<PacketBuf> {
+    let Some(mut copy) = allocator.try_alloc() else {
         trace!("raw: no packet buffer for a copy, socket misses the packet");
         return None;
     };
@@ -480,7 +480,7 @@ impl RawSocket<'_, '_> {
             return Err(SendError::DeviceBusy);
         }
 
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = self.tx.alloc_packet() else {
             self.tx.inner.set_tx_starved();
             return Err(SendError::NoBuffer);
         };
@@ -564,7 +564,7 @@ impl Stack<'_> {
 
             trace!("raw: receiving {} octet frame (ethertype {})", buf.len(), ethertype);
             if stack_wants {
-                if let Some(copy) = copy_packet(&buf) {
+                if let Some(copy) = copy_packet(self.inner.packet_allocator, &buf) {
                     socket.rx_enqueue(copy);
                 }
                 return Some(buf);
@@ -611,7 +611,7 @@ impl Stack<'_> {
 
             trace!("raw: receiving {} octets ({} {})", buf.len(), version, protocol);
             if stack_wants {
-                if let Some(copy) = copy_packet(&buf) {
+                if let Some(copy) = copy_packet(self.inner.packet_allocator, &buf) {
                     socket.rx_enqueue(copy);
                 }
                 return Some((buf, true));
@@ -738,7 +738,7 @@ mod test {
     }
 
     fn buf_from(bytes: &[u8]) -> PacketBuf {
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = crate::test_device::packet_allocator().try_alloc().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(bytes);
         buf
@@ -746,7 +746,7 @@ mod test {
 
     #[test]
     fn test_bind_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         assert!(!socket.is_open());
@@ -780,7 +780,7 @@ mod test {
 
     #[test]
     fn test_bind_ethernet() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let (eth_iface, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (ip_iface, _) = add_test_iface(&mut stack, Medium::Ip, vec![]);
 
@@ -806,7 +806,7 @@ mod test {
 
     #[test]
     fn test_recv() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
 
@@ -837,7 +837,7 @@ mod test {
 
     #[test]
     fn test_peek_and_recv_slice() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         socket
@@ -862,7 +862,7 @@ mod test {
 
     #[test]
     fn test_recv_slice_truncated() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_raw_socket().unwrap();
         let mut socket = stack.raw_socket(handle);
         socket
@@ -884,7 +884,7 @@ mod test {
 
     #[test]
     fn test_demux_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h_icmp = stack.add_raw_socket().unwrap();
         let h_any = stack.add_raw_socket().unwrap();
         stack
@@ -943,7 +943,7 @@ mod test {
     fn test_packet_meta() {
         let driver = TestDevice::new(Medium::Ethernet);
         let sent = driver.tx_meta.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(
             &mut stack,
             HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x01])),
@@ -982,7 +982,7 @@ mod test {
 
     #[test]
     fn test_demux_ethernet() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let (iface_a, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let (iface_b, _) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
 
@@ -1027,7 +1027,7 @@ mod test {
 
     #[test]
     fn test_send_ethernet() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let (iface, tx) = add_test_iface(&mut stack, Medium::Ethernet, vec![]);
         let handle = stack.add_raw_socket().unwrap();
 
@@ -1059,7 +1059,7 @@ mod test {
 
     #[test]
     fn test_send_ip() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_raw_socket().unwrap();
         stack
             .raw_socket(handle)
@@ -1109,7 +1109,7 @@ mod test {
 
     #[test]
     fn test_send_ip_protocol_filter() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let (_iface, tx) = add_test_iface(
             &mut stack,
             Medium::Ip,

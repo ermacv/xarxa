@@ -16,6 +16,8 @@
 //!     --dhcp-range=192.168.69.50,192.168.69.90,12h
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -30,10 +32,11 @@ fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "tap0".to_string());
 
     let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
-    let driver = TunTapDriver::new(&name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = TunTapDriver::new(&name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
 
     // That's all it takes: the stack installs the address and default route

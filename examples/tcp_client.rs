@@ -23,6 +23,8 @@
 //! the connection and exits the client.
 
 use std::io::Write as _;
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -52,12 +54,13 @@ fn main() {
     // The driver and the socket buffers are lent to the stack by reference
     // rather than boxed, as a no-alloc program would. They must be declared
     // before the stack, which holds them until it is dropped.
-    let mut driver = TunTapDriver::new(name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let mut driver = TunTapDriver::new(name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
     let mut rx_buffer = [0u8; 4096];
     let mut tx_buffer = [0u8; 4096];
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface_borrowed(&mut driver).unwrap();
     stack
         .iface(iface)

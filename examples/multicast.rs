@@ -16,6 +16,8 @@
 //! echo hi | socat - UDP4-DATAGRAM:224.0.0.251:5353,bind=:5353
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -38,11 +40,12 @@ fn main() {
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
 
-    let driver = TunTapDriver::new(name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = TunTapDriver::new(name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
     // Create interface
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)

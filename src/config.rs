@@ -16,8 +16,6 @@
 //! Some settings are limits only without the `alloc` feature: with it, the table
 //! they size grows on the heap instead, and the setting is ignored.
 //!
-//! The packet pool size is configurable in [`xarxa_driver::config`](crate::driver::config).
-
 mod raw {
     #![allow(unused)]
     include!(concat!(env!("OUT_DIR"), "/config.rs"));

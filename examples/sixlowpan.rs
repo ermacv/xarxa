@@ -46,6 +46,8 @@
 //! rmmod mac802154_hwsim
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -64,10 +66,11 @@ fn main() {
     let hardware_addr = HardwareAddress::Ieee802154(Ieee802154Address::Extended([
         0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
     ]));
-    let driver = RawSocketDriver::new(&name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = RawSocketDriver::new(&name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     // The link-local address is derived from the extended address:
     // fe80::180b:4242:4242:4242.

@@ -1,8 +1,8 @@
-//! This is an integration test rather than a unit test because it has to own the
-//! whole pool, and unit tests run in parallel threads of one process
+//! The stack is given a deliberately small private pool so exhaustion and
+//! recovery exercise its explicit allocator rather than process-global state.
 
 use xarxa::Stack;
-use xarxa::driver::PacketBuf;
+use xarxa::driver::{PacketPool, PacketPoolStorage};
 use xarxa::iface::Medium;
 use xarxa::udp::SendError;
 use xarxa::wire::{HardwareAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
@@ -14,10 +14,12 @@ use test_device::TestDevice;
 #[path = "../src/test_device.rs"]
 mod test_device;
 
-/// One test function, so that every step runs in order on the one pool.
 #[test]
-fn exhaustion() {
-    let mut stack = Stack::new(0x1234_5678_dead_beef);
+fn configured_stack_pool_exhaustion_and_recovery() {
+    let storage = Box::leak(Box::new(PacketPoolStorage::<16>::new()));
+    let pool = Box::leak(Box::new(PacketPool::new(storage)));
+    let allocator = pool.allocator();
+    let mut stack = Stack::new(0x1234_5678_dead_beef, allocator);
     // The device copies out and drops (frees) whatever it is given.
     let iface = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
     stack
@@ -34,11 +36,11 @@ fn exhaustion() {
 
     // Take every buffer.
     let mut held = Vec::new();
-    while let Some(buf) = PacketBuf::try_new() {
+    while let Some(buf) = allocator.try_alloc() {
         held.push(buf);
     }
     assert!(!held.is_empty());
-    assert!(PacketBuf::try_new().is_none());
+    assert!(allocator.try_alloc().is_none());
 
     // A send now fails, and the socket is unharmed.
     assert_eq!(
@@ -50,7 +52,7 @@ fn exhaustion() {
     // Freeing one buffer is enough for a send. Taking it back starves sends again.
     drop(held.pop());
     stack.udp_socket(udp).send_slice(b"hello", dst).unwrap();
-    held.push(PacketBuf::try_new().unwrap());
+    held.push(allocator.try_alloc().unwrap());
     assert_eq!(
         stack.udp_socket(udp).send_slice(b"hello", dst),
         Err(SendError::NoBuffer)
@@ -60,7 +62,7 @@ fn exhaustion() {
     let count = held.len();
     drop(held);
     let mut again = Vec::new();
-    while let Some(buf) = PacketBuf::try_new() {
+    while let Some(buf) = allocator.try_alloc() {
         again.push(buf);
     }
     assert!(again.len() >= count);

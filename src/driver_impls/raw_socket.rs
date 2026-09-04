@@ -2,8 +2,8 @@ use std::io;
 use std::mem;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::driver::PacketBuf;
 use crate::driver::{Capabilities, Driver};
+use crate::driver::{PacketBuf, PacketBufAllocator};
 use crate::iface::Medium;
 use crate::wire::HardwareAddress;
 
@@ -55,6 +55,7 @@ pub struct RawSocketDriver {
     lower: libc::c_int,
     mtu: usize,
     hardware_addr: HardwareAddress,
+    packet_allocator: PacketBufAllocator,
 }
 
 impl AsRawFd for RawSocketDriver {
@@ -69,6 +70,7 @@ impl RawSocketDriver {
     /// `hardware_addr` is the address the interface reports to the stack, and picks the
     /// medium: an Ethernet address for an Ethernet interface, an IEEE 802.15.4 one for a
     /// `wpan` interface. It must match the address the host interface is configured with.
+    /// `packet_allocator` provides buffers for frames received from the host.
     ///
     /// This requires superuser privileges or a corresponding capability bit
     /// set on the executable.
@@ -78,7 +80,11 @@ impl RawSocketDriver {
     ///   interface does not exist.
     /// - `Unsupported` for [`HardwareAddress::Ip`], and for an IEEE 802.15.4
     ///   address that is not an extended address.
-    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<RawSocketDriver> {
+    pub fn new(
+        name: &str,
+        hardware_addr: HardwareAddress,
+        packet_allocator: PacketBufAllocator,
+    ) -> io::Result<RawSocketDriver> {
         let medium = hardware_addr.medium();
         if hardware_addr.to_driver().is_none() {
             return Err(io::Error::new(
@@ -117,6 +123,7 @@ impl RawSocketDriver {
             lower,
             mtu: 0,
             hardware_addr,
+            packet_allocator,
         };
         let mut ifreq = ifreq_for(name);
 
@@ -203,7 +210,7 @@ impl Driver for RawSocketDriver {
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {
-        let mut buf = PacketBuf::try_new()?;
+        let mut buf = self.packet_allocator.try_alloc()?;
         buf.set_len(buf.capacity());
         match self.recv(&mut buf[..]) {
             Ok(size) => {

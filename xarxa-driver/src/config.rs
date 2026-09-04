@@ -1,35 +1,6 @@
-//! Compile-time configuration.
-//!
-//! The sizes of the packet pool and of the buffers in it are set at compile
-//! time. They can be set in two ways:
-//!
-//! - With a cargo feature named `<name>-<value>`, lowercase and with dashes
-//!   instead of underscores. For example `packet-buf-count-32`. Only the values
-//!   listed in `Cargo.toml` can be set this way.
-//! - With an environment variable named `XARXA_<NAME>` at build time. For
-//!   example `XARXA_PACKET_BUF_COUNT=32 cargo build`. They can also be set in
-//!   the `[env]` section of `.cargo/config.toml`. Any value can be set this way.
-//!
-//! Environment variables win over cargo features. Enabling two cargo features
-//! for the same setting with different values fails the build.
-//!
-//! The `xarxa` crate forwards the features of the same name to this crate, and
-//! has its own knobs in `xarxa::config`.
-
-mod raw {
-    #![allow(unused)]
-    include!(concat!(env!("OUT_DIR"), "/config.rs"));
-}
-
-/// Number of buffers in the packet pool.
-///
-/// Every packet in flight takes one buffer: in a driver's receive ring, in a
-/// socket's queue, being reassembled, or parked waiting for a neighbor. When
-/// they are all in use, [`PacketBuf::try_new`](crate::PacketBuf::try_new) fails
-/// and packets are dropped.
-///
-/// Default: 16.
-pub const PACKET_BUF_COUNT: usize = raw::PACKET_BUF_COUNT;
+//! Packet buffer shape shared by every explicitly sized
+//! [`PacketPool`](crate::PacketPool). Pool capacity and memory placement are
+//! selected per pool rather than by global crate configuration.
 
 /// Alignment of the buffer in a [`PacketBuf`](crate::PacketBuf), in bytes.
 ///

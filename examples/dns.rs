@@ -20,6 +20,8 @@
 //! sudo iptables -I FORWARD -o tap0 -j ACCEPT
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -50,10 +52,11 @@ fn main() {
         })
         .unwrap_or(IpAddress::v4(8, 8, 8, 8));
 
-    let driver = TunTapDriver::new(name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = TunTapDriver::new(name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)

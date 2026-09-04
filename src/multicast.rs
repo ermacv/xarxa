@@ -273,15 +273,16 @@ impl IfaceState<'_> {
             match addr {
                 #[cfg(feature = "ipv4")]
                 IpAddress::Ipv4(addr) => {
-                    if let Some(pkt) = self.igmp_report_packet(IgmpVersion::Version2, addr) {
+                    if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, IgmpVersion::Version2, addr) {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
                 #[cfg(feature = "ipv6")]
                 IpAddress::Ipv6(addr) => {
-                    if let Some(pkt) =
-                        self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToInclude, addr)))
-                    {
+                    if let Some(pkt) = self.mldv2_report_packet(
+                        inner.packet_allocator,
+                        core::iter::once((MldRecordType::ChangeToInclude, addr)),
+                    ) {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
@@ -301,15 +302,16 @@ impl IfaceState<'_> {
             match addr {
                 #[cfg(feature = "ipv4")]
                 IpAddress::Ipv4(addr) => {
-                    if let Some(pkt) = self.igmp_leave_packet(addr) {
+                    if let Some(pkt) = self.igmp_leave_packet(inner.packet_allocator, addr) {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
                 #[cfg(feature = "ipv6")]
                 IpAddress::Ipv6(addr) => {
-                    if let Some(pkt) =
-                        self.mldv2_report_packet(core::iter::once((MldRecordType::ChangeToExclude, addr)))
-                    {
+                    if let Some(pkt) = self.mldv2_report_packet(
+                        inner.packet_allocator,
+                        core::iter::once((MldRecordType::ChangeToExclude, addr)),
+                    ) {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
@@ -325,7 +327,7 @@ impl IfaceState<'_> {
                 timeout,
                 group,
             } if inner.now >= timeout => {
-                if let Some(pkt) = self.igmp_report_packet(version, group) {
+                if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, version, group) {
                     // Send initial membership report
                     self.dispatch_ip(inner, pkt);
                 }
@@ -349,7 +351,7 @@ impl IfaceState<'_> {
 
                 match addr {
                     Some(addr) => {
-                        if let Some(pkt) = self.igmp_report_packet(version, addr) {
+                        if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, version, addr) {
                             // Send initial membership report
                             self.dispatch_ip(inner, pkt);
 
@@ -380,14 +382,14 @@ impl IfaceState<'_> {
                     #[allow(unreachable_patterns)]
                     _ => None,
                 });
-                if let Some(pkt) = self.mldv2_report_packet(records) {
+                if let Some(pkt) = self.mldv2_report_packet(inner.packet_allocator, records) {
                     self.dispatch_ip(inner, pkt);
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
             }
             MldReportState::ToSpecificQuery { group, timeout } if inner.now >= timeout => {
                 let record = (MldRecordType::ModeIsExclude, group);
-                if let Some(pkt) = self.mldv2_report_packet(core::iter::once(record)) {
+                if let Some(pkt) = self.mldv2_report_packet(inner.packet_allocator, core::iter::once(record)) {
                     self.dispatch_ip(inner, pkt);
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
@@ -498,9 +500,14 @@ impl IfaceState<'_> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn igmp_report_packet(&self, version: IgmpVersion, group_addr: Ipv4Address) -> Option<PacketBuf> {
+    fn igmp_report_packet(
+        &self,
+        allocator: crate::driver::PacketBufAllocator,
+        version: IgmpVersion,
+        group_addr: Ipv4Address,
+    ) -> Option<PacketBuf> {
         let iface_addr = self.ipv4_addr()?;
-        let mut pkt = PacketBuf::try_new()?;
+        let mut pkt = allocator.try_alloc()?;
         pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
@@ -527,9 +534,13 @@ impl IfaceState<'_> {
     }
 
     #[cfg(feature = "ipv4")]
-    fn igmp_leave_packet(&self, group_addr: Ipv4Address) -> Option<PacketBuf> {
+    fn igmp_leave_packet(
+        &self,
+        allocator: crate::driver::PacketBufAllocator,
+        group_addr: Ipv4Address,
+    ) -> Option<PacketBuf> {
         let iface_addr = self.ipv4_addr()?;
-        let mut pkt = PacketBuf::try_new()?;
+        let mut pkt = allocator.try_alloc()?;
         pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
@@ -603,6 +614,7 @@ impl IfaceState<'_> {
     /// Records past what fits in one packet are left out.
     fn mldv2_report_packet(
         &self,
+        allocator: crate::driver::PacketBufAllocator,
         records: impl Iterator<Item = (MldRecordType, Ipv6Address)> + Clone,
     ) -> Option<PacketBuf> {
         // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
@@ -615,7 +627,7 @@ impl IfaceState<'_> {
         let dst_addr = IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS;
 
         // MLD report: the report header (8 bytes) plus one record per group.
-        let mut pkt = PacketBuf::try_new()?;
+        let mut pkt = allocator.try_alloc()?;
         pkt.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
         let record_count = records.clone().count();
@@ -715,7 +727,7 @@ mod test {
     fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
         let driver = TestDevice::new(medium).with_checksum(checksum);
         let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef);
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(
             &mut stack,
             match medium {

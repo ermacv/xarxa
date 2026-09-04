@@ -19,15 +19,27 @@ use std::vec::Vec;
 
 use xarxa::Stack;
 use xarxa::driver::Capabilities;
-use xarxa::driver::PacketBuf;
 #[cfg(feature = "packetmeta-id")]
 use xarxa::driver::PacketMeta;
 use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
+use xarxa::driver::{PacketBuf, PacketBufAllocator, PacketPool, PacketPoolStorage};
 #[cfg(feature = "packetmeta-timestamp")]
 use xarxa::driver::{Timestamp, TxTimestamp};
 use xarxa::iface::IfaceHandle;
 use xarxa::iface::Medium;
 use xarxa::wire::HardwareAddress;
+
+/// Process-wide packet storage for tests. Individual tests still exercise
+/// explicit allocator plumbing; the large shared capacity only prevents the
+/// parallel test runner from introducing unrelated exhaustion.
+pub fn packet_allocator() -> PacketBufAllocator {
+    static ALLOCATOR: std::sync::OnceLock<PacketBufAllocator> = std::sync::OnceLock::new();
+    *ALLOCATOR.get_or_init(|| {
+        let storage = Box::leak(Box::new(PacketPoolStorage::<256>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        pool.allocator()
+    })
+}
 
 /// Frames waiting to be received, oldest first.
 pub type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
@@ -174,7 +186,7 @@ impl Driver for TestDevice {
 
     fn receive(&mut self) -> Option<PacketBuf> {
         let bytes = self.rx.borrow_mut().pop_front()?;
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = packet_allocator().try_alloc().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(&bytes);
         #[cfg(feature = "packetmeta-id")]

@@ -256,7 +256,7 @@ impl StackInner {
 
         let more_frags = (frag.packet_len - frag.sent_bytes) != payload_len;
 
-        let Some(mut tx_buffer) = PacketBuf::try_new() else {
+        let Some(mut tx_buffer) = self.alloc_packet() else {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };

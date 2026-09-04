@@ -12,7 +12,6 @@ use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
 use crate::storage::Vec;
 
 use super::{AddrOrigin, IfaceAddr, IfaceState};
-use crate::driver::PacketBuf;
 use crate::route::{Route as IfaceRoute, RouteOrigin};
 use crate::stack::StackInner;
 use crate::time::{Duration, Instant};
@@ -545,7 +544,7 @@ impl IfaceState<'_> {
 
         // Router solicit: RS header (8 bytes) plus the source link-layer address
         // option.
-        let Some(mut buf) = PacketBuf::try_new() else {
+        let Some(mut buf) = inner.alloc_packet() else {
             // The retry timer sends the next one.
             trace!("ndisc: no packet buffer for router solicit");
             return;

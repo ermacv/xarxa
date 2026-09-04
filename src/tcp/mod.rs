@@ -2350,6 +2350,15 @@ pub(crate) fn process_icmp_error(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Blocked;
 
+/// Why a TCP egress flush stopped without being device-blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FlushOutcome {
+    /// The socket has nothing else to emit now.
+    Drained,
+    /// The cooperative socket-egress quantum was consumed.
+    BudgetExhausted,
+}
+
 /// Drive the socket's egress until it has nothing more it wants to transmit right
 /// now: data and flag segments, ACKs, window updates, retransmissions, probes.
 /// Called from [`Stack::poll`](crate::Stack::poll), which is the only place TCP
@@ -2362,8 +2371,15 @@ pub(crate) struct Blocked;
 /// Returns [`Blocked`] if it stopped because the egress device has no room (or
 /// the pool is empty). The socket's state is untouched by the segment it could
 /// not send, so nothing is lost and no retransmission timer has to cover it.
-pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) -> Result<(), Blocked> {
+pub(crate) fn flush(
+    state: &mut TcpSocketState<'_>,
+    cx: &mut TxContext<'_, '_>,
+    remaining: &mut usize,
+) -> Result<FlushOutcome, Blocked> {
     loop {
+        if *remaining == 0 {
+            return Ok(FlushOutcome::BudgetExhausted);
+        }
         let mut emitted = false;
         state.dispatch(cx, |cx, (route, src_addr, dst_addr, hop_limit, repr)| {
             emitted = true;
@@ -2392,8 +2408,9 @@ pub(crate) fn flush(state: &mut TcpSocketState<'_>, cx: &mut TxContext<'_, '_>) 
             Ok(())
         })?;
         if !emitted {
-            return Ok(());
+            return Ok(FlushOutcome::Drained);
         }
+        *remaining -= 1;
     }
 }
 
@@ -11552,5 +11569,40 @@ mod stack_test {
         parse_tx(&mut frame, |tcp| {
             assert!(tcp.syn() && !tcp.ack());
         });
+    }
+
+    #[test]
+    fn test_bounded_poll_rotates_tcp_egress() {
+        let (mut stack, driver) = stack();
+        let first = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        let second = stack
+            .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
+            .unwrap();
+        stack
+            .tcp_socket(first)
+            .connect((REMOTE_ADDR, REMOTE_PORT), LOCAL_PORT)
+            .unwrap();
+        stack
+            .tcp_socket(second)
+            .connect((REMOTE_ADDR, REMOTE_PORT + 1), LOCAL_PORT + 1)
+            .unwrap();
+
+        let budget = crate::PollBudget::new(1, 1);
+        let first_outcome = stack.poll_bounded(Instant::ZERO, budget);
+        assert!(first_outcome.budget_exhausted());
+        assert_eq!(driver.tx.borrow().len(), 1);
+
+        // The first socket cannot consume the second quantum as well.
+        let second_outcome = stack.poll_bounded(Instant::ZERO, budget);
+        assert!(second_outcome.budget_exhausted());
+        assert_eq!(driver.tx.borrow().len(), 2);
+        let mut second_syn = driver.tx.borrow_mut().remove(1);
+        let header_len = Ipv4Packet::new_checked(&mut second_syn[..]).unwrap().header_len() as usize;
+        let tcp = TcpPacket::new_checked(&mut second_syn[header_len..]).unwrap();
+        assert_eq!(tcp.src_port(), LOCAL_PORT + 1);
+        assert_eq!(tcp.dst_port(), REMOTE_PORT + 1);
+        assert!(tcp.syn());
     }
 }

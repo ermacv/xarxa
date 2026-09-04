@@ -43,6 +43,65 @@ pub struct Stack<'d> {
     pub(crate) sockets: Sockets<'d>,
     #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
     pub(crate) fragments: FragmentsBuffer,
+    /// First interface considered for ingress by the next bounded poll.
+    poll_ingress_cursor: usize,
+    /// First TCP socket considered for egress by the next bounded poll.
+    #[cfg(feature = "tcp")]
+    poll_tcp_cursor: usize,
+}
+
+/// Maximum packet work a cooperative [`Stack::poll_bounded`] call may perform.
+///
+/// Ingress and socket egress have independent limits so a continuous receive
+/// stream cannot prevent TCP timers and acknowledgements from advancing, and a
+/// large TCP send cannot prevent received packets from being serviced. The
+/// limits apply to the whole stack, not independently to every interface or
+/// socket.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollBudget {
+    ingress_frames: usize,
+    socket_egress_frames: usize,
+}
+
+impl PollBudget {
+    /// Create a cooperative packet-work budget.
+    ///
+    /// Both limits must be non-zero. A limit is a fairness quantum, not a queue
+    /// capacity: reaching it asks the caller to poll again promptly.
+    pub const fn new(ingress_frames: usize, socket_egress_frames: usize) -> Self {
+        ::core::assert!(ingress_frames != 0, "the ingress poll budget must be non-zero");
+        ::core::assert!(
+            socket_egress_frames != 0,
+            "the socket-egress poll budget must be non-zero"
+        );
+        Self {
+            ingress_frames,
+            socket_egress_frames,
+        }
+    }
+}
+
+/// Result of one cooperative [`Stack::poll_bounded`] call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PollOutcome {
+    deadline: Instant,
+    budget_exhausted: bool,
+}
+
+impl PollOutcome {
+    /// The earliest protocol timer deadline.
+    pub const fn deadline(self) -> Instant {
+        self.deadline
+    }
+
+    /// Whether this call consumed a complete ingress or socket-egress quantum.
+    ///
+    /// This is deliberately conservative: the final frame may have drained the
+    /// queue exactly. The caller should schedule one prompt follow-up poll; that
+    /// poll will sleep normally if no work remains.
+    pub const fn budget_exhausted(self) -> bool {
+        self.budget_exhausted
+    }
 }
 
 /// The stack's socket storage, one slab per socket type.
@@ -408,6 +467,9 @@ impl<'d> Stack<'d> {
             },
             #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
             fragments: FragmentsBuffer::new(packet_allocator),
+            poll_ingress_cursor: 0,
+            #[cfg(feature = "tcp")]
+            poll_tcp_cursor: 0,
         }
     }
 
@@ -823,7 +885,30 @@ impl<'d> Stack<'d> {
     /// - If no timer is pending, [`Instant::MAX`] is returned. No need to call `poll` on a timer, only after
     ///   a packet is received or an operation is done on the Stack, a socket or an interface.
     pub fn poll(&mut self, timestamp: Instant) -> Instant {
+        self.poll_inner(timestamp, None).deadline
+    }
+
+    /// Cooperatively process the stack without monopolizing the caller.
+    ///
+    /// Unlike [`poll`](Self::poll), this stops receiving frames and emitting TCP
+    /// segments when the corresponding [`PollBudget`] quantum is consumed.
+    /// Round-robin cursors are retained across calls, so one permanently busy
+    /// interface or socket cannot starve the others.
+    ///
+    /// If [`PollOutcome::budget_exhausted`] is true, arrange another prompt poll.
+    /// Driver wakes remain level-state hints and are still required for work that
+    /// becomes ready after this call returns.
+    pub fn poll_bounded(&mut self, timestamp: Instant, budget: PollBudget) -> PollOutcome {
+        self.poll_inner(timestamp, Some(budget))
+    }
+
+    fn poll_inner(&mut self, timestamp: Instant, budget: Option<PollBudget>) -> PollOutcome {
         self.inner.now = timestamp;
+
+        let mut ingress_remaining = budget.map_or(usize::MAX, |budget| budget.ingress_frames);
+        #[cfg(feature = "tcp")]
+        let mut socket_egress_remaining = budget.map_or(usize::MAX, |budget| budget.socket_egress_frames);
+        let mut budget_exhausted = false;
 
         // Drop queued packets whose neighbor resolution timed out.
         #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -832,8 +917,22 @@ impl<'d> Stack<'d> {
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(timestamp);
 
-        let mut next = 0;
-        while let Some(index) = self.ifaces.next_occupied(next) {
+        // Walk the interfaces once, starting at the cursor retained by the last
+        // bounded poll. The small explicit wrap avoids allocating a temporary
+        // list and also works with the dynamically sized `alloc` slab.
+        let ingress_start = self.poll_ingress_cursor;
+        let mut next = ingress_start;
+        let mut wrapped = false;
+        loop {
+            let index = match self.ifaces.next_occupied(next) {
+                Some(index) if !wrapped || index < ingress_start => index,
+                _ if !wrapped && ingress_start != 0 => {
+                    wrapped = true;
+                    next = 0;
+                    continue;
+                }
+                _ => break,
+            };
             next = index + 1;
             let handle = IfaceHandle::new(index);
 
@@ -841,7 +940,9 @@ impl<'d> Stack<'d> {
             self.poll_neighbor_timers(handle);
 
             #[allow(unused_mut)]
-            while let Some(mut buf) = self.ifaces.get_mut(index).driver.receive() {
+            while ingress_remaining != 0
+                && let Some(mut buf) = self.ifaces.get_mut(index).driver.receive()
+            {
                 #[cfg(feature = "packet-log")]
                 {
                     trace!("received on iface {}", index);
@@ -849,6 +950,13 @@ impl<'d> Stack<'d> {
                     crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
                 }
                 self.process(handle, buf);
+                ingress_remaining -= 1;
+                if ingress_remaining == 0 && budget.is_some() {
+                    // Continue the outer walk for timers and control state, but
+                    // start the next ingress quantum at the following interface.
+                    self.poll_ingress_cursor = index + 1;
+                    budget_exhausted = true;
+                }
             }
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
@@ -912,14 +1020,36 @@ impl<'d> Stack<'d> {
                 inner: &mut self.inner,
                 ifaces: &mut self.ifaces,
             };
-            for (_, socket) in self.sockets.tcp.iter_mut() {
+            let tcp_start = self.poll_tcp_cursor;
+            let mut next = tcp_start;
+            let mut wrapped = false;
+            loop {
+                let index = match self.sockets.tcp.next_occupied(next) {
+                    Some(index) if !wrapped || index < tcp_start => index,
+                    _ if !wrapped && tcp_start != 0 => {
+                        wrapped = true;
+                        next = 0;
+                        continue;
+                    }
+                    _ => break,
+                };
+                next = index + 1;
+                let socket = self.sockets.tcp.get_mut(index);
                 // If egress failed due to device busy or full packet pool,
                 // avoid endless poll loops.
-                let socket_deadline = match crate::tcp::flush(socket, &mut cx) {
-                    Ok(()) => socket.poll_at(),
+                let socket_deadline = match crate::tcp::flush(socket, &mut cx, &mut socket_egress_remaining) {
+                    Ok(crate::tcp::FlushOutcome::Drained) => socket.poll_at(),
+                    Ok(crate::tcp::FlushOutcome::BudgetExhausted) => {
+                        self.poll_tcp_cursor = index + 1;
+                        budget_exhausted = budget.is_some();
+                        socket.poll_at()
+                    }
                     Err(crate::tcp::Blocked) => socket.poll_at_blocked(),
                 };
                 deadline = deadline.min(socket_deadline);
+                if socket_egress_remaining == 0 {
+                    break;
+                }
             }
         }
 
@@ -975,7 +1105,10 @@ impl<'d> Stack<'d> {
                 .fold(deadline, Instant::min);
         }
 
-        deadline
+        PollOutcome {
+            deadline,
+            budget_exhausted,
+        }
     }
 }
 
@@ -2815,6 +2948,45 @@ pub(crate) mod test {
         stack.poll(Instant::ZERO);
         tx.borrow_mut().clear();
         (stack, rx, tx, room)
+    }
+
+    #[test]
+    #[cfg(feature = "medium-ethernet")]
+    fn bounded_poll_limits_ingress_and_rotates_interfaces() {
+        let first = TestDevice::new(Medium::Ethernet);
+        let second = TestDevice::new(Medium::Ethernet);
+        let first_rx = first.rx.clone();
+        let second_rx = second.rx.clone();
+        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        first.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
+        second.install(
+            &mut stack,
+            HardwareAddress::Ethernet(EthernetAddress([0x02, 0, 0, 0, 0, 0x02])),
+        );
+
+        // Unknown-EtherType Ethernet frames are sufficient here: the assertion
+        // is about ownership transfer out of each device queue, not protocol
+        // processing after receipt.
+        for _ in 0..2 {
+            first_rx.borrow_mut().push_back(vec![0; ETHERNET_HEADER_LEN]);
+            second_rx.borrow_mut().push_back(vec![0; ETHERNET_HEADER_LEN]);
+        }
+
+        let budget = PollBudget::new(1, 1);
+        let first_outcome = stack.poll_bounded(Instant::ZERO, budget);
+        assert!(first_outcome.budget_exhausted());
+        assert_eq!(first_rx.borrow().len(), 1);
+        assert_eq!(second_rx.borrow().len(), 2);
+
+        // The retained cursor gives the second busy interface the next quantum.
+        let second_outcome = stack.poll_bounded(Instant::ZERO, budget);
+        assert!(second_outcome.budget_exhausted());
+        assert_eq!(first_rx.borrow().len(), 1);
+        assert_eq!(second_rx.borrow().len(), 1);
+
+        stack.poll_bounded(Instant::ZERO, budget);
+        assert_eq!(first_rx.borrow().len(), 0);
+        assert_eq!(second_rx.borrow().len(), 1);
     }
 
     /// OUR_HW 02:00:00:00:00:01 -> fe80::ff:fe00:1 (modified EUI-64 flips the U/L bit back).

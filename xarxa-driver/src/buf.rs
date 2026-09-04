@@ -633,8 +633,8 @@ mod tests {
     #[test]
     fn storage_is_dma_shaped() {
         let mut buf = new_buffer();
-        assert_eq!(buf.storage_mut().as_ptr() as usize % PACKET_BUF_ALIGN, 0);
-        assert_eq!(buf.storage_mut().len() % PACKET_BUF_ALIGN, 0);
+        assert!((buf.storage_mut().as_ptr() as usize).is_multiple_of(PACKET_BUF_ALIGN));
+        assert!(buf.storage_mut().len().is_multiple_of(PACKET_BUF_ALIGN));
         assert!(buf.storage_mut().len() >= PACKET_BUF_SIZE);
     }
 

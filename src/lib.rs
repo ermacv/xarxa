@@ -80,5 +80,5 @@ pub use xarxa_driver as driver;
 pub use icmp_error::IcmpError;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub use neighbor::{Neighbor, NeighborCache, NeighborState};
-pub use stack::Stack;
+pub use stack::{PollBudget, PollOutcome, Stack};
 pub use storage::Full;

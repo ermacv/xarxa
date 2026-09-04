@@ -10,9 +10,13 @@ use super::Empty;
 pub struct PacketMetadata<H> {
     size: usize,
     header: Option<H>,
+    #[cfg(feature = "tx-egress-metadata")]
     payload_sequence: u32,
+    #[cfg(feature = "tx-egress-metadata")]
     next_egress: Option<PacketHandle>,
+    #[cfg(feature = "tx-egress-metadata")]
     next_slot: Option<u16>,
+    #[cfg(feature = "tx-egress-metadata")]
     previous_slot: Option<u16>,
 }
 
@@ -21,12 +25,22 @@ impl<H> PacketMetadata<H> {
     pub const EMPTY: PacketMetadata<H> = PacketMetadata {
         size: 0,
         header: None,
+        #[cfg(feature = "tx-egress-metadata")]
         payload_sequence: 0,
+        #[cfg(feature = "tx-egress-metadata")]
         next_egress: None,
+        #[cfg(feature = "tx-egress-metadata")]
         next_slot: None,
+        #[cfg(feature = "tx-egress-metadata")]
         previous_slot: None,
     };
 
+    #[cfg(not(feature = "tx-egress-metadata"))]
+    fn padding(size: usize) -> PacketMetadata<H> {
+        PacketMetadata { size, header: None }
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn padding(size: usize, payload_sequence: u32) -> PacketMetadata<H> {
         PacketMetadata {
             size: size,
@@ -38,6 +52,15 @@ impl<H> PacketMetadata<H> {
         }
     }
 
+    #[cfg(not(feature = "tx-egress-metadata"))]
+    fn packet(size: usize, header: H) -> PacketMetadata<H> {
+        PacketMetadata {
+            size,
+            header: Some(header),
+        }
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn packet(size: usize, header: H, payload_sequence: u32) -> PacketMetadata<H> {
         PacketMetadata {
             size: size,
@@ -59,10 +82,15 @@ impl<H> PacketMetadata<H> {
 pub struct PacketBuffer<'a, H: 'a> {
     metadata_ring: RingBuffer<'a, PacketMetadata<H>>,
     payload_ring: RingBuffer<'a, u8>,
+    #[cfg(feature = "tx-egress-metadata")]
     storage: PacketStorage,
+    #[cfg(feature = "tx-egress-metadata")]
     metadata_base_sequence: u32,
+    #[cfg(feature = "tx-egress-metadata")]
     next_sequence: u32,
+    #[cfg(feature = "tx-egress-metadata")]
     next_payload_sequence: u32,
+    #[cfg(feature = "tx-egress-metadata")]
     payload_base_sequence: u32,
 }
 
@@ -72,6 +100,7 @@ pub struct PacketBuffer<'a, H: 'a> {
 /// tail bytes in short packets for O(1), out-of-order reclamation: a stalled
 /// destination cannot pin payload or metadata capacity owned by another key.
 #[derive(Debug)]
+#[cfg(feature = "tx-egress-metadata")]
 enum PacketStorage {
     Ring,
     IndexedSlots {
@@ -89,11 +118,13 @@ enum PacketStorage {
 /// packet arena. Handles survive out-of-order removal of older packets; they
 /// never expose an address and are invalid after their packet is reclaimed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(feature = "tx-egress-metadata")]
 pub(crate) struct PacketHandle(u32);
 
 /// Ephemeral location of one packet selected while the buffer is exclusively
 /// borrowed. It cannot outlive or mutate the packet ring on its own.
 #[derive(Debug, Clone, Copy)]
+#[cfg(feature = "tx-egress-metadata")]
 pub(crate) struct PacketSelection {
     metadata_offset: usize,
     payload_offset: usize,
@@ -104,6 +135,7 @@ pub(crate) struct PacketSelection {
 /// offsets avoids walking the payload metadata prefix again for every packet
 /// in a burst.
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg(feature = "tx-egress-metadata")]
 pub(crate) struct PacketCursor {
     metadata_offset: usize,
     payload_offset: usize,
@@ -122,10 +154,15 @@ impl<'a, H> PacketBuffer<'a, H> {
         PacketBuffer {
             metadata_ring: RingBuffer::new(metadata_storage),
             payload_ring: RingBuffer::new(payload_storage),
+            #[cfg(feature = "tx-egress-metadata")]
             storage: PacketStorage::Ring,
+            #[cfg(feature = "tx-egress-metadata")]
             metadata_base_sequence: 0,
+            #[cfg(feature = "tx-egress-metadata")]
             next_sequence: 0,
+            #[cfg(feature = "tx-egress-metadata")]
             next_payload_sequence: 0,
+            #[cfg(feature = "tx-egress-metadata")]
             payload_base_sequence: 0,
         }
     }
@@ -137,6 +174,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// FIFO reclaim dependency of [`Self::new`] without allocating or copying
     /// packet payloads. `payload_storage.len() / metadata_storage.len()` is the
     /// maximum packet size; any remainder stays unused.
+    #[cfg(feature = "tx-egress-metadata")]
     pub fn new_indexed_slots<MS, PS>(
         metadata_storage: MS,
         payload_storage: PS,
@@ -184,28 +222,33 @@ impl<'a, H> PacketBuffer<'a, H> {
         }
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn indexed_slot_from_handle(handle: PacketHandle) -> usize {
         usize::from((handle.0 & u32::from(u16::MAX)) as u16)
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn indexed_metadata(&self, index: usize) -> &PacketMetadata<H> {
         self.metadata_ring
             .storage(index)
             .expect("indexed packet metadata remains addressable")
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn indexed_metadata_mut(&mut self, index: usize) -> &mut PacketMetadata<H> {
         self.metadata_ring
             .storage_mut(index)
             .expect("indexed packet metadata remains addressable")
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn indexed_live_slot(&self, handle: PacketHandle) -> Option<usize> {
         let index = Self::indexed_slot_from_handle(handle);
         let metadata = self.metadata_ring.storage(index)?;
         (metadata.header.is_some() && metadata.payload_sequence == handle.0).then_some(index)
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn enqueue_indexed_slot(
         &mut self,
         size: usize,
@@ -288,6 +331,7 @@ impl<'a, H> PacketBuffer<'a, H> {
         Ok((handle, &mut payload[..size]))
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn release_indexed_slot(&mut self, index: usize) {
         let PacketBuffer {
             metadata_ring,
@@ -340,6 +384,11 @@ impl<'a, H> PacketBuffer<'a, H> {
 
     /// Query whether the buffer is empty.
     pub fn is_empty(&self) -> bool {
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        {
+            self.metadata_ring.is_empty()
+        }
+        #[cfg(feature = "tx-egress-metadata")]
         match self.storage {
             PacketStorage::Ring => self.metadata_ring.is_empty(),
             PacketStorage::IndexedSlots { live, .. } => live == 0,
@@ -348,6 +397,11 @@ impl<'a, H> PacketBuffer<'a, H> {
 
     /// Query whether the buffer is full.
     pub fn is_full(&self) -> bool {
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        {
+            self.metadata_ring.is_full()
+        }
+        #[cfg(feature = "tx-egress-metadata")]
         match self.storage {
             PacketStorage::Ring => self.metadata_ring.is_full(),
             PacketStorage::IndexedSlots { free_head, .. } => free_head.is_none(),
@@ -361,13 +415,45 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// return a reference to its payload, or return `Err(Full)`
     /// if the buffer is full.
     pub fn enqueue(&mut self, size: usize, header: H) -> Result<&mut [u8], Full> {
-        self.enqueue_tracked(size, header)
-            .map(|(_, payload)| payload)
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            self
+                .enqueue_tracked(size, header)
+                .map(|(_, payload)| payload)
+        }
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        {
+            if self.payload_ring.capacity() < size || self.metadata_ring.is_full() {
+                return Err(Full);
+            }
+
+            if self.payload_ring.is_empty() {
+                self.payload_ring.clear();
+            }
+
+            let window = self.payload_ring.window();
+            let contig_window = self.payload_ring.contiguous_window();
+            if window < size {
+                return Err(Full);
+            } else if contig_window < size {
+                if window - contig_window < size {
+                    return Err(Full);
+                }
+                *self.metadata_ring.enqueue_one()? = PacketMetadata::padding(contig_window);
+                let _buf_enqueued = self.payload_ring.enqueue_many(contig_window);
+            }
+
+            *self.metadata_ring.enqueue_one()? = PacketMetadata::packet(size, header);
+            let payload_buf = self.payload_ring.enqueue_many(size);
+            debug_assert_eq!(payload_buf.len(), size);
+            Ok(payload_buf)
+        }
     }
 
     /// Enqueue a packet and return its stable arena handle together with the
     /// payload storage. The handle is used only by bounded egress indexes; it
     /// does not transfer or expose storage ownership.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn enqueue_tracked(
         &mut self,
         size: usize,
@@ -376,6 +462,7 @@ impl<'a, H> PacketBuffer<'a, H> {
         self.enqueue_tracked_linked(size, header, None)
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn enqueue_tracked_linked(
         &mut self,
         size: usize,
@@ -464,10 +551,40 @@ impl<'a, H> PacketBuffer<'a, H> {
     where
         F: for<'b> FnOnce(&'b mut [u8]) -> usize,
     {
-        self.enqueue_with_infallible_tracked(max_size, header, f)
-            .map(|(size, _)| size)
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            self
+                .enqueue_with_infallible_tracked(max_size, header, f)
+                .map(|(size, _)| size)
+        }
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        {
+            if self.payload_ring.capacity() < max_size || self.metadata_ring.is_full() {
+                return Err(Full);
+            }
+
+            let window = self.payload_ring.window();
+            let contig_window = self.payload_ring.contiguous_window();
+            if window < max_size {
+                return Err(Full);
+            } else if contig_window < max_size {
+                if window - contig_window < max_size {
+                    return Err(Full);
+                }
+                *self.metadata_ring.enqueue_one()? = PacketMetadata::padding(contig_window);
+                let _buf_enqueued = self.payload_ring.enqueue_many(contig_window);
+            }
+
+            let metadata_slot = self.metadata_ring.enqueue_one()?;
+            let (size, _) = self
+                .payload_ring
+                .enqueue_many_with(|data| (f(&mut data[..max_size]), ()));
+            *metadata_slot = PacketMetadata::packet(size, header);
+            Ok(size)
+        }
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn enqueue_with_infallible_tracked<F>(
         &mut self,
         max_size: usize,
@@ -480,6 +597,7 @@ impl<'a, H> PacketBuffer<'a, H> {
         self.enqueue_with_infallible_tracked_linked(max_size, header, None, f)
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn enqueue_with_infallible_tracked_linked<F>(
         &mut self,
         max_size: usize,
@@ -572,6 +690,19 @@ impl<'a, H> PacketBuffer<'a, H> {
         Ok((size, handle))
     }
 
+    #[cfg(not(feature = "tx-egress-metadata"))]
+    fn dequeue_padding(&mut self) {
+        let _ = self.metadata_ring.dequeue_one_with(|metadata| {
+            if metadata.is_padding() {
+                let _buf_dequeued = self.payload_ring.dequeue_many(metadata.size);
+                Ok(())
+            } else {
+                Err(())
+            }
+        });
+    }
+
+    #[cfg(feature = "tx-egress-metadata")]
     fn dequeue_padding(&mut self) -> PacketCursor {
         if matches!(self.storage, PacketStorage::IndexedSlots { .. }) {
             return PacketCursor::default();
@@ -605,6 +736,7 @@ impl<'a, H> PacketBuffer<'a, H> {
         reclaimed
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn handle_offset(&self, handle: PacketHandle) -> Option<usize> {
         if matches!(self.storage, PacketStorage::IndexedSlots { .. }) {
             return self.indexed_live_slot(handle);
@@ -613,7 +745,54 @@ impl<'a, H> PacketBuffer<'a, H> {
         (offset < self.metadata_ring.len()).then_some(offset)
     }
 
+    /// Inspect one live packet and its current intrusive egress successor.
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn egress_entry(&self, handle: PacketHandle) -> (H, Option<PacketHandle>)
+    where
+        H: Copy,
+    {
+        let offset = self
+            .handle_offset(handle)
+            .expect("an egress packet handle remains allocated");
+        let metadata = if matches!(self.storage, PacketStorage::IndexedSlots { .. }) {
+            self.metadata_ring
+                .storage(offset)
+                .expect("an indexed egress packet remains addressable")
+        } else {
+            self.metadata_ring
+                .get_allocated(offset, 1)
+                .first()
+                .expect("an allocated egress packet remains addressable")
+        };
+        (
+            metadata
+                .header
+                .expect("an egress packet is not a tombstone"),
+            metadata.next_egress,
+        )
+    }
+
+    /// Detach one live packet from its current intrusive egress successor.
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn take_egress_next(&mut self, handle: PacketHandle) -> Option<PacketHandle> {
+        let offset = self
+            .handle_offset(handle)
+            .expect("an egress packet handle remains allocated");
+        let metadata = if matches!(self.storage, PacketStorage::IndexedSlots { .. }) {
+            self.metadata_ring
+                .storage_mut(offset)
+                .expect("an indexed egress packet remains addressable")
+        } else {
+            self.metadata_ring
+                .get_allocated_mut(offset, 1)
+                .first_mut()
+                .expect("an allocated egress packet remains addressable")
+        };
+        metadata.next_egress.take()
+    }
+
     /// Link two live packets in one intrusive egress FIFO.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn link_egress(&mut self, tail: PacketHandle, next: PacketHandle) {
         let offset = self
             .handle_offset(tail)
@@ -639,8 +818,9 @@ impl<'a, H> PacketBuffer<'a, H> {
     }
 
     /// Remove every intrusive egress link without changing packet ownership or
-    /// FIFO order. This is used only when a device changes queue policy or a
-    /// generic socket exceeds the bounded destination index.
+    /// FIFO order. This is used when a device changes queue policy or advances
+    /// the classification epoch.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn clear_egress_links(&mut self) {
         if let PacketStorage::IndexedSlots { fifo_head, .. } = self.storage {
             let mut current = fifo_head;
@@ -663,46 +843,10 @@ impl<'a, H> PacketBuffer<'a, H> {
         }
     }
 
-    /// Visit every live packet once in global FIFO order.
-    pub(crate) fn for_each_packet<F>(&self, mut visit: F)
-    where
-        H: Copy,
-        F: FnMut(PacketHandle, H),
-    {
-        if let PacketStorage::IndexedSlots { fifo_head, .. } = self.storage {
-            let mut current = fifo_head;
-            while let Some(index) = current {
-                let metadata = self
-                    .metadata_ring
-                    .storage(usize::from(index))
-                    .expect("indexed FIFO packet remains addressable");
-                let header = metadata
-                    .header
-                    .expect("indexed FIFO contains only live packets");
-                visit(PacketHandle(metadata.payload_sequence), header);
-                current = metadata.next_slot;
-            }
-            return;
-        }
-
-        for offset in 0..self.metadata_ring.len() {
-            let metadata = self
-                .metadata_ring
-                .get_allocated(offset, 1)
-                .first()
-                .expect("allocated packet metadata remains addressable");
-            if let Some(header) = metadata.header {
-                visit(
-                    PacketHandle(self.metadata_base_sequence.wrapping_add(offset as u32)),
-                    header,
-                );
-            }
-        }
-    }
-
     /// Rebuild intrusive egress links in one FIFO traversal. `predecessor`
     /// updates the external queue index and returns the prior tail for the
     /// current packet's key.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn rebuild_egress_links<F>(&mut self, mut predecessor: F)
     where
         H: Copy,
@@ -751,6 +895,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     }
 
     /// Complete a packet selected through an intrusive egress handle.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn dequeue_handle_with<R, E, F>(
         &mut self,
         handle: PacketHandle,
@@ -849,6 +994,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// Tombstones and ring-wrap padding are skipped. This is intended for a
     /// bounded queue selector which chooses a key before allocating final
     /// device backing.
+    #[cfg(feature = "tx-egress-metadata")]
     pub fn first_header_matching<P>(&self, mut predicate: P) -> Option<H>
     where
         H: Copy,
@@ -860,6 +1006,7 @@ impl<'a, H> PacketBuffer<'a, H> {
 
     /// Select the first matching packet at or after `cursor` and
     /// return both its copied header and an ephemeral removal token.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn first_header_matching_from<P>(
         &self,
         cursor: PacketCursor,
@@ -924,6 +1071,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// The returned cursor points at the first metadata and payload entries
     /// which followed the selected packet after reclaiming any newly
     /// contiguous tombstones.
+    #[cfg(feature = "tx-egress-metadata")]
     pub(crate) fn dequeue_selection_with<R, E, F>(
         &mut self,
         selection: PacketSelection,
@@ -1020,6 +1168,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// order. An out-of-order packet is tombstoned and its storage is reclaimed
     /// once every older packet has completed. If `f` fails, neither metadata nor
     /// payload ownership changes.
+    #[cfg(feature = "tx-egress-metadata")]
     pub fn dequeue_matching_with<R, E, P, F>(
         &mut self,
         mut predicate: P,
@@ -1043,6 +1192,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     where
         F: for<'c> FnOnce(&mut H, &'c mut [u8]) -> Result<R, E>,
     {
+        #[cfg(feature = "tx-egress-metadata")]
         if let PacketStorage::IndexedSlots {
             fifo_head,
             slot_size,
@@ -1078,24 +1228,42 @@ impl<'a, H> PacketBuffer<'a, H> {
         }
         self.dequeue_padding();
 
-        let payload_base_sequence = &mut self.payload_base_sequence;
-        let metadata_base_sequence = &mut self.metadata_base_sequence;
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            let payload_base_sequence = &mut self.payload_base_sequence;
+            let metadata_base_sequence = &mut self.metadata_base_sequence;
+            self.metadata_ring.dequeue_one_with(|metadata| {
+                self.payload_ring
+                    .dequeue_many_with(|payload_buf| {
+                        debug_assert!(payload_buf.len() >= metadata.size);
+
+                        match f(
+                            metadata.header.as_mut().unwrap(),
+                            &mut payload_buf[..metadata.size],
+                        ) {
+                            Ok(val) => {
+                                *payload_base_sequence =
+                                    payload_base_sequence.wrapping_add(metadata.size as u32);
+                                *metadata_base_sequence = metadata_base_sequence.wrapping_add(1);
+                                (metadata.size, Ok(val))
+                            }
+                            Err(err) => (0, Err(err)),
+                        }
+                    })
+                    .1
+            })
+        }
+        #[cfg(not(feature = "tx-egress-metadata"))]
         self.metadata_ring.dequeue_one_with(|metadata| {
             self.payload_ring
                 .dequeue_many_with(|payload_buf| {
                     debug_assert!(payload_buf.len() >= metadata.size);
-
                     match f(
                         metadata.header.as_mut().unwrap(),
                         &mut payload_buf[..metadata.size],
                     ) {
-                        Ok(val) => {
-                            *payload_base_sequence =
-                                payload_base_sequence.wrapping_add(metadata.size as u32);
-                            *metadata_base_sequence = metadata_base_sequence.wrapping_add(1);
-                            (metadata.size, Ok(val))
-                        }
-                        Err(err) => (0, Err(err)),
+                        Ok(value) => (metadata.size, Ok(value)),
+                        Err(error) => (0, Err(error)),
                     }
                 })
                 .1
@@ -1105,6 +1273,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// Dequeue a single packet from the buffer, and return a reference to its payload
     /// as well as its header, or return `Err(Error::Exhausted)` if the buffer is empty.
     pub fn dequeue(&mut self) -> Result<(H, &mut [u8]), Empty> {
+        #[cfg(feature = "tx-egress-metadata")]
         if let PacketStorage::IndexedSlots {
             fifo_head,
             slot_size,
@@ -1134,8 +1303,11 @@ impl<'a, H> PacketBuffer<'a, H> {
         let meta = self.metadata_ring.dequeue_one()?;
 
         let payload_buf = self.payload_ring.dequeue_many(meta.size);
-        self.payload_base_sequence = self.payload_base_sequence.wrapping_add(meta.size as u32);
-        self.metadata_base_sequence = self.metadata_base_sequence.wrapping_add(1);
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            self.payload_base_sequence = self.payload_base_sequence.wrapping_add(meta.size as u32);
+            self.metadata_base_sequence = self.metadata_base_sequence.wrapping_add(1);
+        }
         debug_assert!(payload_buf.len() == meta.size);
         Ok((meta.header.take().unwrap(), payload_buf))
     }
@@ -1145,6 +1317,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     ///
     /// This function otherwise behaves identically to [dequeue](#method.dequeue).
     pub fn peek(&mut self) -> Result<(&H, &[u8]), Empty> {
+        #[cfg(feature = "tx-egress-metadata")]
         if let PacketStorage::IndexedSlots {
             fifo_head,
             slot_size,
@@ -1190,6 +1363,11 @@ impl<'a, H> PacketBuffer<'a, H> {
 
     /// Return the maximum number of bytes in the payload ring buffer.
     pub fn payload_capacity(&self) -> usize {
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        {
+            self.payload_ring.capacity()
+        }
+        #[cfg(feature = "tx-egress-metadata")]
         match self.storage {
             PacketStorage::Ring => self.payload_ring.capacity(),
             PacketStorage::IndexedSlots { slot_size, .. } => {
@@ -1200,6 +1378,11 @@ impl<'a, H> PacketBuffer<'a, H> {
 
     /// Return the current number of bytes in the payload ring buffer.
     pub fn payload_bytes_count(&self) -> usize {
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        {
+            self.payload_ring.len()
+        }
+        #[cfg(feature = "tx-egress-metadata")]
         match self.storage {
             PacketStorage::Ring => self.payload_ring.len(),
             PacketStorage::IndexedSlots { payload_bytes, .. } => payload_bytes,
@@ -1209,6 +1392,7 @@ impl<'a, H> PacketBuffer<'a, H> {
     /// Reset the packet buffer and clear any staged.
     #[allow(unused)]
     pub(crate) fn reset(&mut self) {
+        #[cfg(feature = "tx-egress-metadata")]
         if matches!(self.storage, PacketStorage::IndexedSlots { .. }) {
             let capacity = self.metadata_ring.capacity();
             for index in 0..capacity {
@@ -1240,8 +1424,11 @@ impl<'a, H> PacketBuffer<'a, H> {
         }
         self.payload_ring.clear();
         self.metadata_ring.clear();
-        self.metadata_base_sequence = self.next_sequence;
-        self.payload_base_sequence = self.next_payload_sequence;
+        #[cfg(feature = "tx-egress-metadata")]
+        {
+            self.metadata_base_sequence = self.next_sequence;
+            self.payload_base_sequence = self.next_payload_sequence;
+        }
     }
 }
 
@@ -1326,6 +1513,7 @@ mod test {
         assert_eq!(buffer.metadata_ring.len(), 0);
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_dequeue_matching_preserves_each_key_fifo_and_reclaims_tombstones() {
         let mut buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 8], vec![0u8; 32]);
@@ -1363,6 +1551,7 @@ mod test {
         assert_eq!(buffer.payload_bytes_count(), 0);
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_failed_matching_dequeue_retains_the_exact_packet() {
         let mut buffer = PacketBuffer::new(vec![PacketMetadata::EMPTY; 4], vec![0u8; 16]);
@@ -1377,6 +1566,7 @@ mod test {
         assert_eq!(payload, b"ok");
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn indexed_slots_reclaim_out_of_order_payload_and_metadata_immediately() {
         let mut buffer =
@@ -1422,6 +1612,7 @@ mod test {
         assert_eq!(buffer.payload_bytes_count(), 0);
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn indexed_slots_failed_handle_consume_retains_exact_owner() {
         let mut buffer =

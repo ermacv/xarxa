@@ -157,6 +157,7 @@ pub mod config {
     pub const IFACE_MAX_PREFIX_COUNT: usize = 1;
     pub const IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT: usize = 4;
     pub const IFACE_NEIGHBOR_CACHE_COUNT: usize = 3;
+    pub const IFACE_EGRESS_KEY_COUNT: usize = 16;
     pub const REASSEMBLY_BUFFER_COUNT: usize = 4;
     pub const REASSEMBLY_BUFFER_SIZE: usize = 1500;
     pub const RPL_RELATIONS_BUFFER_COUNT: usize = 16;

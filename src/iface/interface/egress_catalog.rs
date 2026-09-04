@@ -28,6 +28,7 @@ pub(super) enum EgressDemandCatalogError {
     Full,
     ActivationSerialExhausted,
     EpochNotAdvanced,
+    InsufficientCapacity,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +109,9 @@ impl<const CAPACITY: usize> EgressDemandCatalog<CAPACITY> {
         &mut self,
         schedule: EgressSchedule,
     ) -> Result<Option<EgressDemandUpdate>, EgressDemandCatalogError> {
+        if usize::from(schedule.max_active_keys().get()) > CAPACITY {
+            return Err(EgressDemandCatalogError::InsufficientCapacity);
+        }
         if self.schedule == Some(schedule) {
             return Ok(None);
         }
@@ -278,10 +282,11 @@ mod tests {
 
     use super::*;
 
-    fn schedule(max_packets: u8, epoch: u32) -> EgressSchedule {
+    fn schedule(max_packets: u8, max_active_keys: u16, epoch: u32) -> EgressSchedule {
         EgressSchedule::new(
             NonZeroU8::new(max_packets).unwrap(),
             NonZeroU8::new(1).unwrap(),
+            NonZeroU16::new(max_active_keys).unwrap(),
             epoch,
             crate::phy::EgressGrantMode::StackSelected,
         )
@@ -319,6 +324,22 @@ mod tests {
     }
 
     #[test]
+    fn schedule_rejects_more_device_keys_than_compiled_catalog_capacity() {
+        let mut catalog = EgressDemandCatalog::<4>::new();
+        let schedule = EgressSchedule::new(
+            NonZeroU8::new(32).unwrap(),
+            NonZeroU8::MIN,
+            NonZeroU16::new(5).unwrap(),
+            7,
+            crate::phy::EgressGrantMode::Authoritative,
+        );
+        assert_eq!(
+            catalog.configure(schedule),
+            Err(EgressDemandCatalogError::InsufficientCapacity)
+        );
+    }
+
+    #[test]
     fn softap_catalog_does_not_scale_with_provider_count() {
         assert!(
             core::mem::size_of::<EgressDemandCatalog<16>>() <= 1024,
@@ -329,7 +350,7 @@ mod tests {
     #[test]
     fn sparse_activation_is_immediate_and_counts_are_coalesced() {
         let mut catalog = EgressDemandCatalog::<4>::new();
-        catalog.configure(schedule(32, 7)).unwrap();
+        catalog.configure(schedule(32, 4, 7)).unwrap();
         let mut handle = None;
         let mut updates = std::vec::Vec::new();
 
@@ -357,7 +378,7 @@ mod tests {
     #[test]
     fn multiple_providers_share_one_aggregate_observation() {
         let mut catalog = EgressDemandCatalog::<4>::new();
-        catalog.configure(schedule(8, 3)).unwrap();
+        catalog.configure(schedule(8, 4, 3)).unwrap();
         let mut a = None;
         let mut b = None;
         let mut updates = std::vec::Vec::new();
@@ -389,7 +410,7 @@ mod tests {
     #[test]
     fn high_low_hysteresis_avoids_packet_frequency_publication() {
         let mut catalog = EgressDemandCatalog::<4>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
+        catalog.configure(schedule(32, 4, 1)).unwrap();
         let mut handle = None;
         let mut updates = std::vec::Vec::new();
 
@@ -407,7 +428,7 @@ mod tests {
     #[test]
     fn stale_slot_handle_rebinds_to_a_later_lifetime() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
+        catalog.configure(schedule(32, 1, 1)).unwrap();
         let mut stale = None;
         catalog.begin_observation();
         catalog
@@ -437,7 +458,7 @@ mod tests {
     #[test]
     fn epoch_reset_invalidates_cached_handles() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(32, 11)).unwrap();
+        catalog.configure(schedule(32, 1, 11)).unwrap();
         let mut handle = None;
         catalog.begin_observation();
         catalog
@@ -447,7 +468,7 @@ mod tests {
         let old = handle.unwrap();
 
         assert_eq!(
-            catalog.configure(schedule(32, 12)).unwrap(),
+            catalog.configure(schedule(32, 1, 12)).unwrap(),
             Some(EgressDemandUpdate::Reset { schedule_epoch: 12 })
         );
         catalog.begin_observation();
@@ -461,9 +482,9 @@ mod tests {
     #[test]
     fn schedule_geometry_change_requires_an_advanced_epoch() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(32, 5)).unwrap();
+        catalog.configure(schedule(32, 1, 5)).unwrap();
         assert_eq!(
-            catalog.configure(schedule(16, 5)),
+            catalog.configure(schedule(16, 1, 5)),
             Err(EgressDemandCatalogError::EpochNotAdvanced)
         );
     }
@@ -471,7 +492,7 @@ mod tests {
     #[test]
     fn full_distinct_key_catalog_preserves_existing_demand() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
+        catalog.configure(schedule(32, 1, 1)).unwrap();
         let mut a = None;
         let mut b = None;
         catalog.begin_observation();
@@ -489,7 +510,7 @@ mod tests {
     #[test]
     fn one_unit_horizon_stays_ready_for_every_nonempty_level() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(1, 1)).unwrap();
+        catalog.configure(schedule(1, 1, 1)).unwrap();
         let mut handle = None;
         let mut updates = std::vec::Vec::new();
         for ready in [1, 2, 1] {
@@ -506,7 +527,7 @@ mod tests {
     #[test]
     fn aggregate_publication_saturates_without_corrupting_reclamation() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(32, 1)).unwrap();
+        catalog.configure(schedule(32, 1, 1)).unwrap();
         let mut a = None;
         let mut b = None;
         let mut updates = std::vec::Vec::new();
@@ -534,7 +555,7 @@ mod tests {
     #[test]
     fn rekey_publishes_terminal_then_new_lifetime() {
         let mut catalog = EgressDemandCatalog::<2>::new();
-        catalog.configure(schedule(32, 9)).unwrap();
+        catalog.configure(schedule(32, 2, 9)).unwrap();
         let mut handle = None;
         let mut updates = std::vec::Vec::new();
         catalog.begin_observation();
@@ -563,7 +584,7 @@ mod tests {
     #[test]
     fn disable_publishes_terminal_lifetime_once() {
         let mut catalog = EgressDemandCatalog::<1>::new();
-        catalog.configure(schedule(32, 3)).unwrap();
+        catalog.configure(schedule(32, 1, 3)).unwrap();
         let mut handle = None;
         catalog.begin_observation();
         catalog

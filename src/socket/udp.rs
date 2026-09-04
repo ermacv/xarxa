@@ -6,6 +6,8 @@ use core::task::Waker;
 
 #[cfg(feature = "tx-egress-metadata")]
 use super::{KeyedDispatchError, KeyedEmitError};
+#[cfg(feature = "tx-egress-metadata")]
+use crate::config::IFACE_EGRESS_KEY_COUNT;
 use crate::iface::Context;
 #[cfg(feature = "tx-egress-metadata")]
 use crate::iface::EgressDemandHandle;
@@ -15,7 +17,9 @@ use crate::phy::{Device, EgressKey};
 use crate::socket::PollAt;
 #[cfg(feature = "async")]
 use crate::socket::WakerRegistration;
-use crate::storage::{Empty, PacketHandle};
+use crate::storage::Empty;
+#[cfg(feature = "tx-egress-metadata")]
+use crate::storage::PacketHandle;
 use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint, IpProtocol, IpRepr, UdpRepr};
 
 /// Metadata for a sent or received UDP packet.
@@ -121,29 +125,20 @@ impl core::error::Error for RecvError {}
 ///
 /// A UDP socket is bound to a specific endpoint, and owns transmit and receive
 /// packet buffers.
-// One key for every supported S31 SoftAP peer plus one group/broadcast key.
-// This bounds hot scheduler metadata; packet capacity remains independently
-// configured by the socket's PSRAM-backed packet arena.
-const EGRESS_QUEUE_CAPACITY: usize = 16;
-
 #[derive(Debug, Clone, Copy)]
-struct EgressQueue {
-    destination: IpAddress,
+#[cfg(feature = "tx-egress-metadata")]
+struct PacketQueue {
     head: PacketHandle,
     tail: PacketHandle,
     ready_units: usize,
 }
 
-/// Queue identity used before final device backing is requested.
-///
-/// Resolved routes are canonicalized by the device because a link destination
-/// is not necessarily a physical peer. The IP fallback preserves progress for
-/// packets which still need neighbour discovery.
 #[cfg(feature = "tx-egress-metadata")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DeviceEgressQueueKey {
-    Classified(EgressKey),
-    Unresolved(IpAddress),
+#[derive(Debug, Clone, Copy)]
+struct EgressQueue {
+    key: EgressKey,
+    packets: PacketQueue,
+    demand_handle: Option<EgressDemandHandle>,
 }
 
 #[derive(Debug)]
@@ -153,17 +148,17 @@ pub struct Socket<'a> {
     tx_buffer: PacketBuffer<'a>,
     /// The time-to-live (IPv4) or hop limit (IPv6) value used in outgoing packets.
     hop_limit: Option<u8>,
-    tx_egress_index_enabled: bool,
-    tx_egress_index_blocked: bool,
-    tx_egress_queues: [Option<EgressQueue>; EGRESS_QUEUE_CAPACITY],
     #[cfg(feature = "tx-egress-metadata")]
-    tx_egress_demand_handles: [Option<EgressDemandHandle>; EGRESS_QUEUE_CAPACITY],
+    tx_unclassified: Option<PacketQueue>,
+    #[cfg(feature = "tx-egress-metadata")]
+    tx_egress_queues: [Option<EgressQueue>; IFACE_EGRESS_KEY_COUNT],
+    #[cfg(feature = "tx-egress-metadata")]
     tx_egress_current: Option<u8>,
     #[cfg(feature = "tx-egress-metadata")]
-    tx_device_egress_current: Option<DeviceEgressQueueKey>,
+    tx_egress_epoch: Option<u32>,
     #[cfg(feature = "tx-egress-metadata")]
-    tx_egress_epoch: u32,
     tx_egress_cursor: u8,
+    #[cfg(feature = "tx-egress-metadata")]
     tx_burst_remaining: u8,
     #[cfg(feature = "async")]
     rx_waker: WakerRegistration,
@@ -179,20 +174,19 @@ impl<'a> Socket<'a> {
             rx_buffer,
             tx_buffer,
             hop_limit: None,
-            // A keyed build records every enqueue from the start. This avoids
-            // reconstructing provider queues from packet payload ownership
-            // before the first scheduling observation.
-            tx_egress_index_enabled: cfg!(feature = "tx-egress-metadata"),
-            tx_egress_index_blocked: false,
-            tx_egress_queues: [None; EGRESS_QUEUE_CAPACITY],
             #[cfg(feature = "tx-egress-metadata")]
-            tx_egress_demand_handles: [None; EGRESS_QUEUE_CAPACITY],
+            // Enqueue has no route/device context. New owners first enter this
+            // intrusive list and are classified exactly once by the interface.
+            tx_unclassified: None,
+            #[cfg(feature = "tx-egress-metadata")]
+            tx_egress_queues: [None; IFACE_EGRESS_KEY_COUNT],
+            #[cfg(feature = "tx-egress-metadata")]
             tx_egress_current: None,
             #[cfg(feature = "tx-egress-metadata")]
-            tx_device_egress_current: None,
+            tx_egress_epoch: None,
             #[cfg(feature = "tx-egress-metadata")]
-            tx_egress_epoch: 0,
             tx_egress_cursor: 0,
+            #[cfg(feature = "tx-egress-metadata")]
             tx_burst_remaining: 0,
             #[cfg(feature = "async")]
             rx_waker: WakerRegistration::new(),
@@ -201,20 +195,15 @@ impl<'a> Socket<'a> {
         }
     }
 
-    fn egress_queue_index(&self, destination: IpAddress) -> Option<usize> {
-        self.tx_egress_queues
-            .iter()
-            .position(|queue| queue.is_some_and(|queue| queue.destination == destination))
-    }
-
-    fn record_linked_egress_packet(
-        queues: &mut [Option<EgressQueue>; EGRESS_QUEUE_CAPACITY],
-        index: usize,
-        destination: IpAddress,
+    #[cfg(feature = "tx-egress-metadata")]
+    fn append_unlinked_packet(
+        tx_buffer: &mut PacketBuffer<'a>,
+        queue: &mut Option<PacketQueue>,
         handle: PacketHandle,
     ) {
-        queues[index] = Some(if let Some(queue) = queues[index] {
-            EgressQueue {
+        *queue = Some(if let Some(queue) = *queue {
+            tx_buffer.link_egress(queue.tail, handle);
+            PacketQueue {
                 tail: handle,
                 ready_units: queue
                     .ready_units
@@ -223,8 +212,7 @@ impl<'a> Socket<'a> {
                 ..queue
             }
         } else {
-            EgressQueue {
-                destination,
+            PacketQueue {
                 head: handle,
                 tail: handle,
                 ready_units: 1,
@@ -232,152 +220,156 @@ impl<'a> Socket<'a> {
         });
     }
 
-    fn disable_egress_index(&mut self, blocked: bool) {
-        if self.tx_egress_index_enabled {
-            self.tx_buffer.clear_egress_links();
-        }
-        self.tx_egress_index_enabled = false;
-        self.tx_egress_index_blocked = blocked;
-        self.tx_egress_queues = [None; EGRESS_QUEUE_CAPACITY];
-        #[cfg(feature = "tx-egress-metadata")]
-        {
-            self.tx_egress_demand_handles = [None; EGRESS_QUEUE_CAPACITY];
-        }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn rebuild_unclassified(&mut self) {
+        let mut queue = None;
+        self.tx_buffer.rebuild_egress_links(|handle, _| {
+            let previous = queue.map(|queue: PacketQueue| queue.tail);
+            queue = Some(if let Some(queue) = queue {
+                PacketQueue {
+                    tail: handle,
+                    ready_units: queue.ready_units + 1,
+                    ..queue
+                }
+            } else {
+                PacketQueue {
+                    head: handle,
+                    tail: handle,
+                    ready_units: 1,
+                }
+            });
+            previous
+        });
+        self.tx_unclassified = queue;
+        self.tx_egress_queues = [None; IFACE_EGRESS_KEY_COUNT];
         self.tx_egress_current = None;
-        #[cfg(feature = "tx-egress-metadata")]
-        {
-            self.tx_device_egress_current = None;
-        }
+        self.tx_egress_cursor = 0;
         self.tx_burst_remaining = 0;
     }
 
     #[cfg(feature = "tx-egress-metadata")]
     fn begin_device_egress_epoch(&mut self, epoch: u32) {
-        if self.tx_egress_epoch != epoch {
-            // Rebuild all intrusive links from live packet metadata on the
-            // next selection. Packet owners and per-destination FIFO order
-            // survive; only the obsolete scheduler phase is discarded.
-            self.disable_egress_index(false);
-            self.tx_egress_cursor = 0;
-            self.tx_egress_epoch = epoch;
+        if self.tx_egress_epoch != Some(epoch) {
+            // A device epoch invalidates every cached route-to-key decision.
+            // Rebuild one unresolved FIFO in original packet order; payload
+            // ownership never moves and is reclassified exactly once below.
+            self.rebuild_unclassified();
+            self.tx_egress_epoch = Some(epoch);
         }
-    }
-
-    /// Synchronize queue-local scheduler state before interface observation.
-    #[cfg(feature = "tx-egress-metadata")]
-    pub(crate) fn prepare_egress_demand_epoch(&mut self, epoch: u32) {
-        self.begin_device_egress_epoch(epoch);
-    }
-
-    fn enable_egress_index(&mut self) -> bool {
-        if self.tx_egress_index_enabled {
-            return true;
-        }
-        if self.tx_egress_index_blocked {
-            return false;
-        }
-
-        // First prove that the complete live set fits. This keeps activation
-        // transactional: an over-capacity generic socket falls back to FIFO
-        // without leaving a partially linked arena behind.
-        let mut destinations = [None; EGRESS_QUEUE_CAPACITY];
-        let mut overflow = false;
-        self.tx_buffer.for_each_packet(|_, metadata| {
-            if destinations.contains(&Some(metadata.endpoint.addr)) {
-                return;
-            }
-            match destinations
-                .iter_mut()
-                .find(|destination| destination.is_none())
-            {
-                Some(free) => *free = Some(metadata.endpoint.addr),
-                None => overflow = true,
-            }
-        });
-        if overflow {
-            self.tx_egress_index_blocked = true;
-            return false;
-        }
-
-        self.tx_egress_queues = [None; EGRESS_QUEUE_CAPACITY];
-        let queues = &mut self.tx_egress_queues;
-        self.tx_buffer.rebuild_egress_links(|handle, metadata| {
-            let index = queues
-                .iter()
-                .position(|queue| {
-                    queue.is_some_and(|queue| queue.destination == metadata.endpoint.addr)
-                })
-                .or_else(|| queues.iter().position(Option::is_none))
-                .expect("the transactional preflight covered every destination");
-            let previous = queues[index].map(|queue| queue.tail);
-            Self::record_linked_egress_packet(queues, index, metadata.endpoint.addr, handle);
-            previous
-        });
-        self.tx_egress_index_enabled = true;
-        true
     }
 
     #[cfg(feature = "tx-egress-metadata")]
-    fn device_queue_key<D: Device + ?Sized>(
-        cx: &Context,
-        device: &mut D,
-        queue: EgressQueue,
-    ) -> DeviceEgressQueueKey {
-        cx.resolved_egress_route(&queue.destination)
-            .map(|route| DeviceEgressQueueKey::Classified(device.egress_key(route)))
-            .unwrap_or(DeviceEgressQueueKey::Unresolved(queue.destination))
+    fn disable_egress_scheduling(&mut self) {
+        self.tx_buffer.clear_egress_links();
+        self.tx_unclassified = None;
+        self.tx_egress_queues = [None; IFACE_EGRESS_KEY_COUNT];
+        self.tx_egress_current = None;
+        self.tx_egress_epoch = None;
+        self.tx_egress_cursor = 0;
+        self.tx_burst_remaining = 0;
     }
 
-    /// Select one packet by its device-classified scheduling domain.
-    ///
-    /// Resolution is performed only when a burst starts or crosses from one
-    /// IP FIFO to another. The common one-IP-per-peer case therefore does not
-    /// add a neighbour-cache lookup for every packet in a full aggregate.
+    /// Classify newly enqueued owners by the device's opaque scheduling key.
+    /// IP destination count is deliberately absent from the bounded state.
     #[cfg(feature = "tx-egress-metadata")]
-    fn select_device_egress_packet<D: Device + ?Sized>(
+    fn classify_pending_egress<D: Device + ?Sized>(
         &mut self,
         cx: &Context,
         device: &mut D,
-        max_packets: u8,
-    ) -> Option<(usize, PacketHandle)> {
-        if !self.enable_egress_index() {
-            return None;
+        max_active_keys: usize,
+    ) {
+        let mut unresolved = None;
+        let mut current = self.tx_unclassified.take().map(|queue| queue.head);
+        while let Some(handle) = current {
+            let (metadata, observed_next) = self.tx_buffer.egress_entry(handle);
+            let next = self.tx_buffer.take_egress_next(handle);
+            debug_assert_eq!(next, observed_next);
+            current = next;
+
+            let Some(route) = cx.resolved_egress_route(&metadata.endpoint.addr) else {
+                Self::append_unlinked_packet(&mut self.tx_buffer, &mut unresolved, handle);
+                continue;
+            };
+            let key = device.egress_key(route);
+            let existing = self
+                .tx_egress_queues
+                .iter()
+                .position(|queue| queue.is_some_and(|queue| queue.key == key));
+            let index = existing.unwrap_or_else(|| {
+                assert!(
+                    self.tx_egress_queues.iter().flatten().count() < max_active_keys,
+                    "device produced more active egress keys than EgressSchedule declares"
+                );
+                self.tx_egress_queues
+                    .iter()
+                    .position(Option::is_none)
+                    .expect("compiled egress-key capacity covers the declared device domain")
+            });
+            if let Some(mut queue) = self.tx_egress_queues[index] {
+                self.tx_buffer.link_egress(queue.packets.tail, handle);
+                queue.packets = PacketQueue {
+                    tail: handle,
+                    ready_units: queue
+                        .packets
+                        .ready_units
+                        .checked_add(1)
+                        .expect("packet arena bounds UDP egress queue length"),
+                    ..queue.packets
+                };
+                self.tx_egress_queues[index] = Some(queue);
+            } else {
+                self.tx_egress_queues[index] = Some(EgressQueue {
+                    key,
+                    packets: PacketQueue {
+                        head: handle,
+                        tail: handle,
+                        ready_units: 1,
+                    },
+                    demand_handle: None,
+                });
+            }
         }
+        self.tx_unclassified = unresolved;
+    }
 
-        if self.tx_burst_remaining != 0 {
-            if let Some(index) = self.tx_egress_current.map(usize::from)
-                && let Some(queue) = self.tx_egress_queues[index]
-            {
-                return Some((index, queue.head));
-            }
+    /// Synchronize and visit physical-key demand. New IP destinations that map
+    /// to an existing radio key consume no additional queue or catalog slot.
+    #[cfg(feature = "tx-egress-metadata")]
+    pub(crate) fn for_each_egress_demand_provider<D: Device + ?Sized>(
+        &mut self,
+        cx: &Context,
+        device: &mut D,
+        schedule: crate::phy::EgressSchedule,
+        mut visit: impl FnMut(&mut Option<EgressDemandHandle>, EgressKey, NonZeroU16),
+    ) {
+        self.begin_device_egress_epoch(schedule.epoch());
+        self.classify_pending_egress(cx, device, usize::from(schedule.max_active_keys().get()));
+        for queue in self.tx_egress_queues.iter_mut().flatten() {
+            let ready_units =
+                NonZeroU16::new(queue.packets.ready_units.min(usize::from(u16::MAX)) as u16)
+                    .expect("a live egress queue is nonempty");
+            visit(&mut queue.demand_handle, queue.key, ready_units);
+        }
+    }
 
-            if let Some(current_key) = self.tx_device_egress_current {
-                for offset in 0..EGRESS_QUEUE_CAPACITY {
-                    let index =
-                        (usize::from(self.tx_egress_cursor) + offset) % EGRESS_QUEUE_CAPACITY;
-                    let Some(queue) = self.tx_egress_queues[index] else {
-                        continue;
-                    };
-                    if Self::device_queue_key(cx, device, queue) == current_key {
-                        self.tx_egress_current = Some(index as u8);
-                        self.tx_egress_cursor = ((index + 1) % EGRESS_QUEUE_CAPACITY) as u8;
-                        return Some((index, queue.head));
-                    }
-                }
-            }
+    #[cfg(feature = "tx-egress-metadata")]
+    fn select_device_egress_packet(&mut self, max_packets: u8) -> Option<(usize, PacketHandle)> {
+        if self.tx_burst_remaining != 0
+            && let Some(index) = self.tx_egress_current.map(usize::from)
+            && let Some(queue) = self.tx_egress_queues[index]
+        {
+            return Some((index, queue.packets.head));
         }
 
         self.tx_egress_current = None;
-        self.tx_device_egress_current = None;
         self.tx_burst_remaining = 0;
-        for offset in 0..EGRESS_QUEUE_CAPACITY {
-            let index = (usize::from(self.tx_egress_cursor) + offset) % EGRESS_QUEUE_CAPACITY;
+        for offset in 0..IFACE_EGRESS_KEY_COUNT {
+            let index = (usize::from(self.tx_egress_cursor) + offset) % IFACE_EGRESS_KEY_COUNT;
             if let Some(queue) = self.tx_egress_queues[index] {
                 self.tx_egress_current = Some(index as u8);
-                self.tx_device_egress_current = Some(Self::device_queue_key(cx, device, queue));
-                self.tx_egress_cursor = ((index + 1) % EGRESS_QUEUE_CAPACITY) as u8;
+                self.tx_egress_cursor = ((index + 1) % IFACE_EGRESS_KEY_COUNT) as u8;
                 self.tx_burst_remaining = max_packets;
-                return Some((index, queue.head));
+                return Some((index, queue.packets.head));
             }
         }
         None
@@ -390,19 +382,14 @@ impl<'a> Socket<'a> {
         handle: PacketHandle,
         next: Option<PacketHandle>,
     ) -> bool {
-        let queue = self.tx_egress_queues[queue_index]
+        let mut queue = self.tx_egress_queues[queue_index]
             .expect("a selected device egress queue remains active");
-        assert_eq!(
-            queue.head, handle,
-            "device egress scheduling preserves IP FIFO order"
-        );
+        assert_eq!(queue.packets.head, handle, "device-key FIFO order changed");
         let queue_emptied = if let Some(next) = next {
-            debug_assert!(queue.ready_units > 1);
-            self.tx_egress_queues[queue_index] = Some(EgressQueue {
-                head: next,
-                ready_units: queue.ready_units - 1,
-                ..queue
-            });
+            debug_assert!(queue.packets.ready_units > 1);
+            queue.packets.head = next;
+            queue.packets.ready_units -= 1;
+            self.tx_egress_queues[queue_index] = Some(queue);
             false
         } else {
             self.tx_egress_queues[queue_index] = None;
@@ -414,41 +401,8 @@ impl<'a> Socket<'a> {
         let burst_completed = self.tx_burst_remaining == 0;
         if burst_completed {
             self.tx_egress_current = None;
-            self.tx_device_egress_current = None;
         }
-
-        // As with the IP selector, wake a full producer only at a scheduling
-        // boundary. Emptying one IP FIFO is not such a boundary when another
-        // IP FIFO resolves to the same radio key and the burst has credit.
         burst_completed || queue_emptied
-    }
-
-    /// Visit bounded queue metadata used by the interface demand catalog.
-    ///
-    /// Payload bytes are never inspected. The affine handle remains in its
-    /// queue slot across an empty interval so one interface observation can
-    /// terminate the old lifetime before a later activation reuses the slot.
-    #[cfg(feature = "tx-egress-metadata")]
-    pub(crate) fn for_each_egress_demand_provider(
-        &mut self,
-        mut visit: impl FnMut(&mut Option<EgressDemandHandle>, IpAddress, NonZeroU16),
-    ) {
-        if !self.enable_egress_index() {
-            return;
-        }
-
-        for index in 0..EGRESS_QUEUE_CAPACITY {
-            let Some(queue) = self.tx_egress_queues[index] else {
-                continue;
-            };
-            let ready_units = NonZeroU16::new(queue.ready_units.min(usize::from(u16::MAX)) as u16)
-                .expect("a live egress queue is nonempty");
-            visit(
-                &mut self.tx_egress_demand_handles[index],
-                queue.destination,
-                ready_units,
-            );
-        }
     }
 
     /// Register a waker for receive operations.
@@ -626,38 +580,33 @@ impl<'a> Socket<'a> {
             return Err(SendError::Unaddressable);
         }
 
-        let queue_index = if self.tx_egress_index_enabled {
-            match self
-                .egress_queue_index(meta.endpoint.addr)
-                .or_else(|| self.tx_egress_queues.iter().position(Option::is_none))
-            {
-                Some(index) => Some(index),
-                None => {
-                    // Queue cardinality is a scheduling limit, not packet
-                    // capacity. Preserve the packet API by falling back to
-                    // FIFO until this live backlog drains.
-                    self.disable_egress_index(true);
-                    None
+        #[cfg(feature = "tx-egress-metadata")]
+        let payload_buf = {
+            let previous = self.tx_unclassified.map(|queue| queue.tail);
+            let (handle, payload_buf) = self
+                .tx_buffer
+                .enqueue_tracked_linked(size, meta, previous)
+                .map_err(|_| SendError::BufferFull)?;
+            self.tx_unclassified = Some(if let Some(queue) = self.tx_unclassified {
+                PacketQueue {
+                    tail: handle,
+                    ready_units: queue.ready_units + 1,
+                    ..queue
                 }
-            }
-        } else {
-            None
+            } else {
+                PacketQueue {
+                    head: handle,
+                    tail: handle,
+                    ready_units: 1,
+                }
+            });
+            payload_buf
         };
-        let previous = queue_index
-            .and_then(|index| self.tx_egress_queues[index])
-            .map(|queue| queue.tail);
-        let (handle, payload_buf) = self
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        let payload_buf = self
             .tx_buffer
-            .enqueue_tracked_linked(size, meta, previous)
+            .enqueue(size, meta)
             .map_err(|_| SendError::BufferFull)?;
-        if let Some(index) = queue_index {
-            Self::record_linked_egress_packet(
-                &mut self.tx_egress_queues,
-                index,
-                meta.endpoint.addr,
-                handle,
-            );
-        }
 
         net_trace!(
             "udp:{}:{}: buffer to send {} octets",
@@ -693,35 +642,33 @@ impl<'a> Socket<'a> {
             return Err(SendError::Unaddressable);
         }
 
-        let queue_index = if self.tx_egress_index_enabled {
-            match self
-                .egress_queue_index(meta.endpoint.addr)
-                .or_else(|| self.tx_egress_queues.iter().position(Option::is_none))
-            {
-                Some(index) => Some(index),
-                None => {
-                    self.disable_egress_index(true);
-                    None
+        #[cfg(feature = "tx-egress-metadata")]
+        let size = {
+            let previous = self.tx_unclassified.map(|queue| queue.tail);
+            let (size, handle) = self
+                .tx_buffer
+                .enqueue_with_infallible_tracked_linked(max_size, meta, previous, f)
+                .map_err(|_| SendError::BufferFull)?;
+            self.tx_unclassified = Some(if let Some(queue) = self.tx_unclassified {
+                PacketQueue {
+                    tail: handle,
+                    ready_units: queue.ready_units + 1,
+                    ..queue
                 }
-            }
-        } else {
-            None
+            } else {
+                PacketQueue {
+                    head: handle,
+                    tail: handle,
+                    ready_units: 1,
+                }
+            });
+            size
         };
-        let previous = queue_index
-            .and_then(|index| self.tx_egress_queues[index])
-            .map(|queue| queue.tail);
-        let (size, handle) = self
+        #[cfg(not(feature = "tx-egress-metadata"))]
+        let size = self
             .tx_buffer
-            .enqueue_with_infallible_tracked_linked(max_size, meta, previous, f)
+            .enqueue_with_infallible(max_size, meta, f)
             .map_err(|_| SendError::BufferFull)?;
-        if let Some(index) = queue_index {
-            Self::record_linked_egress_packet(
-                &mut self.tx_egress_queues,
-                index,
-                meta.endpoint.addr,
-                handle,
-            );
-        }
 
         net_trace!(
             "udp:{}:{}: buffer to send {} octets",
@@ -977,7 +924,7 @@ impl<'a> Socket<'a> {
         ) -> Result<(), KeyedEmitError<E>>,
     {
         let Some(schedule) = schedule else {
-            self.disable_egress_index(false);
+            self.disable_egress_scheduling();
             return self
                 .dispatch(cx, |cx, meta, packet| emit(cx, device, meta, packet))
                 .map_err(|error| match error {
@@ -987,6 +934,7 @@ impl<'a> Socket<'a> {
         };
 
         self.begin_device_egress_epoch(schedule.epoch());
+        self.classify_pending_egress(cx, device, usize::from(schedule.max_active_keys().get()));
         let max_packets = schedule.max_packets_per_key().get();
         let dispatch_quantum = schedule.dispatch_quantum().get();
         let endpoint = self.endpoint;
@@ -994,16 +942,51 @@ impl<'a> Socket<'a> {
         let mut deferred = 0;
         let mut emitted = 0_u8;
         loop {
-            let selected = self.select_device_egress_packet(cx, device, max_packets);
+            let selected = self.select_device_egress_packet(max_packets);
             let Some((queue_index, handle)) = selected else {
-                let result = self.dispatch(cx, |cx, meta, packet| emit(cx, device, meta, packet));
-                if self.tx_buffer.is_empty() {
-                    self.tx_egress_index_blocked = false;
-                }
-                return result.map_err(|error| match error {
-                    KeyedEmitError::KeyDeferred => KeyedDispatchError::AllKeysDeferred,
-                    KeyedEmitError::Global(error) => KeyedDispatchError::Global(error),
-                });
+                // Unresolved work is retained separately so it can request
+                // neighbour discovery without hiding any resolved grant key.
+                let Some(unclassified) = self.tx_unclassified else {
+                    return Ok(());
+                };
+                let handle = unclassified.head;
+                let (result, next) =
+                    self.tx_buffer
+                        .dequeue_handle_with(handle, |packet_meta, payload_buf| {
+                            let src_addr = packet_meta
+                                .local_address
+                                .or(endpoint.addr)
+                                .or_else(|| cx.get_source_address(&packet_meta.endpoint.addr));
+                            let Some(src_addr) = src_addr else {
+                                return Ok(());
+                            };
+                            let repr = UdpRepr {
+                                src_port: endpoint.port,
+                                dst_port: packet_meta.endpoint.port,
+                            };
+                            let ip_repr = IpRepr::new(
+                                src_addr,
+                                packet_meta.endpoint.addr,
+                                IpProtocol::Udp,
+                                repr.header_len() + payload_buf.len(),
+                                hop_limit,
+                            );
+                            emit(cx, device, packet_meta.meta, (ip_repr, repr, payload_buf))
+                        });
+                return match result {
+                    Ok(()) => {
+                        self.tx_unclassified = next.map(|next| PacketQueue {
+                            head: next,
+                            tail: unclassified.tail,
+                            ready_units: unclassified.ready_units - 1,
+                        });
+                        #[cfg(feature = "async")]
+                        self.tx_waker.wake();
+                        Ok(())
+                    }
+                    Err(KeyedEmitError::Global(error)) => Err(KeyedDispatchError::Global(error)),
+                    Err(KeyedEmitError::KeyDeferred) => Err(KeyedDispatchError::AllKeysDeferred),
+                };
             };
 
             let dispatch_packet = |packet_meta: &mut UdpMetadata, payload_buf: &mut [u8]| {
@@ -1069,7 +1052,6 @@ impl<'a> Socket<'a> {
                     // Retain the exact queue head, but do not interpret a
                     // key-specific scheduler decision as global pressure.
                     self.tx_egress_current = None;
-                    self.tx_device_egress_current = None;
                     self.tx_burst_remaining = 0;
                     deferred += 1;
                     let active = self
@@ -1112,6 +1094,7 @@ mod test {
         )
     }
 
+    #[cfg(feature = "tx-egress-metadata")]
     fn indexed_buffer(packets: usize) -> PacketBuffer<'static> {
         PacketBuffer::new_indexed_slots(
             (0..packets)
@@ -1137,9 +1120,20 @@ mod test {
         crate::phy::EgressSchedule::new(
             core::num::NonZeroU8::new(max_packets_per_key).unwrap(),
             core::num::NonZeroU8::new(dispatch_quantum).unwrap(),
+            core::num::NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
             epoch,
             crate::phy::EgressGrantMode::StackSelected,
         )
+    }
+
+    #[cfg(all(feature = "tx-egress-metadata", feature = "medium-ethernet"))]
+    fn resolve_test_neighbor(cx: &mut Context, address: IpAddress, identity: u8) {
+        cx.fill_test_neighbor(
+            address,
+            crate::wire::HardwareAddress::Ethernet(crate::wire::EthernetAddress([
+                0x02, 0, 0, 0, 0, identity,
+            ])),
+        );
     }
 
     const LOCAL_PORT: u16 = 53;
@@ -1345,6 +1339,8 @@ mod test {
     fn test_destination_burst_dispatch_preserves_per_destination_fifo() {
         let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
+        resolve_test_neighbor(cx, REMOTE_ADDR.into(), 2);
+        resolve_test_neighbor(cx, OTHER_ADDR.into(), 3);
         let mut socket = socket(buffer(0), buffer(8));
         let other = IpEndpoint {
             addr: OTHER_ADDR.into(),
@@ -1444,10 +1440,10 @@ mod test {
             observed,
             [
                 b"a0".to_vec(),
-                b"a1".to_vec(),
                 b"c0".to_vec(),
-                b"c1".to_vec(),
                 b"b0".to_vec(),
+                b"a1".to_vec(),
+                b"c1".to_vec(),
                 b"b1".to_vec(),
             ]
         );
@@ -1511,11 +1507,73 @@ mod test {
         assert!(socket.can_send());
     }
 
+    #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
+    #[test]
+    fn unresolved_head_does_not_hide_a_resolved_device_key() {
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
+        let cx = iface.context();
+        let mut socket = socket(buffer(0), buffer(2));
+        assert_eq!(socket.bind(LOCAL_END), Ok(()));
+        let resolved = IpEndpoint {
+            addr: crate::wire::Ipv4Address::new(224, 0, 0, 1).into(),
+            port: REMOTE_PORT,
+        };
+
+        // The older unicast owner needs ARP. It must not cause head-of-line
+        // blocking for a later owner whose device key is already known.
+        assert_eq!(socket.send_slice(b"unresolved", REMOTE_END), Ok(()));
+        assert_eq!(socket.send_slice(b"resolved", resolved), Ok(()));
+
+        let mut observed = None;
+        socket
+            .dispatch_keyed(
+                cx,
+                &mut device,
+                Some(egress_schedule(2, 1, 0)),
+                |_, _, _, (ip, _, payload)| {
+                    observed = Some((ip.dst_addr(), payload.to_vec()));
+                    Result::<(), KeyedEmitError<()>>::Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(observed, Some((resolved.addr, b"resolved".to_vec())));
+        assert!(!socket.tx_buffer.is_empty());
+    }
+
+    #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
+    #[test]
+    #[should_panic(expected = "device produced more active egress keys")]
+    fn device_cannot_exceed_its_declared_key_domain() {
+        let (mut iface, _, mut device) = setup(Medium::Ethernet);
+        let cx = iface.context();
+        let mut socket = socket(buffer(0), buffer(2));
+        assert_eq!(socket.bind(LOCAL_END), Ok(()));
+        for host in 1..=2 {
+            let endpoint = IpEndpoint {
+                addr: crate::wire::Ipv4Address::new(224, 0, 0, host).into(),
+                port: REMOTE_PORT,
+            };
+            assert_eq!(socket.send_slice(&[host], endpoint), Ok(()));
+        }
+        let schedule = crate::phy::EgressSchedule::new(
+            core::num::NonZeroU8::new(2).unwrap(),
+            core::num::NonZeroU8::MIN,
+            core::num::NonZeroU16::MIN,
+            0,
+            crate::phy::EgressGrantMode::StackSelected,
+        );
+        let _ = socket.dispatch_keyed(cx, &mut device, Some(schedule), |_, _, _, _| {
+            Result::<(), KeyedEmitError<()>>::Ok(())
+        });
+    }
+
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_destination_index_retains_failed_head_and_links_new_packets() {
         let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
+        resolve_test_neighbor(cx, REMOTE_ADDR.into(), 2);
+        resolve_test_neighbor(cx, OTHER_ADDR.into(), 3);
         let mut socket = socket(buffer(0), buffer(8));
         let other = IpEndpoint {
             addr: OTHER_ADDR.into(),
@@ -1573,6 +1631,8 @@ mod test {
     fn test_key_defer_rotates_but_global_error_retains_current_burst() {
         let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
+        resolve_test_neighbor(cx, REMOTE_ADDR.into(), 2);
+        resolve_test_neighbor(cx, OTHER_ADDR.into(), 3);
         let mut socket = socket(buffer(0), buffer(8));
         let other = IpEndpoint {
             addr: OTHER_ADDR.into(),
@@ -1662,10 +1722,13 @@ mod test {
         let mut socket = socket(buffer(0), buffer(PEERS * PACKETS_PER_PEER));
         assert_eq!(socket.bind(LOCAL_END), Ok(()));
 
+        // Multicast supplies fifteen distinct, immediately resolved device
+        // keys without making this queue-topology test depend on the much
+        // smaller neighbor-cache capacity.
         for sequence in 0..PACKETS_PER_PEER as u8 {
             for peer in 0..PEERS as u8 {
                 let endpoint = IpEndpoint {
-                    addr: crate::wire::Ipv4Address::new(10, 0, 0, peer + 1).into(),
+                    addr: crate::wire::Ipv4Address::new(224, 0, 0, peer + 1).into(),
                     port: REMOTE_PORT,
                 };
                 assert_eq!(socket.send_slice(&[peer, sequence], endpoint), Ok(()));
@@ -1689,7 +1752,7 @@ mod test {
         }
 
         for (peer, burst) in observed.chunks_exact(PACKETS_PER_PEER).enumerate() {
-            let expected_address = crate::wire::Ipv4Address::new(10, 0, 0, peer as u8 + 1).into();
+            let expected_address = crate::wire::Ipv4Address::new(224, 0, 0, peer as u8 + 1).into();
             for (sequence, (address, payload)) in burst.iter().enumerate() {
                 assert_eq!(*address, expected_address);
                 assert_eq!(payload.as_slice(), &[peer as u8, sequence as u8]);
@@ -1793,74 +1856,6 @@ mod test {
         assert_eq!(observed[9], 1);
     }
 
-    #[cfg(all(feature = "tx-egress-metadata", feature = "proto-ipv4"))]
-    #[test]
-    fn test_destination_index_overflow_falls_back_without_rejecting_packets() {
-        const PEERS: usize = EGRESS_QUEUE_CAPACITY + 1;
-
-        let (mut iface, _, mut device) = setup(Medium::Ethernet);
-        let cx = iface.context();
-        let mut socket = socket(buffer(0), buffer(PEERS));
-        assert_eq!(socket.bind(LOCAL_END), Ok(()));
-
-        for peer in 0..PEERS as u8 {
-            let endpoint = IpEndpoint {
-                addr: crate::wire::Ipv4Address::new(10, 0, 1, peer + 1).into(),
-                port: REMOTE_PORT,
-            };
-            assert_eq!(socket.send_slice(&[peer], endpoint), Ok(()));
-        }
-
-        let mut observed = Vec::new();
-        for _ in 0..PEERS {
-            assert_eq!(
-                socket.dispatch_keyed(
-                    cx,
-                    &mut device,
-                    Some(egress_schedule(4, 1, 0)),
-                    |_, _, _, (_, _, payload)| {
-                        observed.push(payload[0]);
-                        Result::<(), KeyedEmitError<()>>::Ok(())
-                    },
-                ),
-                Ok(())
-            );
-        }
-        assert_eq!(observed, (0..PEERS as u8).collect::<Vec<_>>());
-        assert!(socket.can_send());
-
-        // Draining the over-capacity live set permits a later bounded set to
-        // activate the index normally.
-        for (payload, destination) in [
-            (b"a0" as &[u8], REMOTE_END),
-            (
-                b"b0",
-                IpEndpoint {
-                    addr: OTHER_ADDR.into(),
-                    port: REMOTE_PORT,
-                },
-            ),
-            (b"a1", REMOTE_END),
-        ] {
-            assert_eq!(socket.send_slice(payload, destination), Ok(()));
-        }
-        observed.clear();
-        for _ in 0..3 {
-            socket
-                .dispatch_keyed(
-                    cx,
-                    &mut device,
-                    Some(egress_schedule(4, 1, 0)),
-                    |_, _, _, (_, _, payload)| {
-                        observed.push(payload[1]);
-                        Result::<(), KeyedEmitError<()>>::Ok(())
-                    },
-                )
-                .unwrap();
-        }
-        assert_eq!(observed, b"010");
-    }
-
     #[cfg(feature = "tx-egress-metadata")]
     #[test]
     fn test_switching_back_to_fifo_clears_intrusive_index_links() {
@@ -1911,6 +1906,8 @@ mod test {
     fn indexed_slot_reuse_preserves_global_fifo_fallback() {
         let (mut iface, _, mut device) = setup(Medium::Ethernet);
         let cx = iface.context();
+        resolve_test_neighbor(cx, REMOTE_ADDR.into(), 2);
+        resolve_test_neighbor(cx, OTHER_ADDR.into(), 3);
         let mut socket = socket(buffer(0), indexed_buffer(4));
         let other = IpEndpoint {
             addr: OTHER_ADDR.into(),

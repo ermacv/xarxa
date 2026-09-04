@@ -33,6 +33,7 @@ fn egress_schedule(max_packets_per_key: u8, dispatch_quantum: u8, epoch: u32) ->
     EgressSchedule::new(
         core::num::NonZeroU8::new(max_packets_per_key).unwrap(),
         core::num::NonZeroU8::new(dispatch_quantum).unwrap(),
+        core::num::NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
         epoch,
         crate::phy::EgressGrantMode::StackSelected,
     )
@@ -222,6 +223,62 @@ fn udp_providers_from_two_sockets_share_one_demand_lifetime() {
 
 #[cfg(all(
     feature = "tx-egress-metadata",
+    feature = "socket-udp",
+    feature = "proto-ipv4",
+    feature = "medium-ethernet"
+))]
+#[test]
+fn authoritative_udp_catalogue_is_bounded_by_device_keys_not_ip_destinations() {
+    use crate::socket::udp;
+
+    const DESTINATIONS: usize = 17;
+
+    let (mut iface, mut sockets, mut device) = setup(Medium::Ethernet);
+    let shared_key = resolved_key(42);
+    device.set_egress_key_override(Some(shared_key));
+    device.set_egress_schedule(Some(EgressSchedule::new(
+        core::num::NonZeroU8::new(32).unwrap(),
+        core::num::NonZeroU8::MIN,
+        core::num::NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
+        7,
+        crate::phy::EgressGrantMode::Authoritative,
+    )));
+
+    let handle = sockets.add(udp::Socket::new(
+        udp::PacketBuffer::new_indexed_slots(vec![udp::PacketMetadata::EMPTY], vec![0; 1]),
+        udp::PacketBuffer::new_indexed_slots(
+            vec![udp::PacketMetadata::EMPTY; DESTINATIONS],
+            vec![0; 8 * DESTINATIONS],
+        ),
+    ));
+    let socket = sockets.get_mut::<udp::Socket>(handle);
+    socket.bind(1234).unwrap();
+    for destination in 1..=DESTINATIONS as u8 {
+        socket
+            .send_slice(
+                &[destination; 8],
+                (
+                    IpAddress::Ipv4(Ipv4Address::new(224, 0, 1, destination)),
+                    4321,
+                ),
+            )
+            .unwrap();
+    }
+
+    assert_eq!(
+        iface.poll_egress(Instant::ZERO, &mut device, &mut sockets),
+        PollResult::None
+    );
+    assert_eq!(device.egress_demand_updates.len(), 2);
+    let crate::phy::EgressDemandUpdate::Active(demand) = device.egress_demand_updates[1] else {
+        panic!("one physical egress key must remain visible regardless of IP cardinality");
+    };
+    assert_eq!(demand.key(), shared_key);
+    assert_eq!(demand.level().ready_units().get(), DESTINATIONS as u16);
+}
+
+#[cfg(all(
+    feature = "tx-egress-metadata",
     feature = "socket-dhcpv4",
     feature = "socket-udp",
     feature = "proto-ipv4",
@@ -241,6 +298,7 @@ fn authoritative_udp_schedule_does_not_gate_uncatalogued_dhcp_control() {
     device.set_egress_schedule(Some(EgressSchedule::new(
         core::num::NonZeroU8::new(32).unwrap(),
         core::num::NonZeroU8::new(4).unwrap(),
+        core::num::NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
         7,
         crate::phy::EgressGrantMode::Authoritative,
     )));
@@ -300,6 +358,7 @@ fn authoritative_current_and_standby_grants_drain_without_an_external_wake() {
     device.set_egress_schedule(Some(EgressSchedule::new(
         core::num::NonZeroU8::new(32).unwrap(),
         core::num::NonZeroU8::MIN,
+        core::num::NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
         7,
         crate::phy::EgressGrantMode::Authoritative,
     )));
@@ -386,6 +445,7 @@ fn stale_current_grant_yields_to_a_valid_standby_without_sleeping() {
     device.set_egress_schedule(Some(EgressSchedule::new(
         core::num::NonZeroU8::new(32).unwrap(),
         core::num::NonZeroU8::MIN,
+        core::num::NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
         7,
         crate::phy::EgressGrantMode::Authoritative,
     )));

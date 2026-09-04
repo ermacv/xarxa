@@ -37,6 +37,7 @@ pub(crate) use self::waker::WakerRegistration;
 ///
 /// This is socket-protocol independent: non-UDP sockets also use keyed device
 /// admission when the driver exposes device-classified egress metadata.
+#[cfg(feature = "tx-egress-metadata")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyedEmitError<E> {
     /// This key has no current scheduler grant; another key may progress.
@@ -46,6 +47,7 @@ pub(crate) enum KeyedEmitError<E> {
 }
 
 /// Terminal result after a bounded keyed dispatch attempt.
+#[cfg(feature = "tx-egress-metadata")]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum KeyedDispatchError<E> {
     /// Every currently active key was deferred once.

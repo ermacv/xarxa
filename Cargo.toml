@@ -185,6 +185,15 @@ iface-neighbor-cache-count-256 = []
 iface-neighbor-cache-count-512 = []
 iface-neighbor-cache-count-1024 = []
 
+iface-egress-key-count-1 = []
+iface-egress-key-count-2 = []
+iface-egress-key-count-3 = []
+iface-egress-key-count-4 = [] # Default
+iface-egress-key-count-8 = []
+iface-egress-key-count-16 = []
+iface-egress-key-count-32 = []
+iface-egress-key-count-64 = []
+
 iface-max-route-count-0 = []
 iface-max-route-count-1 = []
 iface-max-route-count-2 = [] # Default

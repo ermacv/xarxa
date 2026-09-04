@@ -21,6 +21,7 @@ FEATURES_TEST=(
     "std,medium-ethernet,proto-ipv4,proto-ipv4-fragmentation,socket-raw,socket-dns"
     "std,medium-ethernet,proto-ipv4,multicast,socket-raw,socket-dns"
     "std,medium-ethernet,proto-ipv4,socket-udp,socket-tcp,socket-dns"
+    "std,medium-ethernet,proto-ipv4,socket-udp,socket-tcp,tx-egress-metadata"
     "std,medium-ethernet,proto-ipv4,proto-dhcpv4,socket-udp"
     "std,medium-ethernet,medium-ip,medium-ieee802154,proto-ipv6,multicast,proto-rpl,socket-udp,socket-dns,auto-icmp-echo-reply"
     "std,medium-ethernet,proto-ipv6,socket-tcp"
@@ -45,6 +46,7 @@ FEATURES_CHECK=(
     "defmt,medium-ip,medium-ethernet,proto-ipv6,proto-ipv6-slaac,multicast,proto-dhcpv4,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async,packetmeta-timestamp"
     "defmt,alloc,medium-ip,medium-ethernet,proto-ipv6,proto-ipv6-slaac,multicast,proto-dhcpv4,socket-raw,socket-udp,socket-tcp,socket-icmp,socket-dns,async"
     "medium-ieee802154,proto-sixlowpan,socket-dns,auto-icmp-echo-reply"
+    "medium-ethernet,proto-ipv4,socket-udp,socket-tcp,tx-egress-metadata"
 )
 
 test() {
@@ -75,6 +77,7 @@ check() {
     # The driver crate is versioned separately, check it on its own.
     cargo +$version check -p xarxa-driver
     cargo +$version check -p xarxa-driver --features defmt,packetmeta-id,packetmeta-timestamp
+    cargo +$version check -p xarxa-driver --features tx-egress-metadata
 
     if [[ $version == "nightly" ]]; then
         cargo +$version check --benches

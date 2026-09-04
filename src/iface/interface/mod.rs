@@ -44,6 +44,8 @@ use super::fragmentation::{Fragmenter, FragmentsBuffer};
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 use super::neighbor::{Answer as NeighborAnswer, Cache as NeighborCache};
 use super::socket_set::SocketSet;
+#[cfg(feature = "tx-egress-metadata")]
+use crate::config::IFACE_EGRESS_KEY_COUNT;
 use crate::config::{
     IFACE_MAX_ADDR_COUNT, IFACE_MAX_PREFIX_COUNT, IFACE_MAX_SIXLOWPAN_ADDRESS_CONTEXT_COUNT,
 };
@@ -125,17 +127,8 @@ pub struct Interface {
     fragments: FragmentsBuffer,
     fragmenter: Fragmenter,
     #[cfg(feature = "tx-egress-metadata")]
-    egress_demands: egress_catalog::EgressDemandCatalog<EGRESS_DEMAND_CATALOG_CAPACITY>,
+    egress_demands: egress_catalog::EgressDemandCatalog<IFACE_EGRESS_KEY_COUNT>,
 }
-
-/// Bounded distinct device keys observed by one interface.
-///
-/// A SoftAP interface has at most fifteen unicast peers plus one group domain.
-/// Provider/socket count and packet backlog consume no additional catalog
-/// slots. Overflow omits excess shadow demand while synchronous `transmit_for`
-/// admission remains authoritative.
-#[cfg(feature = "tx-egress-metadata")]
-const EGRESS_DEMAND_CATALOG_CAPACITY: usize = 16;
 
 /// The device independent part of an Ethernet network interface.
 ///
@@ -462,6 +455,7 @@ mod egress_grant_tests {
         EgressSchedule::new(
             NonZeroU8::new(32).unwrap(),
             NonZeroU8::new(4).unwrap(),
+            NonZeroU16::new(crate::config::IFACE_EGRESS_KEY_COUNT as u16).unwrap(),
             epoch,
             mode,
         )
@@ -1155,6 +1149,13 @@ impl Interface {
         #[cfg(feature = "tx-egress-metadata")]
         let egress_schedule = device.egress_schedule();
         #[cfg(feature = "tx-egress-metadata")]
+        if let Some(schedule) = egress_schedule {
+            assert!(
+                usize::from(schedule.max_active_keys().get()) <= IFACE_EGRESS_KEY_COUNT,
+                "EgressSchedule requires more active keys than Xarxa was compiled to retain"
+            );
+        }
+        #[cfg(feature = "tx-egress-metadata")]
         let mut grant_state_changed = false;
         #[cfg(feature = "tx-egress-metadata")]
         let displaced_grants = match egress_schedule {
@@ -1538,15 +1539,12 @@ impl Interface {
             return;
         };
 
-        match self.egress_demands.configure(schedule) {
-            Ok(Some(update)) => device.update_egress_demand(update),
-            Ok(None) => {}
-            Err(error) => {
-                net_debug!("invalid egress demand schedule: {:?}", error);
-                self.egress_demands
-                    .disable(|update| device.update_egress_demand(update));
-                return;
-            }
+        if let Some(update) = self
+            .egress_demands
+            .configure(schedule)
+            .expect("device supplied an invalid egress schedule")
+        {
+            device.update_egress_demand(update);
         }
 
         self.egress_demands.begin_observation();
@@ -1555,16 +1553,16 @@ impl Interface {
             match &mut item.socket {
                 #[cfg(feature = "socket-udp")]
                 Socket::Udp(socket) => {
-                    socket.prepare_egress_demand_epoch(schedule.epoch());
-                    socket.for_each_egress_demand_provider(|handle, destination, ready_units| {
-                        let Some(route) = self.inner.resolved_egress_route(&destination) else {
-                            return;
-                        };
-                        let key = device.egress_key(route);
-                        if let Err(error) = self.egress_demands.observe(handle, key, ready_units) {
-                            net_debug!("failed to observe UDP egress demand: {:?}", error);
-                        }
-                    });
+                    socket.for_each_egress_demand_provider(
+                        &self.inner,
+                        device,
+                        schedule,
+                        |handle, key, ready_units| {
+                            self.egress_demands
+                                .observe(handle, key, ready_units)
+                                .expect("device violated its active egress-key bound");
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -1639,6 +1637,16 @@ impl InterfaceInner {
     #[allow(unused)] // unused depending on which sockets are enabled
     pub(crate) fn set_ip_addrs(&mut self, addrs: Vec<IpCidr, IFACE_MAX_ADDR_COUNT>) {
         self.ip_addrs = addrs;
+    }
+
+    #[cfg(all(test, any(feature = "medium-ethernet", feature = "medium-ieee802154")))]
+    pub(crate) fn fill_test_neighbor(
+        &mut self,
+        address: IpAddress,
+        hardware_address: HardwareAddress,
+    ) {
+        self.neighbor_cache
+            .fill(address, hardware_address, self.now);
     }
 
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]

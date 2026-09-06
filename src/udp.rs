@@ -184,6 +184,16 @@ impl fmt::Display for RecvError {
 
 impl core::error::Error for RecvError {}
 
+/// Resource that prevented the last asynchronous send.
+#[cfg(feature = "async")]
+#[derive(Debug, Default)]
+enum SendWait {
+    #[default]
+    None,
+    Device(IpAddress),
+    Buffer,
+}
+
 /// UDP socket state, stored inside the stack.
 #[derive(Debug)]
 pub(crate) struct UdpSocketState {
@@ -205,13 +215,31 @@ pub(crate) struct UdpSocketState {
     rx_waker: WakerRegistration,
     #[cfg(feature = "async")]
     tx_waker: WakerRegistration,
+    #[cfg(feature = "async")]
+    send_wait: SendWait,
 }
 
 impl UdpSocketState {
-    /// Wake the task waiting to send, if any.
+    /// Retry device-blocked sends only when the selected route has capacity.
     #[cfg(feature = "async")]
-    pub(crate) fn wake_tx(&mut self) {
-        self.tx_waker.wake();
+    pub(crate) fn poll_send(&mut self, cx: &mut TxContext<'_, '_>) {
+        let ready = match self.send_wait {
+            SendWait::None => false,
+            // Preserve the existing pool retry policy in this device-wake fix.
+            // The Embassy wrapper separately observes allocator release.
+            SendWait::Buffer => true,
+            SendWait::Device(destination) => match cx.route(&destination) {
+                None => true, // Retry so the sender observes the routing error.
+                Some(route) => {
+                    let iface = cx.ifaces.get_mut(route.iface.index());
+                    iface.can_transmit_new_packet()
+                }
+            },
+        };
+        if ready {
+            self.send_wait = SendWait::None;
+            self.tx_waker.wake();
+        }
     }
 
     /// Create an unbound UDP socket.
@@ -227,6 +255,8 @@ impl UdpSocketState {
             rx_waker: WakerRegistration::new(),
             #[cfg(feature = "async")]
             tx_waker: WakerRegistration::new(),
+            #[cfg(feature = "async")]
+            send_wait: SendWait::None,
         }
     }
 
@@ -524,6 +554,7 @@ impl UdpSocket<'_, '_> {
         // Sends are possible now, and receives can start failing differently.
         #[cfg(feature = "async")]
         {
+            state.send_wait = SendWait::None;
             state.rx_waker.wake();
             state.tx_waker.wake();
         }
@@ -543,6 +574,7 @@ impl UdpSocket<'_, '_> {
         // Wake the tasks waiting, so they can notice the socket is closed.
         #[cfg(feature = "async")]
         {
+            state.send_wait = SendWait::None;
             state.rx_waker.wake();
             state.tx_waker.wake();
         }
@@ -731,6 +763,10 @@ impl UdpSocket<'_, '_> {
         meta: impl Into<UdpMetadata>,
         f: impl FnOnce(&mut [u8]) -> usize,
     ) -> Result<(), SendError> {
+        #[cfg(feature = "async")]
+        {
+            self.inner_mut().send_wait = SendWait::None;
+        }
         let mut meta = meta.into();
         let local = self.inner().local;
         let remote = self.inner().remote;
@@ -800,11 +836,17 @@ impl UdpSocket<'_, '_> {
         let headroom = LINK_HEADER_LEN + ip_header_len + UDP_HEADER_LEN;
 
         if !self.tx.can_transmit(route.iface) {
-            self.tx.inner.set_tx_starved();
+            #[cfg(feature = "async")]
+            {
+                self.inner_mut().send_wait = SendWait::Device(meta.endpoint.addr);
+            }
             return Err(SendError::DeviceBusy);
         }
         let Some(mut buf) = self.tx.alloc_packet() else {
-            self.tx.inner.set_tx_starved();
+            #[cfg(feature = "async")]
+            {
+                self.inner_mut().send_wait = SendWait::Buffer;
+            }
             return Err(SendError::NoBuffer);
         };
         if max_size > buf.capacity() - headroom {

@@ -137,9 +137,9 @@ pub(crate) struct StackInner {
     pub(crate) routes: Routes,
     #[cfg(feature = "ipv4-fragmentation")]
     pub(crate) ipv4_id: u16,
-    /// Set when a socket send failed for lack of a packet buffer or device room.
-    /// `Stack::poll` wakes the send wakers of every packet socket when set.
-    #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+    /// Set when a raw send failed for lack of a packet buffer or device room.
+    /// `Stack::poll` wakes raw senders when set.
+    #[cfg(all(feature = "async", feature = "raw"))]
     pub(crate) tx_starved: bool,
     /// Set when packet materialization observed the general pool empty.
     ///
@@ -160,9 +160,8 @@ impl StackInner {
         packet
     }
 
-    /// Note that a socket send was held back for lack of a packet buffer or
-    /// device room, so `Stack::poll` wakes the packet sockets' send wakers.
-    #[cfg(any(feature = "udp", feature = "raw"))]
+    /// Note that a raw send was held back for lack of a buffer or device room.
+    #[cfg(feature = "raw")]
     pub(crate) fn set_tx_starved(&mut self) {
         #[cfg(feature = "async")]
         {
@@ -460,7 +459,7 @@ impl<'d> Stack<'d> {
                 routes: Routes::new(),
                 #[cfg(feature = "ipv4-fragmentation")]
                 ipv4_id,
-                #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
+                #[cfg(all(feature = "async", feature = "raw"))]
                 tx_starved: false,
                 #[cfg(feature = "async")]
                 packet_allocator_starved: false,
@@ -1077,14 +1076,20 @@ impl<'d> Stack<'d> {
             }
         }
 
-        // Sends held back for lack of a buffer or device room since the last poll
-        // may succeed now: wake their tasks so they retry.
-        #[cfg(all(feature = "async", any(feature = "udp", feature = "raw")))]
-        if core::mem::take(&mut self.inner.tx_starved) {
-            #[cfg(feature = "udp")]
+        #[cfg(all(feature = "async", feature = "udp"))]
+        {
+            let mut cx = TxContext {
+                inner: &mut self.inner,
+                ifaces: &mut self.ifaces,
+            };
             for (_, socket) in self.sockets.udp.iter_mut() {
-                socket.wake_tx();
+                socket.poll_send(&mut cx);
             }
+        }
+
+        // Raw sockets retain their upstream retry behavior.
+        #[cfg(all(feature = "async", feature = "raw"))]
+        if core::mem::take(&mut self.inner.tx_starved) {
             #[cfg(feature = "raw")]
             for (_, socket) in self.sockets.raw.iter_mut() {
                 socket.wake_tx();

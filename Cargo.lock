@@ -478,12 +478,22 @@ dependencies = [
  "libc",
  "log",
  "rand",
- "xarxa-driver",
+ "xarxa-driver 0.1.0 (git+https://github.com/embassy-rs/xarxa?rev=14c369bbcbe8ee7167488ac9c9e18be059d83555)",
 ]
 
 [[package]]
 name = "xarxa-driver"
 version = "0.1.0"
+dependencies = [
+ "critical-section",
+ "defmt",
+ "document-features",
+]
+
+[[package]]
+name = "xarxa-driver"
+version = "0.1.0"
+source = "git+https://github.com/embassy-rs/xarxa?rev=14c369bbcbe8ee7167488ac9c9e18be059d83555#14c369bbcbe8ee7167488ac9c9e18be059d83555"
 dependencies = [
  "critical-section",
  "defmt",

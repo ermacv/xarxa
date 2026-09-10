@@ -12,6 +12,9 @@ pub mod dhcpv4;
 #[cfg(feature = "slaac")]
 pub mod slaac;
 
+#[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+mod arp_reply;
+
 #[cfg(feature = "multicast")]
 pub use crate::multicast::MulticastError;
 
@@ -158,6 +161,8 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
 
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState<'d> {
+    #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+    pub(crate) arp_replies: arp_reply::Replies,
     pub(crate) handle: IfaceHandle,
     pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
     /// The driver's medium, converted and checked when the interface is added.
@@ -570,6 +575,8 @@ impl IfaceState<'_> {
     /// Also keeps the solicited-node multicast groups in step with the addresses,
     /// since every address change passes through here.
     pub(crate) fn config_changed(&mut self) {
+        #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+        self.arp_replies.clear();
         #[cfg(all(
             feature = "multicast",
             any(feature = "medium-ethernet", feature = "medium-ieee802154"),
@@ -627,6 +634,10 @@ impl IfaceState<'_> {
         feature = "medium-ieee802154"
     ))]
     pub(crate) fn can_transmit_new_packet(&mut self) -> bool {
+        #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+        if !self.flush_arp_replies() {
+            return false;
+        }
         #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
         if !self.fragmenter.is_empty() {
             return false;

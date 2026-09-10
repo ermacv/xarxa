@@ -148,3 +148,16 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 _xarxa_ is distributed under the terms of 0-clause BSD license.
 
 See [LICENSE-0BSD](LICENSE-0BSD.txt) for details.
+
+## Maintained backpressure changes
+
+This branch preserves the upstream driver and Embassy contracts. UDP senders
+wait for routed device capacity. ARP replies reuse the received packet owner
+and are retained in a bounded four-entry interface queue on device backpressure.
+Repeated requests for the same peer/local IPv4 pair replace the queued response
+without growing the queue. Distinct excess requests are dropped with a warning;
+RX continues and no extra pool allocation or immediate retry timer is needed.
+Returned device credit serves retained replies before new socket packets. Link
+down, interface removal and configuration changes release retained replies.
+The driver must report capacity changes through its normal wake mechanism.
+This does not add retry storage for other immediate control protocols.

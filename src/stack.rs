@@ -587,6 +587,8 @@ impl<'d> Stack<'d> {
             let _ = ip_addrs.push(ll);
         }
         let index = self.ifaces.add_with(|index| IfaceState {
+            #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+            arp_replies: Default::default(),
             handle: IfaceHandle::new(index),
             driver,
             medium,
@@ -944,6 +946,11 @@ impl<'d> Stack<'d> {
         while let Some(index) = self.ifaces.next_occupied(next) {
             next = index + 1;
             let handle = IfaceHandle::new(index);
+
+            // Retry control owners before timer/socket egress can spend credit.
+            // RX continues even while the control queue is blocked.
+            #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+            self.ifaces.get_mut(index).flush_arp_replies();
 
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             self.poll_neighbor_timers(handle);
@@ -2094,11 +2101,10 @@ impl StackInner {
         );
 
         if operation == ArpOperation::Request {
-            let Some(mut reply) = PacketBuf::try_new() else {
-                trace!("arp: no packet buffer for reply");
-                return;
-            };
-            reply.reserve(ETHERNET_HEADER_LEN);
+            // ARP has no retained payload. Reuse its owner: responding must
+            // not depend on a second free slot in the shared packet pool.
+            let mut reply = buf;
+            *reply.meta_mut() = Default::default();
             reply.set_len(ARP_BUFFER_LEN);
             {
                 let mut arp_reply = ArpPacket::new_unchecked(&mut reply);
@@ -2112,7 +2118,12 @@ impl StackInner {
                 arp_reply.set_target_hardware_addr(source_hardware_addr.as_bytes());
                 arp_reply.set_target_protocol_addr(&source_protocol_addr.octets());
             }
-            self.transmit_ethernet(iface, source_hardware_addr, reply, EthernetProtocol::Arp);
+            reply.push_front(ETHERNET_HEADER_LEN);
+            let mut frame = EthernetFrame::new_unchecked(&mut reply);
+            frame.set_dst_addr(source_hardware_addr);
+            frame.set_src_addr(iface.ethernet_addr());
+            frame.set_ethertype(EthernetProtocol::Arp);
+            iface.queue_arp_reply(source_protocol_addr, target_protocol_addr, reply);
         }
     }
 
@@ -4811,22 +4822,26 @@ pub(crate) mod test {
         assert_eq!(ethertype_of(&tx.borrow()[0]), EthernetProtocol::Arp);
 
         // The neighbor resolves while the device is full: nothing is flushed and
-        // nothing is lost. (The ARP reply we owe is best-effort and is dropped.)
+        // nothing is lost, including the ARP response we owe.
         room.set(Some(0));
         inject(&mut stack, &rx, arp_request_from(remote_hw, REMOTE_V4));
         assert_eq!(tx.borrow().len(), 1);
 
-        // Room for one: the first parked datagram goes out, the second waits.
+        // Returned credit first completes ARP; both parked data owners remain.
         room.set(Some(1));
         stack.poll(Instant::ZERO);
         assert_eq!(tx.borrow().len(), 2);
-        assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Ipv4);
-        assert!(tx.borrow()[1].ends_with(b"one"));
+        assert_eq!(ethertype_of(&tx.borrow()[1]), EthernetProtocol::Arp);
 
-        room.set(None);
+        room.set(Some(1));
         stack.poll(Instant::ZERO);
         assert_eq!(tx.borrow().len(), 3);
-        assert!(tx.borrow()[2].ends_with(b"two"));
+        assert_eq!(ethertype_of(&tx.borrow()[2]), EthernetProtocol::Ipv4);
+        assert!(tx.borrow()[2].ends_with(b"one"));
+        room.set(None);
+        stack.poll(Instant::ZERO);
+        assert_eq!(tx.borrow().len(), 4);
+        assert!(tx.borrow()[3].ends_with(b"two"));
     }
 
     /// TCP holds a segment back while the device is full, leaving the socket as

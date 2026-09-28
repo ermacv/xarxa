@@ -18,8 +18,13 @@ use core::task::Waker;
 #[cfg(feature = "async")]
 use atomic_waker::AtomicWaker;
 #[cfg(feature = "async")]
-use portable_atomic::AtomicBool;
-use portable_atomic::{AtomicU32, Ordering};
+use core::sync::atomic::AtomicBool;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+// Explicit pools claim and release slots with atomic read-modify-write on the
+// bitmap from any core; targets without it (e.g. thumbv6m) are not supported.
+#[cfg(not(target_has_atomic = "32"))]
+compile_error!("explicit packet pools need 32-bit atomic read-modify-write");
 
 use crate::config::PACKET_BUF_SIZE;
 use crate::meta::PacketMeta;

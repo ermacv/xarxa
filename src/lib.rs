@@ -41,6 +41,7 @@ pub mod config;
 pub mod dns;
 #[cfg(feature = "std")]
 pub mod driver_impls;
+pub mod error;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 mod fragmentation;
 #[cfg(feature = "icmp-errors")]
@@ -53,7 +54,7 @@ mod neighbor;
 #[cfg(feature = "packet-log")]
 mod packet_log;
 mod rand;
-#[cfg(feature = "raw")]
+#[cfg(feature = "_raw")]
 pub mod raw;
 #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
 mod reassembly;
@@ -76,9 +77,6 @@ pub mod wire;
 /// The driver interface, re-exported for driver crates and code that names their types.
 pub use xarxa_driver as driver;
 
-#[cfg(feature = "icmp-errors")]
-pub use icmp_error::IcmpError;
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub use neighbor::{Neighbor, NeighborCache, NeighborState};
 pub use stack::{PollBudget, PollOutcome, Stack};
-pub use storage::Full;

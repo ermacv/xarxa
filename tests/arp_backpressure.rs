@@ -8,7 +8,7 @@ use xarxa::{
     },
     time::Instant,
     udp::SendError,
-    wire::{IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address},
+    wire::{IpCidr, Ipv4Addr, ListenSocketAddr, SocketAddr},
 };
 
 #[derive(Default)]
@@ -52,6 +52,11 @@ impl Driver for Device {
         Ok(())
     }
 }
+/// ARP frames the device sent. The link coming back up also rejoins multicast
+/// groups, whose reports are not ARP replies.
+fn arp_frames(state: &RefCell<State>) -> usize {
+    state.borrow().tx.iter().filter(|p| p[12..14] == [0x08, 0x06]).count()
+}
 fn allocator() -> PacketBufAllocator {
     let storage = Box::leak(Box::new(PacketPoolStorage::<16>::new()));
     Box::leak(Box::new(PacketPool::new(storage))).allocator()
@@ -68,6 +73,12 @@ fn request(allocator: PacketBufAllocator, peer: u8) -> PacketBuf {
     p[38..42].copy_from_slice(&[192, 0, 2, 1]);
     p
 }
+/// The stack asks for no poll within the pool retry window: a retained owner
+/// waits for driver credit, not for a timer.
+fn assert_no_pool_retry(deadline: Instant) {
+    assert!(deadline > Instant::from_millis(1), "busy retry deadline {deadline:?}");
+}
+
 #[test]
 fn arp_retains_owner_prioritizes_credit_and_preserves_ingress() {
     let state = Rc::new(RefCell::new(State::default()));
@@ -76,7 +87,7 @@ fn arp_retains_owner_prioritizes_credit_and_preserves_ingress() {
     let iface = stack.add_iface(Box::new(Device(state.clone()))).unwrap();
     stack
         .iface(iface)
-        .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 0, 2, 1).into(), 24))
+        .add_ip_addr(IpCidr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 24))
         .unwrap();
     let original = request(allocator, 2);
     let address = original.as_ptr();
@@ -85,12 +96,12 @@ fn arp_retains_owner_prioritizes_credit_and_preserves_ingress() {
     while let Some(p) = allocator.try_alloc() {
         held.push(p);
     }
-    assert_eq!(stack.poll(Instant::from_millis(0)), Instant::MAX);
+    assert_no_pool_retry(stack.poll(Instant::from_millis(0)));
     assert!(state.borrow().rx.is_empty());
     assert_eq!(state.borrow().attempts, 0);
     assert!(allocator.try_alloc().is_none(), "original request owner is retained");
     for _ in 0..20 {
-        assert_eq!(stack.poll(Instant::from_millis(0)), Instant::MAX);
+        assert_no_pool_retry(stack.poll(Instant::from_millis(0)));
     }
     assert_eq!(state.borrow().attempts, 0, "no busy retry against absent credit");
     state.borrow_mut().credit = 1;
@@ -113,7 +124,7 @@ fn arp_retains_owner_prioritizes_credit_and_preserves_ingress() {
     let socket = stack.add_udp_socket().unwrap();
     stack
         .udp_socket(socket)
-        .bind(1234, IpListenEndpoint::UNSPECIFIED)
+        .bind(1234, ListenSocketAddr::UNSPECIFIED)
         .unwrap();
     // Duplicate requests coalesce; subsequent non-ARP RX is still consumed.
     for _ in 0..3 {
@@ -153,7 +164,7 @@ fn arp_retains_owner_prioritizes_credit_and_preserves_ingress() {
     assert_eq!(
         stack
             .udp_socket(socket)
-            .send_slice(b"data", IpEndpoint::new(Ipv4Address::new(192, 0, 2, 2).into(), 1235)),
+            .send_slice(b"data", SocketAddr::new(Ipv4Addr::new(192, 0, 2, 2).into(), 1235)),
         Err(SendError::DeviceBusy)
     );
     assert_eq!(
@@ -192,17 +203,14 @@ fn arp_retains_owner_prioritizes_credit_and_preserves_ingress() {
     state.borrow_mut().down = false;
     state.borrow_mut().credit = 1;
     stack.poll(Instant::from_millis(4));
-    assert!(state.borrow().tx.is_empty(), "link-down discards old replies");
+    assert_eq!(arp_frames(&state), 0, "link-down discards old replies");
     state.borrow_mut().credit = 0;
     state.borrow_mut().rx.push_back(request(allocator, 2));
     stack.poll(Instant::from_millis(5));
     stack.iface(iface).set_ip_addrs([]).unwrap();
     state.borrow_mut().credit = 1;
     stack.poll(Instant::from_millis(5));
-    assert!(
-        state.borrow().tx.is_empty(),
-        "removed address cannot emit a delayed reply"
-    );
+    assert_eq!(arp_frames(&state), 0, "removed address cannot emit a delayed reply");
 }
 
 #[test]
@@ -216,7 +224,7 @@ fn a_reply_prefers_the_general_pool_and_releases_the_request() {
     let iface = stack.add_iface(Box::new(Device(state.clone()))).unwrap();
     stack
         .iface(iface)
-        .add_ip_addr(IpCidr::new(Ipv4Address::new(192, 0, 2, 1).into(), 24))
+        .add_ip_addr(IpCidr::new(Ipv4Addr::new(192, 0, 2, 1).into(), 24))
         .unwrap();
     let original = request(allocator, 2);
     let address = original.as_ptr();

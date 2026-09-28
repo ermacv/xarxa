@@ -43,7 +43,7 @@ impl<T, const N: usize> BoundedDeque<T, N> {
         self.inner.clear()
     }
 
-    pub fn retain<F: FnMut(&T) -> bool>(&mut self, f: F) {
+    pub fn retain(&mut self, f: impl FnMut(&T) -> bool) {
         self.inner.retain(f)
     }
 

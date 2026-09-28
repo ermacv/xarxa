@@ -8,14 +8,13 @@
 //! completes or expires.
 
 use core::fmt;
-use core::result::Result;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
 use crate::driver::config::PACKET_BUF_SIZE;
 use crate::driver::{PacketBuf, PacketBufAllocator};
 use crate::stack::Stack;
 use crate::storage::Assembler;
-use crate::time::{Duration, Instant};
+use crate::time::{Clock, Duration, Instant};
 use crate::wire::*;
 
 /// Problem when assembling: something was out of bounds, or no packet buffer is free.
@@ -106,17 +105,11 @@ impl<K> PacketAssembler<K> {
         Ok(())
     }
 
-    /// Return the instant when the assembler expires.
-    pub(crate) fn expires_at(&self) -> Instant {
-        self.expires_at
-    }
-
     /// Add a fragment into the packet that is being reassembled.
     ///
     /// # Errors
-    ///
-    /// - Returns [`AssemblerError`] when trying to add data into the buffer at a non-existing
-    ///   place, when the fragments leave more holes than can be tracked, or when no packet
+    /// - `AssemblerError`: if the data goes at a place that does not exist, if
+    ///   the fragments leave more holes than can be tracked, or if no packet
     ///   buffer is free.
     pub(crate) fn add(&mut self, data: &[u8], offset: usize) -> Result<(), AssemblerError> {
         let len = data.len();
@@ -183,7 +176,8 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
     ///
     /// If it doesn't exist, it is created, with the `expires_at` timestamp.
     ///
-    /// If the assembler set is full, in which case an error is returned.
+    /// # Errors
+    /// - `AssemblerFullError`: if the assembler set is full.
     pub(crate) fn get(&mut self, key: &K, expires_at: Instant) -> Result<&mut PacketAssembler<K>, AssemblerFullError> {
         let mut empty_slot = None;
         for slot in &mut self.assemblers {
@@ -202,21 +196,12 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
     }
 
     /// Remove all [`PacketAssembler`]s that are expired.
-    pub fn remove_expired(&mut self, timestamp: Instant) {
+    pub fn remove_expired(&mut self, clock: &mut Clock) {
         for frag in &mut self.assemblers {
-            if !frag.is_free() && frag.expires_at < timestamp {
+            if !frag.is_free() && clock.expired(frag.expires_at) {
                 frag.reset();
             }
         }
-    }
-
-    /// The earliest instant at which an assembler expires, [`Instant::MAX`] if none is in use.
-    pub fn poll_at(&self) -> Instant {
-        self.assemblers
-            .iter()
-            .filter(|frag| !frag.is_free())
-            .map(|frag| frag.expires_at())
-            .fold(Instant::MAX, Instant::min)
     }
 }
 
@@ -226,8 +211,8 @@ impl<K: Eq + Copy> PacketAssemblerSet<K> {
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub(crate) struct Ipv4FragKey {
     id: u16,
-    src_addr: Ipv4Address,
-    dst_addr: Ipv4Address,
+    src_addr: Ipv4Addr,
+    dst_addr: Ipv4Addr,
     protocol: IpProtocol,
 }
 
@@ -291,7 +276,7 @@ impl Stack<'_> {
     /// fragment's IP header in front, patched to describe the whole datagram.
     /// `None` while the packet is incomplete, or if the fragment was dropped.
     #[cfg(feature = "ipv4-reassembly")]
-    pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf) -> Option<PacketBuf> {
+    pub(crate) fn reassemble_ipv4(&mut self, mut buf: PacketBuf, now: Instant) -> Option<PacketBuf> {
         let ipv4_packet = Ipv4Packet::new_unchecked(&mut buf);
 
         let key = FragKey::Ipv4(Ipv4FragKey::of(&ipv4_packet));
@@ -299,7 +284,7 @@ impl Stack<'_> {
         let f = match self
             .fragments
             .assembler
-            .get(&key, self.inner.now + self.fragments.reassembly_timeout)
+            .get(&key, now + self.fragments.reassembly_timeout)
         {
             Ok(f) => f,
             Err(_) => {
@@ -348,6 +333,7 @@ impl Stack<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::time::idle_deadline;
 
     #[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
     struct Key {
@@ -441,13 +427,14 @@ mod tests {
         let mut set = PacketAssemblerSet::new(crate::test_device::packet_allocator());
         let key = Key { id: 0 };
         set.get(&key, Instant::from_secs(10)).unwrap();
-        assert_eq!(set.poll_at(), Instant::from_secs(10));
+        let mut clock = Clock::new(Instant::from_secs(9));
+        set.remove_expired(&mut clock);
+        assert_eq!(clock.next(), Instant::from_secs(10));
 
-        set.remove_expired(Instant::from_secs(10));
-        assert_eq!(set.poll_at(), Instant::from_secs(10));
-
-        set.remove_expired(Instant::from_secs(11));
-        assert_eq!(set.poll_at(), Instant::MAX);
+        // Polling at the deadline removes it.
+        let mut clock = Clock::new(Instant::from_secs(10));
+        set.remove_expired(&mut clock);
+        assert_eq!(clock.next(), idle_deadline(clock.now()));
     }
 
     #[test]

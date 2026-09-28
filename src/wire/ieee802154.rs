@@ -2,8 +2,9 @@
 
 use core::fmt;
 
-use super::{Error, Result, take};
-use crate::wire::Ipv6Address;
+use super::take;
+use crate::error::Malformed;
+use crate::wire::Ipv6Addr;
 
 open_enum! {
     /// IEEE 802.15.4 frame type.
@@ -156,13 +157,13 @@ impl Address {
     /// Convert an extended address to a link-local IPv6 address (RFC 4944 §6).
     ///
     /// Returns `None` for short and absent addresses.
-    pub fn as_link_local_address(&self) -> Option<Ipv6Address> {
+    pub fn as_link_local_address(&self) -> Option<Ipv6Addr> {
         let mut bytes = [0; 16];
         bytes[0] = 0xfe;
         bytes[1] = 0x80;
         bytes[8..].copy_from_slice(&self.as_eui_64()?);
 
-        Some(Ipv6Address::from_octets(bytes))
+        Some(Ipv6Addr::from_octets(bytes))
     }
 }
 
@@ -255,7 +256,7 @@ fn addr_present_flags(
 }
 
 /// Read an address in little-endian byte order.
-fn parse_addr(buf: &[u8], offset: &mut usize, mode: AddressingMode) -> Result<Address> {
+fn parse_addr(buf: &[u8], offset: &mut usize, mode: AddressingMode) -> Result<Address, Malformed> {
     match mode {
         AddressingMode::Absent => Ok(Address::Absent),
         AddressingMode::Short => {
@@ -268,7 +269,7 @@ fn parse_addr(buf: &[u8], offset: &mut usize, mode: AddressingMode) -> Result<Ad
             bytes.reverse();
             Ok(Address::Extended(bytes))
         }
-        _ => Err(Error),
+        _ => Err(Malformed),
     }
 }
 
@@ -295,14 +296,14 @@ impl Repr {
     /// Returns the header and its length, the auxiliary security header
     /// included. The payload starts at that offset.
     ///
-    /// Errors:
-    /// - `Error` if the buffer is shorter than the header, or longer than 127
+    /// # Errors
+    /// - `Malformed`: if the buffer is shorter than the header, or longer than 127
     ///   bytes, or the frame version or an addressing mode is unknown.
-    pub fn parse(buf: &[u8]) -> Result<(Repr, usize)> {
+    pub fn parse(buf: &[u8]) -> Result<(Repr, usize), Malformed> {
         // A frame is at most 127 bytes, and starts with the frame control
         // field and a sequence number.
         if buf.len() < 3 || buf.len() > 127 {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         let fc = u16::from_le_bytes([buf[0], buf[1]]);
@@ -320,7 +321,7 @@ impl Repr {
             frame_version,
             FrameVersion::Ieee802154_2003 | FrameVersion::Ieee802154_2006 | FrameVersion::Ieee802154
         ) {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         // We don't handle unknown addressing modes.
@@ -329,7 +330,7 @@ impl Repr {
                 mode,
                 AddressingMode::Absent | AddressingMode::Short | AddressingMode::Extended
             ) {
-                return Err(Error);
+                return Err(Malformed);
             }
         }
 
@@ -341,7 +342,7 @@ impl Repr {
             && dst_addr_mode == AddressingMode::Absent
             && src_addr_mode == AddressingMode::Absent
         {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         let sequence_number = match frame_type {
@@ -381,7 +382,7 @@ impl Repr {
         if security_enabled {
             // The security control byte, then the frame counter and the key
             // identifier its bits say are there.
-            let b = *buf.get(offset).ok_or(Error)?;
+            let b = *buf.get(offset).ok_or(Malformed)?;
             let frame_counter_suppressed = (b >> 5) & 0b1 == 0b1;
             let key_identifier_len = match (b >> 3) & 0b11 {
                 0 => 0,
@@ -391,7 +392,7 @@ impl Repr {
             };
             offset += 1 + if frame_counter_suppressed { 0 } else { 4 } + key_identifier_len;
             if offset > buf.len() {
-                return Err(Error);
+                return Err(Malformed);
             }
         }
 
@@ -535,6 +536,17 @@ mod test {
     fn test_broadcast() {
         assert!(Address::BROADCAST.is_broadcast());
         assert!(!Address::BROADCAST.is_unicast());
+    }
+
+    /// Only an extended address has an EUI-64: the address with the U/L bit flipped.
+    #[test]
+    fn test_as_eui_64() {
+        assert_eq!(
+            Address::Extended([0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77]).as_eui_64(),
+            Some([0x02, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77])
+        );
+        assert_eq!(Address::Short([0x12, 0x34]).as_eui_64(), None);
+        assert_eq!(Address::Absent.as_eui_64(), None);
     }
 
     /// Emitting a header and parsing it back round-trips, even into a buffer
@@ -700,9 +712,9 @@ mod test {
         ];
         assert!(Repr::parse(&frame).is_ok());
         for len in 0..frame.len() {
-            assert_eq!(Repr::parse(&frame[..len]), Err(Error));
+            assert_eq!(Repr::parse(&frame[..len]), Err(Malformed));
         }
         // Frames longer than 127 bytes are not valid either.
-        assert_eq!(Repr::parse(&[0u8; 128]), Err(Error));
+        assert_eq!(Repr::parse(&[0u8; 128]), Err(Malformed));
     }
 }

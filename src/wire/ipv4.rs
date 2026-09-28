@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::ip::checksum;
 
 pub use super::IpProtocol as Protocol;
@@ -47,12 +47,29 @@ pub(crate) trait AddressExt {
     /// If `self` is a CIDR-compatible subnet mask, return `Some(prefix_len)`,
     /// where `prefix_len` is the number of leading zeroes. Return `None` otherwise.
     fn prefix_len(&self) -> Option<u8>;
+
+    /// The Ethernet address this multicast address maps to (RFC 1112 §6.4).
+    ///
+    /// The mapping drops the top 5 bits of the group, so distinct groups can
+    /// map to the same Ethernet address.
+    ///
+    /// # Panics
+    /// Panics if the address is not multicast.
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress;
 }
 
 impl AddressExt for Address {
     /// Query whether the address is an unicast address.
     fn x_is_unicast(&self) -> bool {
         !(self.is_broadcast() || self.is_multicast() || self.is_unspecified())
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress {
+        assert!(self.is_multicast());
+        let b = self.octets();
+        super::EthernetAddress([0x01, 0x00, 0x5e, b[1] & 0x7F, b[2], b[3]])
     }
 
     fn prefix_len(&self) -> Option<u8> {
@@ -92,15 +109,25 @@ pub struct Cidr {
 impl Cidr {
     /// Create an IPv4 CIDR block from the given address and prefix length.
     ///
+    /// Return `None` if the prefix length is larger than 32.
+    pub const fn try_new(address: Address, prefix_len: u8) -> Option<Self> {
+        if prefix_len <= 32 {
+            Some(Self { address, prefix_len })
+        } else {
+            None
+        }
+    }
+
+    /// Create an IPv4 CIDR block from the given address and prefix length.
+    ///
     /// # Panics
     /// This function panics if the prefix length is larger than 32.
-    pub const fn new(address: Address, prefix_len: u8) -> Cidr {
-        core::assert!(prefix_len <= 32);
-        Cidr { address, prefix_len }
+    pub const fn new(address: Address, prefix_len: u8) -> Self {
+        Self::try_new(address, prefix_len).unwrap()
     }
 
     /// Create an IPv4 CIDR block from the given address and network mask.
-    pub fn from_netmask(addr: Address, netmask: Address) -> Result<Cidr> {
+    pub fn from_netmask(addr: Address, netmask: Address) -> Result<Cidr, Malformed> {
         let netmask = netmask.to_bits();
         if netmask.leading_zeros() == 0 && netmask.trailing_zeros() == netmask.count_zeros() {
             Ok(Cidr {
@@ -108,7 +135,7 @@ impl Cidr {
                 prefix_len: netmask.count_ones() as u8,
             })
         } else {
-            Err(Error)
+            Err(Malformed)
         }
     }
 
@@ -206,36 +233,37 @@ impl<'a> Packet<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    /// Returns `Err(Error)` if the header length is greater
-    /// than total length.
-    /// Returns `Err(Error)` if the header length is less than minimum allowed IHL
     ///
     /// The result of this check is invalidated by calling [set_header_len]
     /// and [set_total_len].
     ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short, if the header length is
+    ///   greater than the total length, or if the header length is less than
+    ///   the minimum allowed IHL.
+    ///
     /// [set_header_len]: #method.set_header_len
     /// [set_total_len]: #method.set_total_len
     #[allow(clippy::if_same_then_else)]
-    pub fn check_len(&self) -> Result<()> {
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
         if len < field::DST_ADDR.end {
-            Err(Error)
+            Err(Malformed)
         } else if len < self.header_len() as usize {
-            Err(Error)
+            Err(Malformed)
         } else if self.header_len() as u16 > self.total_len() {
-            Err(Error)
+            Err(Malformed)
         } else if len < self.total_len() as usize {
-            Err(Error)
+            Err(Malformed)
         } else if self.header_len() < MINIMUM_IHL_BYTES {
-            Err(Error)
+            Err(Malformed)
         } else {
             Ok(())
         }
@@ -543,7 +571,7 @@ pub(crate) mod test {
         let mut bytes = PACKET_BYTES;
         Packet::new_unchecked(&mut bytes).set_total_len(128);
 
-        assert_eq!(Packet::new_checked(&mut bytes).unwrap_err(), Error);
+        assert_eq!(Packet::new_checked(&mut bytes).unwrap_err(), Malformed);
     }
 
     static REPR_PACKET_BYTES: [u8; 24] = [
@@ -555,7 +583,7 @@ pub(crate) mod test {
     fn test_parse_total_len_less_than_header_len() {
         let mut bytes = [0; 40];
         bytes[0] = 0x09;
-        assert_eq!(Packet::new_checked(&mut bytes), Err(Error));
+        assert_eq!(Packet::new_checked(&mut bytes), Err(Malformed));
     }
 
     #[test]
@@ -564,7 +592,7 @@ pub(crate) mod test {
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet.set_header_len(16);
 
-        assert_eq!(Packet::new_checked(&mut bytes), Err(Error));
+        assert_eq!(Packet::new_checked(&mut bytes), Err(Malformed));
     }
 
     #[test]

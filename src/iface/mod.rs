@@ -1,14 +1,16 @@
 //! Network interfaces.
 //!
 //! An interface is a [`Driver`] added to a [`Stack`], together with its
-//! configuration: hardware address, IP addresses, and whatever address
-//! autoconfiguration is turned on for it.
+//! configuration.
 //!
-//! The two autoconfiguration methods are [`dhcpv4`] and [`slaac`], each turned
-//! on per interface and driven by [`Stack::poll`].
+//! Interfaces can be configured manually, or automatically with [`dhcpv4`] or [`slaac`].
+//!
+//! An interface can also hand out addresses itself, as a [`dhcpv4_server`].
 
 #[cfg(feature = "dhcpv4")]
 pub mod dhcpv4;
+#[cfg(feature = "dhcpv4-server")]
+pub mod dhcpv4_server;
 #[cfg(feature = "slaac")]
 pub mod slaac;
 
@@ -21,17 +23,105 @@ pub use crate::multicast::MulticastError;
 use crate::config::{IFACE_ADDR_COUNT, IFACE_COUNT};
 use crate::driver::config::PACKET_BUF_SIZE;
 use crate::driver::{Capabilities, ChecksumCapabilities, Driver, LinkState};
+use crate::error::Full;
 #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
 use crate::fragmentation::Fragmenter;
+#[cfg(any(
+    feature = "udp",
+    feature = "tcp",
+    feature = "_raw",
+    feature = "medium-ethernet",
+    feature = "medium-ieee802154"
+))]
+use crate::stack::Blocked;
+#[cfg(feature = "packetmeta-timestamp")]
+use crate::stack::TxTimestampQueue;
 use crate::stack::{Stack, StackInner};
-use crate::storage::{Full, MaybeBox, Slab, Vec};
-use crate::time::Instant;
+use crate::storage::{MaybeBox, Slab, Vec};
+use crate::time::{Clock, Instant};
 use crate::wire::*;
 
 define_handle! {
     /// A handle to an interface added to a [`Stack`].
     IfaceHandle(crate::config::iface_index)
 }
+
+/// Error returned by [`Stack::add_iface`] and [`Stack::add_iface_borrowed`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddIfaceError {
+    /// The stack has no room for another interface. Only possible without the
+    /// `alloc` feature, where the limit is [`IFACE_COUNT`].
+    Full,
+    /// The build has no `medium-*` feature for the device's medium.
+    UnsupportedMedium,
+    /// The hardware address the device reports is not of the kind its medium
+    /// uses.
+    HardwareAddrMismatch,
+}
+
+impl From<Full> for AddIfaceError {
+    fn from(_: Full) -> Self {
+        AddIfaceError::Full
+    }
+}
+
+impl core::fmt::Display for AddIfaceError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AddIfaceError::Full => f.write_str("full"),
+            AddIfaceError::UnsupportedMedium => f.write_str("unsupported medium"),
+            AddIfaceError::HardwareAddrMismatch => f.write_str("hardware address does not match the medium"),
+        }
+    }
+}
+
+impl core::error::Error for AddIfaceError {}
+
+/// Error returned by [`Iface::add_ip_addr`] and [`Iface::set_ip_addrs`].
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AddrError {
+    /// The address is not unicast: it is unspecified, multicast or broadcast.
+    NotUnicast,
+    /// The interface has no room for another address. Only possible without
+    /// the `alloc` feature, where the limit is [`IFACE_ADDR_COUNT`].
+    Full,
+}
+
+impl From<Full> for AddrError {
+    fn from(_: Full) -> Self {
+        AddrError::Full
+    }
+}
+
+impl core::fmt::Display for AddrError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            AddrError::NotUnicast => f.write_str("not unicast"),
+            AddrError::Full => f.write_str("full"),
+        }
+    }
+}
+
+impl core::error::Error for AddrError {}
+
+/// The interface's medium can not do this.
+///
+/// Returned by [`Iface::set_hardware_addr`] when the address is of another
+/// medium's kind, and by the methods that turn on an address
+/// autoconfiguration the medium does not support.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MediumMismatch;
+
+impl core::fmt::Display for MediumMismatch {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("medium mismatch")
+    }
+}
+
+impl core::error::Error for MediumMismatch {}
 
 /// Type of medium of an interface.
 ///
@@ -116,13 +206,28 @@ pub struct IfaceAddr {
     pub cidr: IpCidr,
     /// Where the address came from.
     pub origin: AddrOrigin,
-    /// When the address stops being preferred and becomes deprecated
-    /// (RFC 4862 section 5.5.4). `None` means "forever".
+    /// Whether the address is preferred or deprecated (RFC 4862 section 5.5.4).
     ///
-    /// Only SLAAC sets this: a router advertises a preferred lifetime alongside
-    /// the valid one, and shortens it to zero to signal that a prefix is on its
-    /// way out while addresses formed from it still work.
-    pub preferred_until: Option<Instant>,
+    /// Only SLAAC sets anything but [`Preferred::Always`]: a router advertises a
+    /// preferred lifetime alongside the valid one, and shortens it to zero to
+    /// signal that a prefix is on its way out while addresses formed from it
+    /// still work.
+    pub preferred: Preferred,
+}
+
+/// Whether an address is preferred, or deprecated.
+///
+/// A deprecated address keeps working for connections that already use it,
+/// but is avoided when a source address is chosen for a new one.
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Preferred {
+    /// Preferred for as long as it is assigned.
+    Always,
+    /// Preferred until this instant, deprecated after it.
+    Until(Instant),
+    /// Deprecated.
+    Never,
 }
 
 impl IfaceAddr {
@@ -131,16 +236,32 @@ impl IfaceAddr {
         Self {
             cidr,
             origin: AddrOrigin::Manual,
-            preferred_until: None,
+            preferred: Preferred::Always,
         }
     }
 
-    /// Whether the address is still preferred, i.e. not deprecated.
+    /// Whether the address is preferred, i.e. not deprecated.
     ///
-    /// A deprecated address keeps working for connections that already use it,
-    /// but is avoided when a source address is chosen for a new one.
-    pub fn is_preferred(&self, now: Instant) -> bool {
-        self.preferred_until.is_none_or(|until| until > now)
+    /// [`Stack::poll`](crate::Stack::poll) turns [`Preferred::Until`] into
+    /// [`Preferred::Never`] once the instant has passed.
+    pub fn is_preferred(&self) -> bool {
+        !matches!(self.preferred, Preferred::Never)
+    }
+}
+
+/// Deprecate the addresses whose preferred lifetime ran out, and count the others
+/// toward the next deadline.
+///
+/// The poll calls this at its start, before anything in it picks a source
+/// address, and at its end, after everything that can refresh a lifetime. Only
+/// the end call's deadline counts.
+pub(crate) fn expire_preferred(addrs: &mut [IfaceAddr], clock: &mut Clock) {
+    for addr in addrs {
+        if let Preferred::Until(until) = addr.preferred
+            && clock.expired(until)
+        {
+            addr.preferred = Preferred::Never;
+        }
     }
 }
 
@@ -153,9 +274,9 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
     bytes[1] = 0x80;
     bytes[8..].copy_from_slice(&hardware_addr.as_eui_64()?);
     Some(IfaceAddr {
-        cidr: IpCidr::new(Ipv6Address::from(bytes).into(), 64),
+        cidr: IpCidr::new(Ipv6Addr::from(bytes).into(), 64),
         origin: AddrOrigin::LinkLocal,
-        preferred_until: None,
+        preferred: Preferred::Always,
     })
 }
 
@@ -167,6 +288,8 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
     /// The driver's medium, converted and checked when the interface is added.
     pub(crate) medium: Medium,
+    /// The driver's capabilities, read when the interface is added.
+    pub(crate) caps: Capabilities,
     pub(crate) hardware_addr: HardwareAddress,
     pub(crate) ip_addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT>,
     /// Bumped whenever the interface's addresses or routes change.
@@ -176,6 +299,8 @@ pub(crate) struct IfaceState<'d> {
     pub(crate) waker: crate::waker::WakerRegistration,
     #[cfg(feature = "dhcpv4")]
     pub(crate) dhcpv4: Option<self::dhcpv4::Client>,
+    #[cfg(feature = "dhcpv4-server")]
+    pub(crate) dhcpv4_server: Option<self::dhcpv4_server::Server>,
     #[cfg(feature = "slaac")]
     pub(crate) slaac: Option<self::slaac::Slaac>,
     /// Link state at the previous poll, for spotting a change.
@@ -212,7 +337,7 @@ impl<'d> Iface<'_, 'd> {
 
     /// The capabilities reported by the device.
     pub fn capabilities(&self) -> Capabilities {
-        self.state().driver.capabilities()
+        self.state().caps.clone()
     }
 
     /// The interface's driver.
@@ -229,19 +354,6 @@ impl<'d> Iface<'_, 'd> {
     /// clamped to what a [`PacketBuf`](crate::driver::PacketBuf) can carry.
     pub fn ip_mtu(&self) -> usize {
         self.state().ip_mtu()
-    }
-
-    /// Poll the device for the timestamp of an already-transmitted packet, sent with
-    /// [`PacketMeta::request_timestamp`](crate::driver::PacketMeta::request_timestamp) set.
-    ///
-    /// Returns `None` if no timestamp is available right now, which is also all a
-    /// device without transmit timestamping support ever returns. See
-    /// [`Driver::poll_tx_timestamp`] for what a caller must tolerate: timestamps
-    /// arrive an arbitrary time after the packet was sent, possibly out of order, and
-    /// possibly never.
-    #[cfg(feature = "packetmeta-timestamp")]
-    pub fn poll_tx_timestamp(&mut self) -> Option<crate::driver::TxTimestamp> {
-        self.state_mut().driver.poll_tx_timestamp()
     }
 
     /// The hardware address of the interface.
@@ -263,15 +375,13 @@ impl<'d> Iface<'_, 'd> {
     /// is accepted, but the stack can not put it in NDISC link-layer address
     /// options, so neighbor discovery does not work with one.
     ///
-    /// # Panics
-    /// Panics if the address is not of the kind the device's medium uses.
-    pub fn set_hardware_addr(&mut self, addr: HardwareAddress) {
-        let medium = self.state().medium();
-        assert_eq!(
-            addr.medium(),
-            medium,
-            "hardware address does not match the interface's medium"
-        );
+    /// # Errors
+    /// - `MediumMismatch`: if the address is not of the kind the interface's
+    ///   medium uses. The interface is left unchanged.
+    pub fn set_hardware_addr(&mut self, addr: HardwareAddress) -> Result<(), MediumMismatch> {
+        if addr.medium() != self.state().medium() {
+            return Err(MediumMismatch);
+        }
         self.state_mut().hardware_addr = addr;
         #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
         {
@@ -287,6 +397,7 @@ impl<'d> Iface<'_, 'd> {
                 self.invalidate();
             }
         }
+        Ok(())
     }
 
     /// The IP addresses assigned to the interface, with their origin.
@@ -295,7 +406,7 @@ impl<'d> Iface<'_, 'd> {
     }
 
     /// Check whether the given address is assigned to the interface.
-    pub fn has_ip_addr(&self, addr: impl Into<IpAddress>) -> bool {
+    pub fn has_ip_addr(&self, addr: impl Into<IpAddr>) -> bool {
         self.state().has_ip_addr(addr)
     }
 
@@ -307,18 +418,15 @@ impl<'d> Iface<'_, 'd> {
     /// destination's subnet, so ordering only matters between addresses of the same
     /// subnet.
     ///
-    /// # Panics
-    /// Panics if the address is not unicast.
-    ///
-    /// Errors:
-    /// - `Full` if the interface has no room for another address. Only possible
+    /// # Errors
+    /// - `NotUnicast`: if the address is not unicast.
+    /// - `Full`: if the interface has no room for another address. Only possible
     ///   without the `alloc` feature, where the limit is
     ///   [`IFACE_ADDR_COUNT`].
-    pub fn add_ip_addr(&mut self, cidr: IpCidr) -> core::result::Result<Option<IpCidr>, Full> {
-        assert!(
-            cidr.address().is_unicast(),
-            "only unicast addresses can be assigned to an interface"
-        );
+    pub fn add_ip_addr(&mut self, cidr: IpCidr) -> Result<Option<IpCidr>, AddrError> {
+        if !cidr.address().is_unicast() {
+            return Err(AddrError::NotUnicast);
+        }
 
         let ip_addrs = &mut self.state_mut().ip_addrs;
         match ip_addrs.iter().position(|old| old.cidr.address() == cidr.address()) {
@@ -329,7 +437,7 @@ impl<'d> Iface<'_, 'd> {
                 Ok(Some(old.cidr))
             }
             None => {
-                ip_addrs.push(IfaceAddr::manual(cidr)).map_err(|_| Full)?;
+                ip_addrs.push(IfaceAddr::manual(cidr)).map_err(|_| AddrError::Full)?;
                 self.state_mut().config_changed();
                 Ok(None)
             }
@@ -338,7 +446,7 @@ impl<'d> Iface<'_, 'd> {
 
     /// Unassign an IP address from the interface, returning the CIDR it was
     /// assigned with, or `None` if it was not assigned.
-    pub fn remove_ip_addr(&mut self, addr: impl Into<IpAddress>) -> Option<IpCidr> {
+    pub fn remove_ip_addr(&mut self, addr: impl Into<IpAddr>) -> Option<IpCidr> {
         let addr = addr.into();
         let ip_addrs = &mut self.state_mut().ip_addrs;
         let index = ip_addrs.iter().position(|a| a.cidr.address() == addr)?;
@@ -352,25 +460,25 @@ impl<'d> Iface<'_, 'd> {
     /// Equivalent to removing every address and adding the given ones. The
     /// automatic IPv6 link-local address is kept.
     ///
-    /// # Panics
-    /// Panics if any of the addresses is not unicast.
+    /// On error the interface is left unchanged.
     ///
-    /// Errors:
-    /// - `Full` if the addresses do not fit. Only possible without the `alloc`
+    /// # Errors
+    /// - `NotUnicast`: if any of the addresses is not unicast.
+    /// - `Full`: if the addresses do not fit. Only possible without the `alloc`
     ///   feature, where the limit is [`IFACE_ADDR_COUNT`].
-    ///   The interface is left unchanged.
-    pub fn set_ip_addrs(&mut self, new_addrs: impl IntoIterator<Item = IpCidr>) -> core::result::Result<(), Full> {
+    pub fn set_ip_addrs(&mut self, new_addrs: impl IntoIterator<Item = IpCidr>) -> Result<(), AddrError> {
         #[allow(unused_mut)]
         let mut addrs: Vec<IfaceAddr, IFACE_ADDR_COUNT> = Vec::new();
-        addrs.try_extend(new_addrs.into_iter().map(IfaceAddr::manual))?;
-        assert!(
-            addrs.iter().all(|a| a.cidr.address().is_unicast()),
-            "only unicast addresses can be assigned to an interface"
-        );
+        for cidr in new_addrs {
+            if !cidr.address().is_unicast() {
+                return Err(AddrError::NotUnicast);
+            }
+            addrs.push(IfaceAddr::manual(cidr)).map_err(|_| AddrError::Full)?;
+        }
         #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
         for a in self.state().ip_addrs.iter() {
             if a.origin == AddrOrigin::LinkLocal && !addrs.iter().any(|n| n.cidr.address() == a.cidr.address()) {
-                addrs.push(*a).map_err(|_| Full)?;
+                addrs.push(*a).map_err(|_| AddrError::Full)?;
             }
         }
 
@@ -419,18 +527,18 @@ impl<'d> Iface<'_, 'd> {
     /// turned off. Turning it on when it is already on restarts it with the new
     /// configuration.
     ///
-    /// # Panics
-    /// Panics if the interface is not an Ethernet interface.
+    /// # Errors
+    /// - `MediumMismatch`: if the interface is not an Ethernet interface.
     #[cfg(feature = "dhcpv4")]
-    pub fn set_dhcpv4(&mut self, config: Option<self::dhcpv4::DhcpConfig>) {
-        assert!(
-            matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)),
-            "the DHCPv4 client needs an Ethernet interface"
-        );
+    pub fn set_dhcpv4(&mut self, config: Option<self::dhcpv4::DhcpConfig>) -> Result<(), MediumMismatch> {
+        if !matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)) {
+            return Err(MediumMismatch);
+        }
         let Iface { inner, ifaces, index } = self;
         let iface = ifaces.get_mut(*index);
         iface.dhcpv4_reset(inner);
         iface.dhcpv4 = config.map(self::dhcpv4::Client::new);
+        Ok(())
     }
 
     /// Turn IPv6 stateless address autoconfiguration on, with the given
@@ -443,18 +551,19 @@ impl<'d> Iface<'_, 'd> {
     /// lifetime runs out or when SLAAC is turned off. Turning it on when it is
     /// already on restarts it.
     ///
-    /// # Panics
-    /// Panics if the interface is not an Ethernet or IEEE 802.15.4 interface.
+    /// # Errors
+    /// - `MediumMismatch`: if the interface is not an Ethernet or IEEE 802.15.4
+    ///   interface.
     #[cfg(feature = "slaac")]
-    pub fn set_slaac(&mut self, config: Option<self::slaac::SlaacConfig>) {
-        assert!(
-            self.state().has_link_layer(),
-            "SLAAC needs an Ethernet or IEEE 802.15.4 interface"
-        );
+    pub fn set_slaac(&mut self, config: Option<self::slaac::SlaacConfig>) -> Result<(), MediumMismatch> {
+        if !self.state().has_link_layer() {
+            return Err(MediumMismatch);
+        }
         let Iface { inner, ifaces, index } = self;
         let iface = ifaces.get_mut(*index);
         iface.slaac_reset(inner);
         iface.slaac = config.map(self::slaac::Slaac::new);
+        Ok(())
     }
 
     /// Solicit routers again, keeping the addresses and routes already configured.
@@ -488,6 +597,65 @@ impl<'d> Iface<'_, 'd> {
     pub fn restart_dhcpv4(&mut self) {
         let Iface { inner, ifaces, index } = self;
         ifaces.get_mut(*index).dhcpv4_reset(inner);
+    }
+
+    /// Turn the DHCPv4 server on, with the given configuration, or off with `None`.
+    ///
+    /// While on, the stack answers DHCP requests arriving on this interface,
+    /// handing out addresses from the configured pool.
+    ///
+    /// You must configure at least one IPv4 address on the interface, and the
+    /// pool must be inside its subnet.
+    ///
+    /// Turning the server off, or on again with a new configuration, drops all
+    /// leases.
+    ///
+    /// On error the server is left as it was.
+    ///
+    /// # Errors
+    /// - `MediumMismatch`: if the interface is not an Ethernet interface.
+    /// - `InvalidPool`: if `pool_end` is below `pool_start`.
+    #[cfg(feature = "dhcpv4-server")]
+    pub fn set_dhcpv4_server(
+        &mut self,
+        config: Option<self::dhcpv4_server::DhcpServerConfig>,
+    ) -> Result<(), self::dhcpv4_server::DhcpServerError> {
+        use self::dhcpv4_server::DhcpServerError;
+
+        if !matches!(self.state().hardware_addr, HardwareAddress::Ethernet(_)) {
+            return Err(DhcpServerError::MediumMismatch);
+        }
+        if let Some(config) = &config
+            && config.pool_start.to_bits() > config.pool_end.to_bits()
+        {
+            return Err(DhcpServerError::InvalidPool);
+        }
+        self.state_mut().dhcpv4_server = config.map(self::dhcpv4_server::Server::new);
+        Ok(())
+    }
+
+    /// The DHCP server's lease table. Empty if the server is off.
+    ///
+    /// All entries are returned, whether their lease is running or already over.
+    /// Check each entry's [`state`](self::dhcpv4_server::DhcpServerLease::state).
+    #[cfg(feature = "dhcpv4-server")]
+    pub fn dhcpv4_server_leases(&self) -> &[self::dhcpv4_server::DhcpServerLease] {
+        match &self.state().dhcpv4_server {
+            Some(server) => server.leases(),
+            None => &[],
+        }
+    }
+
+    /// Remove the DHCP server lease of the given address, freeing it for other
+    /// clients. Returns whether there was one.
+    ///
+    /// The client is not told: it keeps using the address until it next renews.
+    #[cfg(feature = "dhcpv4-server")]
+    pub fn remove_dhcpv4_server_lease(&mut self, address: Ipv4Addr) -> bool {
+        match &mut self.state_mut().dhcpv4_server {
+            Some(server) => server.remove_lease(address),
+            None => false,
+        }
     }
 }
 
@@ -534,7 +702,7 @@ impl IfaceState<'_> {
     /// doesn't do it in software.
     #[allow(dead_code)] // unused depending on which protocols are enabled
     pub(crate) fn checksum_caps(&self) -> ChecksumCapabilities {
-        self.driver.capabilities().checksum
+        self.caps.checksum
     }
 
     /// Whether the interface's medium has link-layer addresses, and so does
@@ -585,6 +753,8 @@ impl IfaceState<'_> {
         if self.has_link_layer() {
             self.update_solicited_node_groups();
         }
+        #[cfg(feature = "medium-ethernet")]
+        self.sync_multicast_filter();
         self.config_generation = self.config_generation.wrapping_add(1);
         #[cfg(feature = "async")]
         self.waker.wake();
@@ -594,7 +764,7 @@ impl IfaceState<'_> {
     /// Ethernet mediums, clamped to what a `PacketBuf` can carry once the
     /// link-layer headroom egress reserves ([`LINK_HEADER_LEN`]) is taken out.
     pub(crate) fn ip_mtu(&self) -> usize {
-        let caps = self.driver.capabilities();
+        let caps = &self.caps;
         let mtu = match self.medium() {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => caps.max_transmission_unit - ETHERNET_HEADER_LEN,
@@ -610,7 +780,7 @@ impl IfaceState<'_> {
     #[cfg(any(
         feature = "udp",
         feature = "tcp",
-        feature = "raw",
+        feature = "_raw",
         feature = "ipv4-fragmentation",
         feature = "sixlowpan-fragmentation",
         feature = "medium-ethernet",
@@ -620,29 +790,44 @@ impl IfaceState<'_> {
         self.driver.can_transmit()
     }
 
+    #[cfg(feature = "packetmeta-timestamp")]
+    pub(crate) fn drain_tx_timestamps(&mut self, timestamps: &mut TxTimestampQueue) {
+        while let Some(timestamp) = self.driver.poll_tx_timestamp() {
+            timestamps.push(timestamp);
+        }
+    }
+
     /// Whether a new packet can be handed to the interface right now.
     ///
-    /// Unlike [`can_transmit`](Self::can_transmit), this is `false` while the
+    /// Unlike [`can_transmit`](Self::can_transmit), this refuses while the
     /// fragments of a packet are still going out: they have first claim on the
     /// device, and a new packet would take their room, or need the fragmenter
-    /// itself.
+    /// itself. The new packet then waits for what the fragments wait for. They
+    /// only stop for a full device or an empty pool, so with room in the device
+    /// it is the pool, and whoever holds the packet back has to retry on its own.
+    /// The device is asked first either way, so a full one wakes the poll task
+    /// once it has room.
     #[cfg(any(
         feature = "udp",
         feature = "tcp",
-        feature = "raw",
+        feature = "_raw",
         feature = "medium-ethernet",
         feature = "medium-ieee802154"
     ))]
-    pub(crate) fn can_transmit_new_packet(&mut self) -> bool {
+    pub(crate) fn can_transmit_new_packet(&mut self) -> Result<(), Blocked> {
+        // Owed ARP replies take returned device room before new egress.
         #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
         if !self.flush_arp_replies() {
-            return false;
+            return Err(Blocked::DeviceBusy);
+        }
+        if !self.can_transmit() {
+            return Err(Blocked::DeviceBusy);
         }
         #[cfg(any(feature = "ipv4-fragmentation", feature = "sixlowpan-fragmentation"))]
         if !self.fragmenter.is_empty() {
-            return false;
+            return Err(Blocked::NoBuffer);
         }
-        self.can_transmit()
+        Ok(())
     }
 
     /// The assigned addresses, without their origin.
@@ -650,20 +835,22 @@ impl IfaceState<'_> {
         self.ip_addrs.iter().map(|a| &a.cidr)
     }
 
-    pub(crate) fn has_ip_addr<T: Into<IpAddress>>(&self, addr: T) -> bool {
+    #[inline(never)] // helps code size
+    pub(crate) fn has_ip_addr(&self, addr: impl Into<IpAddr>) -> bool {
         let addr = addr.into();
         self.cidrs().any(|probe| probe.address() == addr)
     }
 
-    pub(crate) fn in_same_network(&self, addr: &IpAddress) -> bool {
+    #[inline(never)] // helps code size
+    pub(crate) fn in_same_network(&self, addr: &IpAddr) -> bool {
         self.cidrs().any(|cidr| cidr.contains_addr(addr))
     }
 
     /// Get the first IPv4 address of the interface.
     #[cfg(all(feature = "ipv4", any(feature = "icmp-ping-reply", feature = "multicast")))]
-    pub(crate) fn ipv4_addr(&self) -> Option<Ipv4Address> {
+    pub(crate) fn ipv4_addr(&self) -> Option<Ipv4Addr> {
         self.cidrs().find_map(|addr| match *addr {
-            IpCidr::Ipv4(cidr) => Some(cidr.address()),
+            IpCidr::V4(cidr) => Some(cidr.address()),
             #[allow(unreachable_patterns)]
             _ => None,
         })
@@ -684,11 +871,11 @@ impl IfaceState<'_> {
             all(feature = "medium-ieee802154", feature = "icmp-errors")
         )
     ))]
-    pub(crate) fn get_source_address_ipv4(&self, dst_addr: &Ipv4Address) -> Option<Ipv4Address> {
+    pub(crate) fn get_source_address_ipv4(&self, dst_addr: &Ipv4Addr) -> Option<Ipv4Addr> {
         let mut first_ipv4 = None;
         for cidr in self.cidrs() {
             #[allow(irrefutable_let_patterns)]
-            if let IpCidr::Ipv4(cidr) = cidr {
+            if let IpCidr::V4(cidr) = cidr {
                 // Return immediately if we find an address in the same subnet
                 if cidr.contains_addr(dst_addr) {
                     return Some(cidr.address());
@@ -705,60 +892,61 @@ impl IfaceState<'_> {
 
     /// Get a source address for the given destination address.
     #[cfg(any(feature = "udp", feature = "tcp"))]
-    pub(crate) fn get_source_address(&self, dst_addr: &IpAddress, #[allow(unused)] now: Instant) -> Option<IpAddress> {
+    pub(crate) fn get_source_address(&self, dst_addr: &IpAddr) -> Option<IpAddr> {
         match dst_addr {
             #[cfg(feature = "ipv4")]
-            IpAddress::Ipv4(addr) => self.get_source_address_ipv4(addr).map(IpAddress::Ipv4),
+            IpAddr::V4(addr) => self.get_source_address_ipv4(addr).map(IpAddr::V4),
             #[cfg(feature = "ipv6")]
-            IpAddress::Ipv6(addr) => Some(IpAddress::Ipv6(self.get_source_address_ipv6(addr, now))),
+            IpAddr::V6(addr) => Some(IpAddr::V6(self.get_source_address_ipv6(addr))),
         }
     }
 
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154", feature = "udp"))]
-    pub(crate) fn is_broadcast(&self, address: &IpAddress) -> bool {
+    pub(crate) fn is_broadcast(&self, address: &IpAddr) -> bool {
         match address {
             #[cfg(feature = "ipv4")]
-            IpAddress::Ipv4(address) => self.is_broadcast_v4(*address),
+            IpAddr::V4(address) => self.is_broadcast_v4(*address),
             #[cfg(feature = "ipv6")]
-            IpAddress::Ipv6(_) => false,
+            IpAddr::V6(_) => false,
         }
     }
 
     /// Checks if an address is broadcast, taking into account ipv4 subnet-local
     /// broadcast addresses.
     #[cfg(feature = "ipv4")]
-    pub(crate) fn is_broadcast_v4(&self, address: Ipv4Address) -> bool {
+    pub(crate) fn is_broadcast_v4(&self, address: Ipv4Addr) -> bool {
         if address.is_broadcast() {
             return true;
         }
 
         self.cidrs()
             .filter_map(|own_cidr| match own_cidr {
-                IpCidr::Ipv4(own_ip) => Some(own_ip.broadcast()?),
+                IpCidr::V4(own_ip) => Some(own_ip.broadcast()?),
                 #[cfg(feature = "ipv6")]
-                IpCidr::Ipv6(_) => None,
+                IpCidr::V6(_) => None,
             })
             .any(|broadcast_address| address == broadcast_address)
     }
 
     /// Checks if an ipv4 address is unicast, taking into account subnet broadcast addresses
     #[cfg(feature = "ipv4")]
-    pub(crate) fn is_unicast_v4(&self, address: Ipv4Address) -> bool {
+    #[inline(never)] // helps code size
+    pub(crate) fn is_unicast_v4(&self, address: Ipv4Addr) -> bool {
         address.x_is_unicast() && !self.is_broadcast_v4(address)
     }
 
-    /// Determine if the given `Ipv6Address` is the solicited node
+    /// Determine if the given `Ipv6Addr` is the solicited node
     /// multicast address for a IPv6 addresses assigned to the interface.
     /// See [RFC 4291 § 2.7.1] for more details.
     ///
     /// [RFC 4291 § 2.7.1]: https://tools.ietf.org/html/rfc4291#section-2.7.1
     #[cfg(feature = "ipv6")]
-    pub(crate) fn has_solicited_node(&self, addr: Ipv6Address) -> bool {
+    pub(crate) fn has_solicited_node(&self, addr: Ipv6Addr) -> bool {
         self.cidrs().any(|cidr| {
             match *cidr {
-                IpCidr::Ipv6(cidr) if cidr.address() != Ipv6Address::LOCALHOST => {
+                IpCidr::V6(cidr) if cidr.address() != Ipv6Addr::LOCALHOST => {
                     // Take the lower order 24 bits of the IPv6 address and
                     // append those bits to FF02:0:0:0:0:1:FF00::/104.
                     addr.is_solicited_node_multicast() && addr.octets()[13..] == cidr.address().octets()[13..]
@@ -769,7 +957,7 @@ impl IfaceState<'_> {
     }
 
     /// Check whether the interface listens to given destination multicast IP address.
-    pub(crate) fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
+    pub(crate) fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
         let addr = addr.into();
 
         #[cfg(feature = "multicast")]
@@ -779,17 +967,66 @@ impl IfaceState<'_> {
 
         match addr {
             #[cfg(feature = "ipv4")]
-            IpAddress::Ipv4(key) => key == IPV4_MULTICAST_ALL_SYSTEMS,
+            IpAddr::V4(key) => key == IPV4_MULTICAST_ALL_SYSTEMS,
             #[cfg(feature = "ipv6")]
-            IpAddress::Ipv6(key) => key == IPV6_LINK_LOCAL_ALL_NODES || self.has_solicited_node(key),
+            IpAddr::V6(key) => key == IPV6_LINK_LOCAL_ALL_NODES || self.has_solicited_node(key),
         }
+    }
+
+    /// Report the multicast hardware addresses the interface listens on to the
+    /// driver's filter: the groups every host is in, the solicited-node group of
+    /// each assigned IPv6 address, and the joined groups. The driver gets the
+    /// whole list every time, changed or not: keeping the last list to compare
+    /// against would cost every interface a copy of it, for calls that only
+    /// happen on configuration changes.
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn sync_multicast_filter(&mut self) {
+        if self.medium() != Medium::Ethernet {
+            return;
+        }
+
+        // Worst-case size of the set.
+        const MAX_COUNT: usize = crate::config::MULTICAST_GROUP_COUNT + crate::config::IFACE_ADDR_COUNT + 2;
+
+        let mut desired: Vec<[u8; 6], MAX_COUNT> = Vec::new();
+        let mut push = |addr: EthernetAddress| {
+            if !desired.contains(&addr.0) && desired.push(addr.0).is_err() {
+                warn!("iface: multicast filter table full, address not reported to the driver");
+            }
+        };
+
+        #[cfg(feature = "ipv4")]
+        push(IPV4_MULTICAST_ALL_SYSTEMS.multicast_ethernet_addr());
+        #[cfg(feature = "ipv6")]
+        push(IPV6_LINK_LOCAL_ALL_NODES.multicast_ethernet_addr());
+
+        // The solicited-node groups follow the assigned addresses. With `multicast`
+        // they are also joined as regular groups, but ingress accepts them even if
+        // the group table had no room for one, so derive them from the addresses
+        // directly rather than trusting the group table.
+        #[cfg(feature = "ipv6")]
+        for cidr in self.cidrs() {
+            #[allow(irrefutable_let_patterns)]
+            if let IpCidr::V6(cidr) = cidr
+                && cidr.address() != Ipv6Addr::LOCALHOST
+            {
+                push(cidr.address().solicited_node().multicast_ethernet_addr());
+            }
+        }
+
+        #[cfg(feature = "multicast")]
+        for group in self.multicast.active_groups() {
+            push(group.multicast_ethernet_addr());
+        }
+
+        self.driver.set_multicast_filter(&desired);
     }
 
     /// Get the first link-local IPv6 address of the interface, if present.
     #[cfg(any(feature = "slaac", all(feature = "ipv6", feature = "multicast")))]
-    pub(crate) fn link_local_ipv6_address(&self) -> Option<Ipv6Address> {
+    pub(crate) fn link_local_ipv6_address(&self) -> Option<Ipv6Addr> {
         self.cidrs().find_map(|cidr| match *cidr {
-            IpCidr::Ipv6(cidr) if cidr.address().is_link_local() => Some(cidr.address()),
+            IpCidr::V6(cidr) if cidr.address().is_link_local() => Some(cidr.address()),
             _ => None,
         })
     }
@@ -800,11 +1037,11 @@ impl IfaceState<'_> {
     /// # Panics
     /// This function panics if the destination address is unspecified.
     #[cfg(feature = "ipv6")]
-    pub(crate) fn get_source_address_ipv6(&self, dst_addr: &Ipv6Address, now: Instant) -> Ipv6Address {
+    pub(crate) fn get_source_address_ipv6(&self, dst_addr: &Ipv6Addr) -> Ipv6Addr {
         assert!(!dst_addr.is_unspecified());
 
         // See RFC 6724 Section 4: Candidate source address
-        fn is_candidate_source_address(dst_addr: &Ipv6Address, src_addr: &Ipv6Address) -> bool {
+        fn is_candidate_source_address(dst_addr: &Ipv6Addr, src_addr: &Ipv6Addr) -> bool {
             // For all multicast and link-local destination addresses, the candidate address MUST
             // only be an address from the same link.
             if dst_addr.is_link_local() && !src_addr.is_link_local() {
@@ -830,7 +1067,7 @@ impl IfaceState<'_> {
         }
 
         // See RFC 6724 Section 2.2: Common Prefix Length
-        fn common_prefix_length(dst_addr: &Ipv6Cidr, src_addr: &Ipv6Address) -> usize {
+        fn common_prefix_length(dst_addr: &Ipv6Cidr, src_addr: &Ipv6Addr) -> usize {
             let addr = dst_addr.address();
             let mut bits = 0;
             for (l, r) in addr.octets().iter().zip(src_addr.octets().iter()) {
@@ -852,18 +1089,18 @@ impl IfaceState<'_> {
         fn ipv6_candidate(addr: &IfaceAddr) -> Option<(&IfaceAddr, &Ipv6Cidr)> {
             match &addr.cidr {
                 #[cfg(feature = "ipv4")]
-                IpCidr::Ipv4(_) => None,
-                IpCidr::Ipv6(cidr) => Some((addr, cidr)),
+                IpCidr::V4(_) => None,
+                IpCidr::V6(cidr) => Some((addr, cidr)),
             }
         }
 
         // If the destination address is a loopback address, or when there are no IPv6 addresses in
         // the interface, then the loopback address is the only candidate source address.
         if dst_addr.is_loopback() {
-            return Ipv6Address::LOCALHOST;
+            return Ipv6Addr::LOCALHOST;
         }
         let Some((mut candidate, mut candidate_cidr)) = self.ip_addrs.iter().find_map(ipv6_candidate) else {
-            return Ipv6Address::LOCALHOST;
+            return Ipv6Addr::LOCALHOST;
         };
 
         // See RFC 6724 Section 5: Source Address Selection. The rules are a priority
@@ -874,8 +1111,7 @@ impl IfaceState<'_> {
         fn prefer(
             (candidate, candidate_cidr): (&IfaceAddr, &Ipv6Cidr),
             (addr, cidr): (&IfaceAddr, &Ipv6Cidr),
-            dst_addr: &Ipv6Address,
-            now: Instant,
+            dst_addr: &Ipv6Addr,
         ) -> bool {
             // Rule 1: prefer the address that is the same as the output destination address.
             if cidr.address() == *dst_addr {
@@ -905,8 +1141,8 @@ impl IfaceState<'_> {
             // address wins even when a deprecated one matches more closely. It sits
             // below rules 1 and 2, so it cannot hand back an address of the wrong
             // scope, nor pass over the destination address itself.
-            if candidate.is_preferred(now) != addr.is_preferred(now) {
-                return addr.is_preferred(now);
+            if candidate.is_preferred() != addr.is_preferred() {
+                return addr.is_preferred();
             }
 
             // Rule 4: prefer home addresses (TODO)
@@ -923,7 +1159,7 @@ impl IfaceState<'_> {
                 continue;
             }
 
-            if prefer((candidate, candidate_cidr), (addr, cidr), dst_addr, now) {
+            if prefer((candidate, candidate_cidr), (addr, cidr), dst_addr) {
                 (candidate, candidate_cidr) = (addr, cidr);
             }
         }

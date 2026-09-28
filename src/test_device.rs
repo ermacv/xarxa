@@ -57,6 +57,9 @@ pub type Room = Rc<Cell<Option<usize>>>;
 /// Control over the link state the device reports, shared with the test.
 pub type Link = Rc<Cell<LinkState>>;
 
+/// The multicast filter updates reported so far, oldest first. `true` is add.
+pub type McastFilter = Rc<RefCell<Vec<Vec<[u8; 6]>>>>;
+
 /// A mock network device.
 ///
 /// Build one with [`TestDevice::new`] plus the `with_*` setters, then give it to
@@ -84,6 +87,8 @@ pub struct TestDevice {
     pub hardware_addr: HardwareAddress,
     /// The link state it reports.
     pub link: Link,
+    /// Multicast filter lists the stack set, oldest first.
+    pub mcast_filter: McastFilter,
     /// Metadata stamped onto every received packet.
     #[cfg(feature = "packetmeta-id")]
     pub rx_meta: PacketMeta,
@@ -108,6 +113,7 @@ impl TestDevice {
             #[cfg(feature = "packetmeta-id")]
             tx_meta: Rc::new(RefCell::new(Vec::new())),
             room: Rc::new(Cell::new(None)),
+            mcast_filter: Rc::new(RefCell::new(Vec::new())),
             hardware_addr: match medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => {
@@ -225,5 +231,9 @@ impl Driver for TestDevice {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         self.tx_stamps.pop_front()
+    }
+
+    fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
+        self.mcast_filter.borrow_mut().push(addrs.to_vec());
     }
 }

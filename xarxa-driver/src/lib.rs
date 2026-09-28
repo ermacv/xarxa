@@ -87,39 +87,32 @@ impl HardwareAddress {
     }
 }
 
-/// A description of checksum behavior for a particular protocol.
+/// Checksum offload capabilities for a given protocol, per direction.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum Checksum {
-    /// Verify checksum when receiving and compute checksum when sending.
-    #[default]
-    Both,
-    /// Verify checksum when receiving.
-    Rx,
-    /// Compute checksum before sending.
-    Tx,
-    /// Ignore checksum completely.
-    None,
+pub struct ChecksumOffload {
+    /// The device verifies the checksum of received packets.
+    ///
+    /// The stack then does not verify it in software.
+    pub rx: bool,
+    /// The device fills in the checksum of transmitted packets.
+    ///
+    /// The stack then writes the field as zero instead of computing it.
+    pub tx: bool,
 }
 
-impl Checksum {
-    /// Whether the checksum should be verified when receiving.
-    pub fn rx(&self) -> bool {
-        matches!(*self, Checksum::Both | Checksum::Rx)
-    }
-
-    /// Whether the checksum should be computed when sending.
-    pub fn tx(&self) -> bool {
-        matches!(*self, Checksum::Both | Checksum::Tx)
-    }
+impl ChecksumOffload {
+    /// No offload. The stack computes and verifies the checksum in software.
+    pub const NONE: Self = Self { rx: false, tx: false };
+    /// Offload in both directions.
+    pub const BOTH: Self = Self { rx: true, tx: true };
 }
 
-/// A description of checksum behavior for every supported protocol.
+/// Checksum offload capabilities per protocol direction.
 ///
-/// This is what a device uses to tell the stack which checksums its hardware
-/// takes care of, so the stack doesn't compute them again in software.
+/// The stack skips the offloaded work in software.
 ///
-/// The default is [`Checksum::Both`] for every protocol: the stack computes and
+/// The default is no offload for every protocol: the stack computes and
 /// verifies everything itself.
 ///
 /// A checksum the stack does not compute is written as zero, so that a device
@@ -131,28 +124,30 @@ impl Checksum {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct ChecksumCapabilities {
-    /// Checksum behavior for the IPv4 header.
-    pub ipv4: Checksum,
-    /// Checksum behavior for UDP.
-    pub udp: Checksum,
-    /// Checksum behavior for TCP.
-    pub tcp: Checksum,
-    /// Checksum behavior for ICMPv4.
-    pub icmpv4: Checksum,
-    /// Checksum behavior for ICMPv6.
-    pub icmpv6: Checksum,
+    /// Offload for the IPv4 header checksum.
+    pub ipv4: ChecksumOffload,
+    /// Offload for the UDP checksum.
+    pub udp: ChecksumOffload,
+    /// Offload for the TCP checksum.
+    pub tcp: ChecksumOffload,
+    /// Offload for the ICMPv4 checksum.
+    pub icmpv4: ChecksumOffload,
+    /// Offload for the ICMPv6 checksum.
+    pub icmpv6: ChecksumOffload,
 }
 
 impl ChecksumCapabilities {
-    /// Checksum behavior that results in not computing or verifying checksums
-    /// for any of the supported protocols.
-    pub fn ignored() -> Self {
+    /// Every checksum offloaded in both directions.
+    ///
+    /// The stack computes and verifies nothing. Use this for devices where
+    /// checksums don't matter, like loopback.
+    pub fn all_offloaded() -> Self {
         ChecksumCapabilities {
-            ipv4: Checksum::None,
-            udp: Checksum::None,
-            tcp: Checksum::None,
-            icmpv4: Checksum::None,
-            icmpv6: Checksum::None,
+            ipv4: ChecksumOffload::BOTH,
+            udp: ChecksumOffload::BOTH,
+            tcp: ChecksumOffload::BOTH,
+            icmpv4: ChecksumOffload::BOTH,
+            icmpv6: ChecksumOffload::BOTH,
         }
     }
 }
@@ -182,11 +177,10 @@ pub struct Capabilities {
     /// by this function.
     pub max_transmission_unit: usize,
 
-    /// Checksum behavior.
+    /// Checksum offload.
     ///
-    /// If the network device is capable of verifying or computing checksums for some
-    /// protocols, it can request that the stack not do so in software to improve
-    /// performance.
+    /// Which checksums the device's hardware verifies or computes, so the
+    /// stack skips them in software.
     pub checksum: ChecksumCapabilities,
 }
 
@@ -226,19 +220,22 @@ pub trait Driver {
     /// Register a waker.
     ///
     /// The driver must wake it when:
-    /// - a frame has been received, so [`receive`](Self::receive) may return `Some`,
-    /// - there is room to transmit again, after [`can_transmit`](Self::can_transmit) returned `false`,
-    /// - the link state changed, so [`link_state`](Self::link_state) may return something new.
+    /// - a frame has been received, so [`receive`](Self::receive) may return `Some`.
+    /// - there is room to transmit again, after [`can_transmit`](Self::can_transmit)
+    ///   returned `false`.
+    /// - the link state changed, so [`link_state`](Self::link_state) may return
+    ///   something new.
     ///
     /// Only one waker is kept. Registering another replaces it. Wakes are
     /// allowed to be spurious.
     ///
-    /// A registered waker is woken just one. The main loop must re-register it if
-    /// it wants to be woken again.
+    /// A registered waker is woken just once. The main loop must register it
+    /// again if it wants to be woken again.
     ///
-    /// Drivers that cannot wake anything return `Err(NotSupported)`, which is the
-    /// default implementation. Such a driver can only be polled, so a caller that
-    /// needs to sleep until the driver has something new cannot use it.
+    /// # Errors
+    /// - `NotSupported`: if the driver cannot wake anything. This is the default
+    ///   implementation. Such a driver can only be polled, so a caller that
+    ///   needs to sleep until the driver has something new cannot use it.
     #[cfg(feature = "async")]
     fn register_waker(&mut self, waker: &Waker) -> Result<(), NotSupported> {
         let _ = waker;
@@ -262,6 +259,9 @@ pub trait Driver {
     ///
     /// If this returns `true`, the next `transmit()` call must not fail.
     ///
+    /// If this returns `false`, the driver must wake the waker from
+    /// `register_waker` once there is room again.
+    ///
     /// In devices where there's no queue so transmit always succeeds, this
     /// should always return `true`.
     fn can_transmit(&mut self) -> bool;
@@ -269,8 +269,6 @@ pub trait Driver {
     /// Queue a frame for transmission, transferring ownership of the buffer to the driver.
     ///
     /// The driver holds the buffer until the hardware is done with it, then drops it.
-    /// If the frame cannot be queued right now (device busy or queue full), the buffer
-    /// is handed back in the `Err` variant.
     ///
     /// The buffer's [`PacketMeta`] is whatever the sending socket attached to the
     /// packet (default for packets the stack generates itself). A driver that
@@ -278,6 +276,10 @@ pub trait Driver {
     /// [`request_timestamp`](PacketMeta::request_timestamp) is set, and reports
     /// the result from [`poll_tx_timestamp`](Self::poll_tx_timestamp) tagged with the
     /// packet's [`id`](PacketMeta::id).
+    ///
+    /// # Errors
+    /// - `PacketBuf`: the buffer itself, handed back if the frame cannot be
+    ///   queued right now (device busy or queue full).
     fn transmit(&mut self, buf: PacketBuf) -> Result<(), PacketBuf>;
 
     /// Poll for the timestamp of an already-transmitted packet.
@@ -304,6 +306,28 @@ pub trait Driver {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         None
+    }
+
+    /// Set the device's multicast hardware address filter.
+    ///
+    /// `addrs` is the full list of multicast MAC addresses to listen on. It
+    /// replaces the previous one.
+    ///
+    /// A device with no multicast filter can ignore the calls, which
+    /// is the default implementation.
+    ///
+    /// Only called for [`Medium::Ethernet`] devices. The list has no duplicates.
+    ///
+    /// It may be the same list as last time: the stack does not compare. If
+    /// applying the filter is expensive, the driver should should keep the last
+    /// list and skip if there were no changes.
+    ///
+    /// If the list does not fit the filter, receive the addresses anyway if
+    /// possible, for example by turning the filter off or switching it to
+    /// receive all multicast. Losing filter efficiency is fine, filtering out
+    /// traffic the network stack wants is not.
+    fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
+        let _ = addrs;
     }
 }
 
@@ -333,5 +357,8 @@ impl<T: Driver + ?Sized> Driver for &mut T {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         T::poll_tx_timestamp(self)
+    }
+    fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
+        T::set_multicast_filter(self, addrs)
     }
 }

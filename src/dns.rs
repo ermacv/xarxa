@@ -15,14 +15,15 @@ use core::cmp::min;
 use core::task::Waker;
 
 use crate::config::{DNS_MAX_NAME_SIZE, DNS_MAX_QUERY_COUNT, DNS_MAX_RESULT_COUNT, DNS_MAX_SERVER_COUNT};
-use crate::storage::{Full, Slab};
+use crate::error::{Full, Malformed};
+use crate::storage::Slab;
 use heapless::Vec;
 
 use crate::stack::Stack;
-use crate::time::{Duration, Instant};
+use crate::time::{Clock, Duration, Instant};
 use crate::udp::{RecvError, SendError, UdpHandle};
 use crate::wire::dns::{Flags, HEADER_LEN, Opcode, Packet, Question, Rcode, Record, RecordData, Type};
-use crate::wire::{self, IpAddress, IpEndpoint, IpListenEndpoint};
+use crate::wire::{IpAddr, ListenSocketAddr, SocketAddr};
 
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
@@ -34,10 +35,10 @@ const MAX_RETRANSMIT_DELAY: Duration = Duration::from_millis(10_000);
 const RETRANSMIT_TIMEOUT: Duration = Duration::from_millis(10_000); // Should generally be 2-10 secs
 
 #[cfg(all(feature = "mdns", feature = "ipv6"))]
-const MDNS_IPV6_ADDR: IpAddress = IpAddress::Ipv6(crate::wire::Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb));
+const MDNS_IPV6_ADDR: IpAddr = IpAddr::V6(crate::wire::Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0xfb));
 
 #[cfg(all(feature = "mdns", feature = "ipv4"))]
-const MDNS_IPV4_ADDR: IpAddress = IpAddress::Ipv4(crate::wire::Ipv4Address::new(224, 0, 0, 251));
+const MDNS_IPV4_ADDR: IpAddr = IpAddr::V4(crate::wire::Ipv4Addr::new(224, 0, 0, 251));
 
 /// Error returned by [`DnsClient::start_query`].
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -138,7 +139,7 @@ pub enum MulticastDns {
 
 #[derive(Debug)]
 struct CompletedQuery {
-    addresses: Vec<IpAddress, DNS_MAX_RESULT_COUNT>,
+    addresses: Vec<IpAddr, DNS_MAX_RESULT_COUNT>,
 }
 
 define_handle! {
@@ -153,7 +154,7 @@ define_handle! {
 #[derive(Debug)]
 pub struct DnsClient {
     socket: UdpHandle,
-    servers: Vec<IpAddress, DNS_MAX_SERVER_COUNT>,
+    servers: Vec<IpAddr, DNS_MAX_SERVER_COUNT>,
     queries: Slab<DnsQuery, DNS_MAX_QUERY_COUNT>,
 }
 
@@ -163,15 +164,15 @@ impl DnsClient {
     /// Creates and binds a UDP socket in `stack`.
     /// Truncates the server list if `servers.len() > DNS_MAX_SERVER_COUNT`.
     ///
-    /// Errors:
-    /// - `Full` if the stack has no room for another UDP socket.
-    pub fn new(stack: &mut Stack, servers: &[IpAddress]) -> core::result::Result<DnsClient, Full> {
+    /// # Errors
+    /// - `Full`: if the stack has no room for another UDP socket.
+    pub fn new(stack: &mut Stack, servers: &[IpAddr]) -> Result<DnsClient, Full> {
         let truncated_servers = &servers[..min(servers.len(), DNS_MAX_SERVER_COUNT)];
 
         let socket = stack.add_udp_socket()?;
         // A fresh socket on an ephemeral port: can only fail if the whole
         // ephemeral range is taken.
-        unwrap!(stack.udp_socket(socket).bind(0, IpListenEndpoint::UNSPECIFIED));
+        unwrap!(stack.udp_socket(socket).bind(0, ListenSocketAddr::UNSPECIFIED));
 
         Ok(DnsClient {
             socket,
@@ -197,7 +198,7 @@ impl DnsClient {
     /// Update the list of DNS servers, will replace all existing servers
     ///
     /// Truncates the server list if `servers.len() > DNS_MAX_SERVER_COUNT`.
-    pub fn update_servers(&mut self, servers: &[IpAddress]) {
+    pub fn update_servers(&mut self, servers: &[IpAddr]) {
         if servers.len() > DNS_MAX_SERVER_COUNT {
             trace!("Max DNS Servers exceeded. Increase DNS_MAX_SERVER_COUNT");
             self.servers = Vec::from_slice(&servers[..DNS_MAX_SERVER_COUNT]).unwrap();
@@ -267,6 +268,8 @@ impl DnsClient {
     /// Start a query with a raw (wire-format) DNS name, such as
     /// `b"\x09rust-lang\x03org\x00"`.
     ///
+    /// With the `mdns` feature, names ending in `.local` are sent with multicast DNS.
+    ///
     /// You probably want to use [`start_query`](Self::start_query) instead.
     pub fn start_query_raw(
         &mut self,
@@ -285,6 +288,7 @@ impl DnsClient {
                 txid,
                 delay: RETRANSMIT_DELAY,
                 timeout_at: None,
+                // Set by the first poll, along with `timeout_at`.
                 retransmit_at: Instant::ZERO,
                 server_idx: 0,
                 mdns,
@@ -305,7 +309,7 @@ impl DnsClient {
     pub fn get_query_result(
         &mut self,
         handle: DnsQueryHandle,
-    ) -> Result<Vec<IpAddress, DNS_MAX_RESULT_COUNT>, GetQueryResultError> {
+    ) -> Result<Vec<IpAddr, DNS_MAX_RESULT_COUNT>, GetQueryResultError> {
         let q = self.queries.get_mut(handle.index());
         match &mut q.state {
             // Query is not done yet.
@@ -345,18 +349,19 @@ impl DnsClient {
 
     /// Advance the client: process received responses and send due queries.
     ///
-    /// Uses the time of the last `Stack::poll`.
+    /// `now` is the current time.
     ///
-    /// Returns the next time `poll` should be called to retransmit a query, or
-    /// [`Instant::MAX`] if no query is pending. Call it after every [`Stack::poll`],
-    /// and again when that deadline arrives.
+    /// Returns the next time `poll` should be called to retransmit a query or try
+    /// the next server, or one day after `now` if no query is pending. It is always
+    /// later than `now`. Call it after every [`Stack::poll`], and again when that
+    /// deadline arrives.
     #[must_use]
-    pub fn poll(&mut self, stack: &mut Stack) -> Instant {
+    pub fn poll(&mut self, stack: &mut Stack, now: Instant) -> Instant {
         self.process(stack);
-        self.dispatch(stack)
+        self.dispatch(stack, now)
     }
 
-    fn accepts(&self, remote: IpEndpoint) -> bool {
+    fn accepts(&self, remote: SocketAddr) -> bool {
         (remote.port == DNS_PORT && self.servers.contains(&remote.addr)) || (remote.port == MDNS_DNS_PORT)
     }
 
@@ -369,7 +374,7 @@ impl DnsClient {
                 Err(_) => continue,
             };
 
-            let remote = pkt.meta().endpoint;
+            let remote = pkt.meta().remote_addr;
             if !self.accepts(remote) {
                 trace!("dns packet from unexpected source {}", remote);
                 continue;
@@ -518,9 +523,9 @@ impl DnsClient {
         }
     }
 
-    fn dispatch(&mut self, stack: &mut Stack) -> Instant {
-        let now = stack.inner.now;
-        let mut next_poll_at = Instant::MAX;
+    fn dispatch(&mut self, stack: &mut Stack, now: Instant) -> Instant {
+        let now = now;
+        let mut clock = Clock::new(now);
 
         for (_, q) in self.queries.iter_mut() {
             if let State::Pending(pq) = &mut q.state {
@@ -538,19 +543,22 @@ impl DnsClient {
                     MulticastDns::Disabled => self.servers.as_slice(),
                 };
 
-                let timeout = if let Some(timeout) = pq.timeout_at {
+                let mut timeout = if let Some(timeout) = pq.timeout_at {
                     timeout
                 } else {
+                    // Not sent yet: the first query goes out now.
                     let v = now + RETRANSMIT_TIMEOUT;
                     pq.timeout_at = Some(v);
+                    pq.retransmit_at = now;
                     v
                 };
 
                 // Check timeout
-                if timeout < now {
+                if timeout <= now {
                     // DNS timeout
-                    pq.timeout_at = Some(now + RETRANSMIT_TIMEOUT);
-                    pq.retransmit_at = Instant::ZERO;
+                    timeout = now + RETRANSMIT_TIMEOUT;
+                    pq.timeout_at = Some(timeout);
+                    pq.retransmit_at = now;
                     pq.delay = RETRANSMIT_DELAY;
 
                     // Try next server. We check below whether we've tried all servers.
@@ -570,9 +578,9 @@ impl DnsClient {
                     continue;
                 }
 
-                if pq.retransmit_at > now {
+                if !clock.expired(pq.retransmit_at) {
                     // query is waiting for retransmit
-                    next_poll_at = next_poll_at.min(pq.retransmit_at);
+                    clock.schedule(timeout);
                     continue;
                 }
 
@@ -599,41 +607,39 @@ impl DnsClient {
                     MulticastDns::Disabled => DNS_PORT,
                 };
 
-                let dst = IpEndpoint::new(servers[pq.server_idx], dst_port);
+                let dst = SocketAddr::new(servers[pq.server_idx], dst_port);
 
                 trace!("sending {} octets to {}", payload.len(), dst);
 
                 match stack.udp_socket(self.socket).send_slice(payload, dst) {
                     Ok(()) => {}
-                    Err(SendError::NoBuffer) => {
-                        // Transient: treat it as a lost query, the retransmit
-                        // timer below sends it again.
-                        trace!("send to {} failed: no packet buffer", dst);
+                    Err(e @ (SendError::NoBuffer | SendError::DeviceBusy)) => {
+                        // Transient errors: treat it as packet loss, the retransmit timer retries.
+                        trace!("send to {} failed: {:?}. Will retry.", dst, e);
                     }
                     Err(e) => {
-                        // `Unaddressable` is the "no source address for destination" case.
-                        // The others can't happen for a bound socket and a ≤512 byte payload.
+                        // Permanent errors: fail the query.
                         let _: SendError = e;
-                        trace!("send to {} failed: {:?}", dst, e);
+                        trace!("send to {} failed: {:?}. Query failed.", dst, e);
                         q.set_state(State::Failure);
                         continue;
                     }
                 }
 
-                pq.retransmit_at = now + pq.delay;
+                pq.retransmit_at = clock.after(pq.delay);
                 pq.delay = MAX_RETRANSMIT_DELAY.min(pq.delay * 2);
-                next_poll_at = next_poll_at.min(pq.retransmit_at);
+                clock.schedule(timeout);
             }
         }
 
-        next_poll_at
+        clock.next()
     }
 }
 
 fn eq_names<'a>(
-    mut a: impl Iterator<Item = wire::Result<&'a [u8]>>,
-    mut b: impl Iterator<Item = wire::Result<&'a [u8]>>,
-) -> wire::Result<bool> {
+    mut a: impl Iterator<Item = Result<&'a [u8], Malformed>>,
+    mut b: impl Iterator<Item = Result<&'a [u8], Malformed>>,
+) -> Result<bool, Malformed> {
     loop {
         match (a.next(), b.next()) {
             // Handle errors
@@ -659,18 +665,18 @@ fn eq_names<'a>(
 
 fn copy_name<'a, const N: usize>(
     dest: &mut Vec<u8, N>,
-    name: impl Iterator<Item = wire::Result<&'a [u8]>>,
-) -> Result<(), wire::Error> {
+    name: impl Iterator<Item = Result<&'a [u8], Malformed>>,
+) -> Result<(), crate::error::Malformed> {
     dest.truncate(0);
 
     for label in name {
         let label = label?;
-        dest.push(label.len() as u8).map_err(|_| wire::Error)?;
-        dest.extend_from_slice(label).map_err(|_| wire::Error)?;
+        dest.push(label.len() as u8).map_err(|_| crate::error::Malformed)?;
+        dest.extend_from_slice(label).map_err(|_| crate::error::Malformed)?;
     }
 
     // Write terminator 0x00
-    dest.push(0).map_err(|_| wire::Error)?;
+    dest.push(0).map_err(|_| crate::error::Malformed)?;
 
     Ok(())
 }

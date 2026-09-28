@@ -7,11 +7,14 @@
 //! compressed packet is cut into pieces behind fragment headers. Fragmentation
 //! pays one extra copy, on purpose: it is a fallback path.
 
+#[cfg(feature = "ipv4-fragmentation")]
+use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
 use crate::driver::PacketBuf;
 use crate::iface::IfaceState;
 #[cfg(feature = "ipv4-fragmentation")]
 use crate::rand::Rand;
-use crate::stack::StackInner;
+use crate::stack::{Blocked, StackInner};
 use crate::wire::*;
 
 pub(crate) struct Fragmenter {
@@ -68,9 +71,9 @@ impl SixlowpanFragmenter {
 #[cfg(feature = "ipv4-fragmentation")]
 pub(crate) struct Ipv4Fragmenter {
     /// The destination address.
-    pub dst_addr: IpAddress,
+    pub dst_addr: IpAddr,
     /// The next hop the packet was routed to.
-    pub next_hop: IpAddress,
+    pub next_hop: IpAddr,
     /// The offset of the next fragment.
     pub frag_offset: u16,
     /// The identifier of the stream.
@@ -86,8 +89,8 @@ impl Fragmenter {
 
             #[cfg(feature = "ipv4-fragmentation")]
             ipv4: Ipv4Fragmenter {
-                dst_addr: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
-                next_hop: IpAddress::Ipv4(Ipv4Address::UNSPECIFIED),
+                dst_addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                next_hop: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
                 frag_offset: 0,
                 ident: 0,
             },
@@ -116,8 +119,8 @@ impl Fragmenter {
 
         #[cfg(feature = "ipv4-fragmentation")]
         {
-            self.ipv4.dst_addr = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
-            self.ipv4.next_hop = IpAddress::Ipv4(Ipv4Address::UNSPECIFIED);
+            self.ipv4.dst_addr = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
+            self.ipv4.next_hop = IpAddr::V4(Ipv4Addr::UNSPECIFIED);
             self.ipv4.frag_offset = 0;
             self.ipv4.ident = 0;
         }
@@ -133,19 +136,22 @@ impl StackInner {
     ///
     /// An IEEE 802.15.4 interface's fragmenter holds a 6LoWPAN packet, any
     /// other's an IPv4 packet.
-    pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) {
+    ///
+    /// The error says why the rest of the fragments have to wait.
+    pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
         match iface.medium() {
             #[cfg(feature = "medium-ieee802154")]
             crate::iface::Medium::Ieee802154 => {
                 #[cfg(feature = "sixlowpan-fragmentation")]
-                self.sixlowpan_egress(iface);
+                self.sixlowpan_egress(iface)?;
             }
             #[allow(unreachable_patterns)]
             _ => {
                 #[cfg(feature = "ipv4-fragmentation")]
-                self.ipv4_egress(iface);
+                self.ipv4_egress(iface)?;
             }
         }
+        Ok(())
     }
 }
 
@@ -174,8 +180,8 @@ impl StackInner {
     pub(crate) fn fragment_ipv4(
         &mut self,
         iface: &mut IfaceState<'_>,
-        dst_addr: IpAddress,
-        next_hop: IpAddress,
+        dst_addr: IpAddr,
+        next_hop: IpAddr,
         mut buf: PacketBuf,
     ) {
         debug!("start fragmentation");
@@ -214,31 +220,33 @@ impl StackInner {
         frag.buffer = Some(buf);
 
         // Transmit as many fragments as the device takes now. The rest go
-        // out on the next polls.
-        self.ipv4_egress(iface);
+        // out on the next polls, which also schedule the retry if the pool ran out.
+        let _ = self.ipv4_egress(iface);
     }
 
     /// Process fragments that still need to be sent for IPv4 packets.
     ///
     /// Fragments go out while the device has room for them and the pool has
-    /// buffers. The rest wait in the fragmenter for the next poll.
-    pub(crate) fn ipv4_egress(&mut self, iface: &mut IfaceState<'_>) {
+    /// buffers. The rest wait in the fragmenter for the next poll, and the error
+    /// says which of the two ran out.
+    pub(crate) fn ipv4_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
         if iface.fragmenter.is_empty() {
-            return;
+            return Ok(());
         }
 
         while !iface.fragmenter.finished() {
             if !iface.can_transmit() {
                 trace!("fragmenter: device has no room, fragments wait");
-                return;
+                return Err(Blocked::DeviceBusy);
             }
             if !self.dispatch_ipv4_frag(iface) {
-                return;
+                return Err(Blocked::NoBuffer);
             }
         }
 
         // Reset the buffer when we transmitted everything.
         iface.fragmenter.reset();
+        Ok(())
     }
 
     /// Transmit the next fragment of the packet in the interface's fragmenter.
@@ -260,7 +268,7 @@ impl StackInner {
             trace!("fragmenter: no packet buffer, fragments wait");
             return false;
         };
-        tx_buffer.reserve(LINK_HEADER_LEN);
+        tx_buffer.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN);
         tx_buffer.set_len(ip_len);
 
         // NOTE(unwrap): checked above.
@@ -276,7 +284,7 @@ impl StackInner {
         packet.set_more_frags(more_frags);
         packet.set_dont_frag(false);
         packet.set_frag_offset(frag.ipv4.frag_offset);
-        if checksum_caps.ipv4.tx() {
+        if !checksum_caps.ipv4.tx {
             packet.fill_checksum();
         } else {
             packet.set_checksum(0);

@@ -1,6 +1,6 @@
 use byteorder::{ByteOrder, NetworkEndian};
 
-use super::{Error, Result};
+use crate::error::Malformed;
 
 pub use super::EthernetProtocol as Protocol;
 
@@ -75,27 +75,29 @@ impl<'a> Packet<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
     ///
     /// The result of this check is invalidated by calling [set_hardware_len] or
     /// [set_protocol_len].
     ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    ///
     /// [set_hardware_len]: #method.set_hardware_len
     /// [set_protocol_len]: #method.set_protocol_len
     #[allow(clippy::if_same_then_else)]
-    pub fn check_len(&self) -> Result<()> {
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
         if len < field::OPER.end {
-            Err(Error)
+            Err(Malformed)
         } else if len < field::TPA(self.hardware_len(), self.protocol_len()).end {
-            Err(Error)
+            Err(Malformed)
         } else {
             Ok(())
         }

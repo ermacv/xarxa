@@ -2,19 +2,17 @@
 
 #[cfg(feature = "tcp-timestamps")]
 use super::TcpTimestampRepr;
-use super::{
-    AcceptError, DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, SocketBuffer, State, TcpControl, TcpHandle, TcpRepr,
-    TcpSocketState, Tuple,
-};
-use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT, TCP_SOCKET_COUNT};
+use super::{DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, State, TcpControl, TcpRepr, TcpSocketState, Tuple};
+use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT};
+use crate::iface::IfaceHandle;
 use crate::rand::Rand;
-use crate::stack::{Stack, addr_score};
+use crate::stack::{IfaceBinding, Stack, addr_score};
 use crate::storage::{BoundedDeque, Slab};
 use crate::tcp::TcpSeqNumber;
 use crate::tcp::congestion::Controller as _;
 #[cfg(feature = "async")]
 use crate::waker::WakerRegistration;
-use crate::wire::{IpAddress, IpEndpoint, IpListenEndpoint};
+use crate::wire::{IpAddr, ListenSocketAddr, SocketAddr};
 
 define_handle! {
     /// A handle to a TCP listener added to a [`Stack`].
@@ -48,10 +46,12 @@ struct PendingSyn {
 /// TCP listener state, stored inside the stack.
 #[derive(Debug)]
 pub(crate) struct TcpListenerState {
-    /// The listened endpoint. A zero port means the listener is closed. The
+    /// The listened address. A zero port means the listener is closed. The
     /// address scopes the listen, from any address of any version down to one
     /// exact address.
-    local: IpListenEndpoint,
+    local: ListenSocketAddr,
+    /// The interface the listener is bound to. Zero-sized without `iface-bind`.
+    binding: IfaceBinding,
     /// The accept queue: SYNs waiting to be accepted, deduplicated by 4-tuple.
     queue: BoundedDeque<PendingSyn, TCP_LISTENER_BACKLOG>,
     #[cfg(feature = "async")]
@@ -61,23 +61,26 @@ pub(crate) struct TcpListenerState {
 impl TcpListenerState {
     pub(crate) fn new() -> TcpListenerState {
         TcpListenerState {
-            local: IpListenEndpoint::UNSPECIFIED,
+            local: ListenSocketAddr::UNSPECIFIED,
+            binding: IfaceBinding::Any,
             queue: BoundedDeque::new(),
             #[cfg(feature = "async")]
             accept_waker: WakerRegistration::new(),
         }
     }
 
-    /// Score this listener against a segment to (`dst_addr`, `dst_port`).
+    /// Score this listener against a segment to (`dst_addr`, `dst_port`)
+    /// arriving on `arrival`.
     ///
     /// `None` if the listener does not match, else how specific the match is: an
     /// exact local-address match outscores a per-version one, which outscores a
-    /// wildcard.
-    pub(crate) fn match_score(&self, dst_addr: &IpAddress, dst_port: u16) -> Option<u8> {
+    /// wildcard, and a listener bound to the arrival interface outscores an
+    /// unbound one.
+    pub(crate) fn match_score(&self, arrival: IfaceHandle, dst_addr: &IpAddr, dst_port: u16) -> Option<u8> {
         if self.local.port == 0 || dst_port != self.local.port {
             return None;
         }
-        addr_score(&self.local, dst_addr)
+        Some(self.binding.match_score(arrival)? + addr_score(&self.local, dst_addr)?)
     }
 
     /// Record a SYN aimed at this listener in the accept queue.
@@ -86,13 +89,13 @@ impl TcpListenerState {
     /// retransmission (or a client aborting and reconnecting from the same
     /// port) updates the entry in place instead of queueing a duplicate. On a
     /// full queue the SYN is dropped silently, and the client retries. Nothing
-    /// is ever transmitted in response. The SYN|ACK is sent by the socket
-    /// [`accept`](TcpListener::accept) creates.
-    fn record_syn(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) {
+    /// is ever transmitted in response. The SYN|ACK is sent by the socket the
+    /// attempt is [`accept`](crate::tcp::TcpSocket::accept)ed into.
+    fn record_syn(&mut self, src_addr: &IpAddr, dst_addr: &IpAddr, repr: &TcpRepr) {
         debug_assert!(repr.control == TcpControl::Syn && repr.ack_number.is_none());
         let tuple = Tuple {
-            local: IpEndpoint::new(*dst_addr, repr.dst_port),
-            remote: IpEndpoint::new(*src_addr, repr.src_port),
+            local: SocketAddr::new(*dst_addr, repr.dst_port),
+            remote: SocketAddr::new(*src_addr, repr.src_port),
         };
         let syn = PendingSyn {
             tuple,
@@ -133,11 +136,11 @@ impl TcpListenerState {
     /// was removed. The client gave up before we accepted. The only acceptable
     /// sequence number for a connection with nothing received past the SYN is
     /// exactly RCV.NXT.
-    fn process_rst(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress, repr: &TcpRepr) -> bool {
+    fn process_rst(&mut self, src_addr: &IpAddr, dst_addr: &IpAddr, repr: &TcpRepr) -> bool {
         debug_assert!(repr.control == TcpControl::Rst);
         let tuple = Tuple {
-            local: IpEndpoint::new(*dst_addr, repr.dst_port),
-            remote: IpEndpoint::new(*src_addr, repr.src_port),
+            local: SocketAddr::new(*dst_addr, repr.dst_port),
+            remote: SocketAddr::new(*src_addr, repr.src_port),
         };
         let before = self.queue.len();
         self.queue
@@ -155,22 +158,23 @@ impl TcpListenerState {
 /// consumed.
 ///
 /// The listeners consume exactly two things, and never reply to either. A SYN
-/// to a listened endpoint is recorded on the *most specific* matching listener,
+/// to a listened address is recorded on the *most specific* matching listener,
 /// where an exact local-address match beats a wildcard one, so a per-address
 /// listener takes its address's connections away from an any-address one on the
 /// same port. An RST aimed at a recorded SYN removes it. Everything else is
 /// left to the caller's RST fallback.
 pub(crate) fn process_listeners(
     listeners: &mut Slab<TcpListenerState, TCP_LISTENER_COUNT>,
-    src_addr: &IpAddress,
-    dst_addr: &IpAddress,
+    iface: IfaceHandle,
+    src_addr: &IpAddr,
+    dst_addr: &IpAddr,
     repr: &TcpRepr,
 ) -> bool {
     match repr.control {
         TcpControl::Syn if repr.ack_number.is_none() => {
             let mut best: Option<(usize, u8)> = None;
             for (index, listener) in listeners.iter() {
-                if let Some(score) = listener.match_score(dst_addr, repr.dst_port)
+                if let Some(score) = listener.match_score(iface, dst_addr, repr.dst_port)
                     && best.is_none_or(|(_, best_score)| score > best_score)
                 {
                     best = Some((index, score));
@@ -185,8 +189,75 @@ pub(crate) fn process_listeners(
         }
         TcpControl::Rst => listeners
             .iter_mut()
-            .any(|(_, listener)| listener.process_rst(src_addr, dst_addr, repr)),
+            .any(|(_, listener)| listener.binding.matches(iface) && listener.process_rst(src_addr, dst_addr, repr)),
         _ => false,
+    }
+}
+
+/// A connection attempt accepted from a [`TcpListener`], returned by
+/// [`TcpListener::accept`].
+///
+/// Pass it to [`TcpSocket::accept`] to set up a socket for it.
+///
+/// Dropping the token forgets the attempt. The client retransmits its SYN,
+/// which queues the attempt on the listener again.
+///
+/// [`TcpSocket::accept`]: crate::tcp::TcpSocket::accept
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+#[derive(Debug)]
+pub struct AcceptToken {
+    syn: PendingSyn,
+    binding: IfaceBinding,
+}
+
+impl AcceptToken {
+    /// The local address the client is connecting to.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.syn.tuple.local
+    }
+
+    /// The remote address the connection attempt comes from.
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.syn.tuple.remote
+    }
+
+    /// Set up a closed socket as the SYN-RECEIVED socket continuing the
+    /// token's SYN. This mirrors what the SYN would have set up in a
+    /// LISTEN-state socket: the SYN|ACK itself is built by the socket's
+    /// dispatch from this state.
+    ///
+    /// The socket takes over the listener's interface binding, overwriting its
+    /// own: the connection's traffic is on that link, and the SYN|ACK and
+    /// everything after must leave through it.
+    pub(crate) fn start_syn_received(self, s: &mut TcpSocketState<'_>, rand: &mut Rand) {
+        debug_assert_eq!(s.state, State::Closed);
+        let syn = self.syn;
+        s.set_state(State::SynReceived);
+        s.tuple = Some(syn.tuple);
+        s.binding = self.binding;
+        s.local_seq_no = TcpSocketState::random_seq_no(rand);
+        s.remote_seq_no = syn.remote_seq_no;
+        s.remote_last_seq = s.local_seq_no;
+        #[cfg(feature = "tcp-sack")]
+        {
+            s.remote_has_sack = syn.remote_has_sack;
+        }
+        s.remote_win_scale = syn.remote_win_scale;
+        // Remote doesn't support window scaling, don't do it.
+        if syn.remote_win_scale.is_none() {
+            s.remote_win_shift = 0;
+        }
+        s.remote_win_len = syn.remote_win_len;
+        s.remote_max_win_len = syn.remote_win_len;
+        s.remote_mss = syn.remote_mss;
+        s.congestion_controller.set_mss(syn.remote_mss);
+        // Answer with timestamps only if the SYN offered them.
+        #[cfg(feature = "tcp-timestamps")]
+        {
+            s.timestamps = syn.timestamp.is_some();
+            s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
+            s.tsval_offset = TcpSocketState::random_tsval_offset(rand);
+        }
     }
 }
 
@@ -199,18 +270,19 @@ pub(crate) fn process_listeners(
 ///
 /// A listener can be bound to a port and optionally an address.
 /// It receives all incoming connection attempts and queues them.
-/// Calling [`accept`](TcpListener::accept) pops a connection from the queue
-/// and constructs a full [`TcpSocket`](crate::tcp::TcpSocket) for it.
+/// Calling [`accept`](TcpListener::accept) pops an attempt from the queue as
+/// an [`AcceptToken`]. Pass it to [`TcpSocket::accept`] to set up a socket for it.
 ///
-/// Connection attempts (SYN packets) are not answered (with a SYN|ACK packet) until you accept them.
-pub struct TcpListener<'a, 'd> {
+/// Connection attempts (SYN packets) are not answered (with a SYN|ACK packet)
+/// until a socket accepts them.
+///
+/// [`TcpSocket::accept`]: crate::tcp::TcpSocket::accept
+pub struct TcpListener<'a> {
     pub(crate) listeners: &'a mut Slab<TcpListenerState, TCP_LISTENER_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tcp: &'a mut Slab<TcpSocketState<'d>, TCP_SOCKET_COUNT>,
-    pub(crate) rand: &'a mut Rand,
 }
 
-impl<'d> TcpListener<'_, 'd> {
+impl TcpListener<'_> {
     /// This listener's state in the slab.
     #[inline]
     fn inner(&self) -> &TcpListenerState {
@@ -223,17 +295,18 @@ impl<'d> TcpListener<'_, 'd> {
         self.listeners.get_mut(self.index)
     }
 
-    /// Start listening on the given endpoint.
+    /// Start listening on the given local address.
     ///
-    /// Returns:
-    /// - `Err(ListenError::Unaddressable)` if the port is zero.
-    /// - `Err(ListenError::InvalidState)` if the listener is already listening
-    ///   (unless it is listening on this same endpoint, which is a no-op).
-    /// - `Err(ListenError::InUse)` if another listener is bound to an identical
-    ///   endpoint. Listeners on the same port with *different* specificity (one
-    ///   wildcard, one per-version, one per-address) may coexist.
-    pub fn listen(&mut self, local_endpoint: impl Into<IpListenEndpoint>) -> Result<(), ListenError> {
-        let local = local_endpoint.into();
+    /// # Errors
+    /// - `Unaddressable`: if the port is zero.
+    /// - `InvalidState`: if the listener is already listening (unless it is
+    ///   listening on this same address, which is a no-op).
+    /// - `InUse`: if another listener is bound to an identical address.
+    ///   Listeners on the same port with *different* specificity (one wildcard,
+    ///   one per-version, one per-address) may coexist, and so may listeners on
+    ///   identical addresses bound to different interfaces.
+    pub fn listen(&mut self, local: impl Into<ListenSocketAddr>) -> Result<(), ListenError> {
+        let local = local.into();
         if local.port == 0 {
             return Err(ListenError::Unaddressable);
         }
@@ -243,12 +316,49 @@ impl<'d> TcpListener<'_, 'd> {
             }
             return Err(ListenError::InvalidState);
         }
-        if self.listeners.iter().any(|(i, l)| i != self.index && l.local == local) {
+        let binding = self.inner().binding;
+        if self
+            .listeners
+            .iter()
+            .any(|(i, l)| i != self.index && l.local == local && l.binding == binding)
+        {
             return Err(ListenError::InUse);
         }
 
         self.inner_mut().local = local;
         Ok(())
+    }
+
+    /// Bind the listener to an interface, or unbind it with `None`.
+    ///
+    /// A listener bound to an interface only accepts connection attempts that arrive on that interface.
+    ///
+    /// When accepting a connection, the sockets inherit the binding.
+    ///
+    /// The listener must be closed. The binding is kept across
+    /// [`close`](Self::close).
+    ///
+    /// Two listeners on the same address can coexist if they are bound to different interfaces,
+    /// or if one is not bound. In the latter case, the bound listener "wins" for incoming
+    /// connections coming from the bound interface.
+    ///
+    /// # Errors
+    /// - `InvalidState`: if the listener is open.
+    #[cfg(feature = "iface-bind")]
+    pub fn bind_to_iface(&mut self, iface: Option<IfaceHandle>) -> Result<(), ListenError> {
+        if self.is_open() {
+            return Err(ListenError::InvalidState);
+        }
+        self.inner_mut().binding = iface.into();
+        Ok(())
+    }
+
+    /// Return the interface the listener is bound to, or `None`.
+    ///
+    /// See [`bind_to_iface`](Self::bind_to_iface).
+    #[cfg(feature = "iface-bind")]
+    pub fn bound_iface(&self) -> Option<IfaceHandle> {
+        self.inner().binding.iface()
     }
 
     /// Stop listening, dropping all queued SYNs.
@@ -257,7 +367,7 @@ impl<'d> TcpListener<'_, 'd> {
     /// answered with an RST once the listener is gone.
     pub fn close(&mut self) {
         let state = self.inner_mut();
-        state.local = IpListenEndpoint::UNSPECIFIED;
+        state.local = ListenSocketAddr::UNSPECIFIED;
         state.queue.clear();
         // Wake the task waiting, so it can notice the listener is closed.
         #[cfg(feature = "async")]
@@ -270,10 +380,10 @@ impl<'d> TcpListener<'_, 'd> {
         self.inner().local.port != 0
     }
 
-    /// Return the listened endpoint. The address is the filter the listen scoped
+    /// Return the listened address. The address is the filter the listen scoped
     /// the listener to. A zero port means the listener is closed.
     #[inline]
-    pub fn local_endpoint(&self) -> IpListenEndpoint {
+    pub fn local_addr(&self) -> ListenSocketAddr {
         self.inner().local
     }
 
@@ -300,144 +410,20 @@ impl<'d> TcpListener<'_, 'd> {
         !self.inner().queue.is_empty()
     }
 
-    /// Accept a queued connection attempt, allocating the socket for it with
-    /// receive and transmit buffers of the given capacities.
+    /// Accept a queued connection attempt.
     ///
-    /// The buffers are allocated on the heap, so this needs the `alloc` feature.
-    /// Without it, use [`accept_with_bufs`](Self::accept_with_bufs) to lend your
-    /// own buffers, or [`accept_with_socket`](Self::accept_with_socket) to reuse
-    /// a socket you already have.
+    /// Returns an [`AcceptToken`], or `None` if none is
+    /// queued.
     ///
-    /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
+    /// Pass it to [`TcpSocket::accept`] to set up a socket for the incoming connection.
     ///
-    /// Returns `None` if no connection attempt is queued, or if the stack has no
-    /// room for another TCP socket. In the second case the attempt stays queued
-    /// and `accept` can be retried after removing a socket.
-    #[cfg(feature = "alloc")]
-    pub fn accept(&mut self, rx_capacity: usize, tx_capacity: usize) -> Option<TcpHandle> {
-        if self.tcp.is_full() || !self.can_accept() {
-            return None;
-        }
-        self.accept_inner(
-            SocketBuffer::new(alloc::vec![0; rx_capacity]),
-            SocketBuffer::new(alloc::vec![0; tx_capacity]),
-        )
-    }
-
-    /// Accept a queued connection attempt, creating the socket for it with the
-    /// given receive and transmit buffers.
-    ///
-    /// The buffers are lent to the stack. It holds them until it is dropped or
-    /// the socket is removed, so they must be declared before the stack, or be
-    /// `'static`. Removing the socket does not hand them back, so a program
-    /// that serves many connections from a fixed set of buffers should accept
-    /// into the same sockets over and over with
-    /// [`accept_with_socket`](Self::accept_with_socket) instead.
-    ///
-    /// The new socket starts in the SYN-RECEIVED state and is added to the stack.
-    ///
-    /// Returns `None` if no connection attempt is queued, or if the stack has no
-    /// room for another TCP socket. In the second case the attempt stays queued
-    /// and `accept_with_bufs` can be retried after removing a socket. The buffers
-    /// are not handed back in either case, so check
-    /// [`can_accept`](Self::can_accept) first.
-    pub fn accept_with_bufs(&mut self, rx_buffer: &'d mut [u8], tx_buffer: &'d mut [u8]) -> Option<TcpHandle> {
-        self.accept_inner(SocketBuffer::new(rx_buffer), SocketBuffer::new(tx_buffer))
-    }
-
-    /// Accept a queued connection attempt into an existing socket, reusing its
-    /// buffers.
-    ///
-    /// The socket must be closed (see [`is_open`](crate::tcp::TcpSocket::is_open)),
-    /// and is set up for the new connection exactly as [`connect`] sets it up for
-    /// an outgoing one: its buffers are cleared and everything you configured on
-    /// it (hop limit, timeout, keep-alive, Nagle, ACK delay) is kept. Its handle
-    /// stays valid.
-    ///
-    /// This is how to serve connections without a heap: create the sockets once,
-    /// with the buffers they will use for the program's whole life, and accept
-    /// into them again as each connection ends. [`accept`](Self::accept) and
-    /// [`accept_with_bufs`](Self::accept_with_bufs) create a new socket per
-    /// connection, and buffers lent to the stack are never handed back.
-    ///
-    /// The socket ends up in the SYN-RECEIVED state and sends the SYN|ACK on the
-    /// next [`Stack::poll`].
-    ///
-    /// Errors:
-    /// - `InvalidState` if the socket is still open.
-    /// - `Exhausted` if no connection attempt is queued.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the handle does not belong to a socket of this stack.
-    ///
-    /// [`connect`]: crate::tcp::TcpSocket::connect
-    /// [`Stack::poll`]: crate::Stack::poll
-    pub fn accept_with_socket(&mut self, handle: TcpHandle) -> Result<(), AcceptError> {
-        if self.tcp.get(handle.index()).is_open() {
-            return Err(AcceptError::InvalidState);
-        }
-        let state = self.listeners.get_mut(self.index);
-        let syn = state.queue.pop_front().ok_or(AcceptError::Exhausted)?;
-        trace!(
-            "listener:{}: accepting {} into socket {}",
-            state.local,
-            syn.tuple,
-            handle.index()
-        );
-
-        let s = self.tcp.get_mut(handle.index());
-        s.reset();
-        Self::start_syn_received(s, syn, self.rand);
-        Ok(())
-    }
-
-    fn accept_inner(&mut self, rx_buffer: SocketBuffer<'d>, tx_buffer: SocketBuffer<'d>) -> Option<TcpHandle> {
-        if self.tcp.is_full() {
-            // No room for the socket: leave the SYN queued, the caller can retry
-            // after freeing one.
-            return None;
-        }
-        let state = self.listeners.get_mut(self.index);
+    /// [`TcpSocket::accept`]: crate::tcp::TcpSocket::accept
+    pub fn accept(&mut self) -> Option<AcceptToken> {
+        let state = self.inner_mut();
         let syn = state.queue.pop_front()?;
+        let binding = state.binding;
         trace!("listener:{}: accepting {}", state.local, syn.tuple);
-
-        let mut s = TcpSocketState::new(rx_buffer, tx_buffer);
-        Self::start_syn_received(&mut s, syn, self.rand);
-
-        // Can't fail: checked for room above.
-        Some(TcpHandle::new(unwrap!(self.tcp.add_with(|_| s))))
-    }
-
-    /// Set up a closed socket as the SYN-RECEIVED socket continuing `syn`. This
-    /// mirrors what the SYN would have set up in a LISTEN-state socket: the
-    /// SYN|ACK itself is built by the socket's dispatch from this state.
-    fn start_syn_received(s: &mut TcpSocketState<'d>, syn: PendingSyn, rand: &mut Rand) {
-        debug_assert_eq!(s.state, State::Closed);
-        s.set_state(State::SynReceived);
-        s.tuple = Some(syn.tuple);
-        s.local_seq_no = TcpSocketState::random_seq_no(rand);
-        s.remote_seq_no = syn.remote_seq_no;
-        s.remote_last_seq = s.local_seq_no;
-        #[cfg(feature = "tcp-sack")]
-        {
-            s.remote_has_sack = syn.remote_has_sack;
-        }
-        s.remote_win_scale = syn.remote_win_scale;
-        // Remote doesn't support window scaling, don't do it.
-        if syn.remote_win_scale.is_none() {
-            s.remote_win_shift = 0;
-        }
-        s.remote_win_len = syn.remote_win_len;
-        s.remote_mss = syn.remote_mss;
-        s.congestion_controller.set_mss(syn.remote_mss);
-        // Answer with timestamps only if the SYN offered them.
-        #[cfg(feature = "tcp-timestamps")]
-        {
-            s.timestamps = syn.timestamp.is_some();
-            s.last_remote_tsval = syn.timestamp.map_or(0, |ts| ts.tsval);
-            s.tsval_offset = TcpSocketState::random_tsval_offset(rand);
-        }
+        Some(AcceptToken { syn, binding })
     }
 }
 
@@ -465,7 +451,7 @@ impl<'d> TcpListenerIter<'_, 'd> {
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_, 'd>)> {
+    pub fn next(&mut self) -> Option<(TcpListenerHandle, TcpListener<'_>)> {
         let index = self.stack.sockets.tcp_listeners.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = TcpListenerHandle::new(index);

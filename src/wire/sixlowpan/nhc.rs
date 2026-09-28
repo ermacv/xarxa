@@ -1,7 +1,7 @@
 //! Next header compression ([RFC 6282 § 4]).
 //!
 //! [RFC 6282 § 4]: https://datatracker.ietf.org/doc/html/rfc6282#section-4
-use super::{DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER, Error, NextHeader, Result};
+use super::{DISPATCH_EXT_HEADER, DISPATCH_UDP_HEADER, Malformed, NextHeader};
 use crate::wire::IpProtocol;
 use crate::wire::take;
 
@@ -18,13 +18,13 @@ pub enum NhcPacket {
 impl NhcPacket {
     /// Read the dispatch byte of a compressed next header.
     ///
-    /// Errors:
-    /// - `Error` if the buffer is empty, or the dispatch is neither an
+    /// # Errors
+    /// - `Malformed`: if the buffer is empty, or the dispatch is neither an
     ///   extension header nor a UDP header.
-    pub fn dispatch(buffer: &[u8]) -> Result<Self> {
+    pub fn dispatch(buffer: &[u8]) -> Result<Self, Malformed> {
         let raw = buffer;
         if raw.is_empty() {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         if raw[0] >> 4 == DISPATCH_EXT_HEADER {
@@ -34,7 +34,7 @@ impl NhcPacket {
             // We have a compressed UDP header.
             Ok(Self::UdpHeader)
         } else {
-            Err(Error)
+            Err(Malformed)
         }
     }
 }
@@ -92,16 +92,16 @@ impl ExtHeaderRepr {
     ///
     /// Returns the header and its length, not counting the payload.
     ///
-    /// Errors:
-    /// - `Error` if the buffer is shorter than the header, or does not start
+    /// # Errors
+    /// - `Malformed`: if the buffer is shorter than the header, or does not start
     ///   with an extension header dispatch.
-    pub fn parse(buf: &[u8]) -> Result<(Self, usize)> {
+    pub fn parse(buf: &[u8]) -> Result<(Self, usize), Malformed> {
         if buf.is_empty() {
-            return Err(Error);
+            return Err(Malformed);
         }
         let b = buf[0];
         if b >> 4 != DISPATCH_EXT_HEADER {
-            return Err(Error);
+            return Err(Malformed);
         }
         let ext_header_id = match (b >> 1) & 0b111 {
             0 => ExtHeaderId::HopByHopHeader,
@@ -192,16 +192,16 @@ impl UdpNhcRepr {
     ///
     /// Returns the header and its length, not counting the payload.
     ///
-    /// Errors:
-    /// - `Error` if the buffer is shorter than the header, or does not start
+    /// # Errors
+    /// - `Malformed`: if the buffer is shorter than the header, or does not start
     ///   with a UDP header dispatch.
-    pub fn parse(buf: &[u8]) -> Result<(Self, usize)> {
+    pub fn parse(buf: &[u8]) -> Result<(Self, usize), Malformed> {
         if buf.is_empty() {
-            return Err(Error);
+            return Err(Malformed);
         }
         let b = buf[0];
         if b >> 3 != DISPATCH_UDP_HEADER {
-            return Err(Error);
+            return Err(Malformed);
         }
         let mut offset = 1;
         let (src_port, dst_port) = match b & 0b11 {

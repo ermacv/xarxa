@@ -15,8 +15,6 @@
 // not worth a `#[cfg]` each.
 #![allow(dead_code)]
 
-use core::fmt;
-
 mod assembler;
 mod bounded_deque;
 mod bounded_vec;
@@ -37,16 +35,3 @@ pub(crate) use maybe_box::MaybeBox;
 pub(crate) use slab::Slab;
 #[allow(unused_imports)]
 pub(crate) use vec::Vec;
-
-/// A table, slab or queue has no room for another item.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-pub struct Full;
-
-impl fmt::Display for Full {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("full")
-    }
-}
-
-impl core::error::Error for Full {}

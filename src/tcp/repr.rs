@@ -8,7 +8,8 @@
 use core::fmt;
 
 use crate::driver::ChecksumCapabilities;
-use crate::wire::{Error, IpAddress, Result, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
+use crate::error::Malformed;
+use crate::wire::{IpAddr, TCP_HEADER_LEN, TcpControl, TcpOption, TcpPacket, TcpSeqNumber};
 
 /// A high-level representation of a Transmission Control Protocol packet.
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -59,15 +60,15 @@ impl<'a> TcpRepr<'a> {
     ///
     /// The checksum is not verified here. The caller verifies it on the wire packet
     /// before parsing.
-    pub fn parse(packet: &'a TcpPacket<'_>, src_addr: &IpAddress, dst_addr: &IpAddress) -> Result<TcpRepr<'a>> {
+    pub fn parse(packet: &'a TcpPacket<'_>, src_addr: &IpAddr, dst_addr: &IpAddr) -> Result<TcpRepr<'a>, Malformed> {
         packet.check_len()?;
 
         // Source and destination ports must be present.
         if packet.src_port() == 0 {
-            return Err(Error);
+            return Err(Malformed);
         }
         if packet.dst_port() == 0 {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         let control = match (packet.syn(), packet.fin(), packet.rst(), packet.psh()) {
@@ -76,7 +77,7 @@ impl<'a> TcpRepr<'a> {
             (true, false, false, _) => TcpControl::Syn,
             (false, true, false, _) => TcpControl::Fin,
             (false, false, true, _) => TcpControl::Rst,
-            _ => return Err(Error),
+            _ => return Err(Malformed),
         };
         let ack_number = match packet.ack() {
             true => Some(packet.ack_number()),
@@ -203,8 +204,8 @@ impl<'a> TcpRepr<'a> {
     pub fn emit(
         &self,
         packet: &mut TcpPacket<'_>,
-        src_addr: &IpAddress,
-        dst_addr: &IpAddress,
+        src_addr: &IpAddr,
+        dst_addr: &IpAddr,
         checksum_caps: &ChecksumCapabilities,
     ) {
         packet.set_src_port(self.src_port);
@@ -258,7 +259,7 @@ impl<'a> TcpRepr<'a> {
         let payload = packet.payload_mut();
         payload[..self.payload.len()].copy_from_slice(self.payload);
         payload[self.payload.len()..].copy_from_slice(self.payload2);
-        if checksum_caps.tcp.tx() {
+        if !checksum_caps.tcp.tx {
             packet.fill_checksum(src_addr, dst_addr)
         } else {
             packet.set_checksum(0);
@@ -268,15 +269,6 @@ impl<'a> TcpRepr<'a> {
     /// Return the length of the segment, in terms of sequence space.
     pub const fn segment_len(&self) -> usize {
         self.payload_len() + self.control.len()
-    }
-
-    /// Return whether the segment has no flags set (except PSH) and no data.
-    pub const fn is_empty(&self) -> bool {
-        match self.control {
-            _ if self.payload_len() != 0 => false,
-            TcpControl::Syn | TcpControl::Fin | TcpControl::Rst => false,
-            TcpControl::None | TcpControl::Psh => true,
-        }
     }
 }
 
@@ -306,10 +298,10 @@ impl<'a> fmt::Display for TcpRepr<'a> {
 #[cfg(all(test, feature = "ipv4"))]
 mod test {
     use super::*;
-    use crate::wire::Ipv4Address;
+    use crate::wire::Ipv4Addr;
 
-    const SRC_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-    const DST_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
+    const SRC_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+    const DST_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
 
     static PAYLOAD_BYTES: [u8; 4] = [0xaa, 0x00, 0x00, 0xff];
 

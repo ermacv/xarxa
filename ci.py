@@ -33,22 +33,24 @@ MEDIA = [
 PROTOS = ["ipv4", "ipv6", "ipv4,ipv6"]
 SOCKETS = [
     "",
-    "raw",
+    "raw-ethernet",
+    "raw-ip",
+    "raw-ethernet,raw-ip",
     "udp",
     "tcp",
-    "raw,udp",
-    "raw,tcp",
+    "raw-ethernet,raw-ip,udp",
+    "raw-ethernet,raw-ip,tcp",
     "udp,tcp",
-    "raw,udp,tcp",
+    "raw-ethernet,raw-ip,udp,tcp",
 ]
 
 # Everything that adds code paths to a media/protocol/socket combination,
 # without being a combination axis of its own.
-COMBO_EXTRAS = "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,multicast"
+COMBO_EXTRAS = "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,multicast,iface-bind"
 
 # The other axes are checked against the full feature set only; combining them
 # with all of the above would be thousands of builds for no extra coverage.
-EXTRAS_BASE = "medium-ethernet,medium-ip,ipv4,ipv6,raw,udp,tcp"
+EXTRAS_BASE = "medium-ethernet,medium-ip,ipv4,ipv6,raw-ethernet,raw-ip,udp,tcp"
 EXTRAS = [
     "",
     "defmt",
@@ -61,6 +63,8 @@ EXTRAS = [
     "icmp-errors",
     "icmp-ping-reply",
     "async,icmp-errors",
+    "iface-bind",
+    "iface-bind,defmt",
     "packetmeta-id",
     "packetmeta-timestamp",
     "packetmeta-timestamp,defmt",
@@ -82,20 +86,25 @@ EXTRAS = [
     "dhcpv4,defmt",
     "dhcpv4-options",
     "dhcpv4-options,defmt",
+    "dhcpv4-server",
+    "dhcpv4-server,defmt",
+    "dhcpv4,dhcpv4-server",
     "multicast",
     "multicast,defmt",
     "multicast,icmp-errors,icmp-ping-reply",
     "std,log,async,icmp-errors,icmp-ping-reply,packetmeta-timestamp,tcp-timestamps,tcp-sack,"
-    "packet-log,dhcpv4,dhcpv4-options,multicast,ipv4-fragmentation,ipv4-reassembly,"
+    "packet-log,dhcpv4,dhcpv4-options,dhcpv4-server,multicast,ipv4-fragmentation,ipv4-reassembly,"
     "medium-ieee802154,sixlowpan-fragmentation,sixlowpan-reassembly,slaac",
+    "packet-buf-driver-headroom-16",
+    "packet-buf-driver-headroom-32",
 ]
 
 # The whole API, minus the features that are mutually exclusive with another.
 FULL = (
-    "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw,udp,tcp,tcp-listener,"
-    "std,log,async,icmp-errors,icmp-ping-reply,multicast,slaac,dhcpv4,dhcpv4-options,"
+    "medium-ethernet,medium-ip,medium-ieee802154,ipv4,ipv6,raw-ethernet,raw-ip,udp,tcp,tcp-listener,"
+    "std,log,async,icmp-errors,icmp-ping-reply,iface-bind,multicast,slaac,dhcpv4,dhcpv4-options,dhcpv4-server,"
     "dns,mdns,packetmeta-timestamp,tcp-timestamps,tcp-sack,ipv4-fragmentation,ipv4-reassembly,"
-    "sixlowpan-fragmentation,sixlowpan-reassembly"
+    "sixlowpan-fragmentation,sixlowpan-reassembly,serde"
 )
 
 
@@ -178,7 +187,13 @@ def collect():
 
     # `xarxa-driver` on its own, every feature combination it has (it has few).
     # The combinations above only build it with the features xarxa forwards.
-    for extra in ["", "defmt", "packetmeta-id", "packetmeta-timestamp", "packetmeta-timestamp,defmt"]:
+    for extra in [
+        "",
+        "defmt",
+        "packetmeta-id",
+        "packetmeta-timestamp",
+        "packetmeta-timestamp,defmt",
+    ]:
         args = ["check", "-p", "xarxa-driver"]
         if extra:
             args += ["--features", extra]
@@ -186,6 +201,9 @@ def collect():
     cmds.raw(["test", "-p", "xarxa-driver"])
 
     cmds.raw(["test"])
+    # Test serde (de)serialize specifically with just ipv4 or just ipv6
+    for proto in PROTOS:
+        cmds.test(join(proto, MEDIA[0], "serde"))
     # Once more without `alloc`: the bounded containers and their full-table
     # paths. Unit tests only: the examples and doc tests are written against the
     # owned `Box`/`Vec` storage that only exists with `alloc`.

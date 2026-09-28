@@ -1,15 +1,15 @@
 //! Bounded, coalescing ARP response ownership. No pool allocation and no RX gate.
 use super::IfaceState;
 use crate::driver::{LinkState, PacketBuf};
-use crate::wire::Ipv4Address;
+use crate::wire::Ipv4Addr;
 
 // Small control working set, independent of socket backlog. A flood can fill
 // this queue; drop the new distinct request rather than evict an admitted reply.
 const CAPACITY: usize = 4;
 
 pub(crate) struct Reply {
-    peer: Ipv4Address,
-    local: Ipv4Address,
+    peer: Ipv4Addr,
+    local: Ipv4Addr,
     packet: PacketBuf,
 }
 
@@ -23,7 +23,7 @@ impl Replies {
 }
 
 impl IfaceState<'_> {
-    pub(crate) fn queue_arp_reply(&mut self, peer: Ipv4Address, local: Ipv4Address, packet: PacketBuf) {
+    pub(crate) fn queue_arp_reply(&mut self, peer: Ipv4Addr, local: Ipv4Addr, packet: PacketBuf) {
         // Duplicate requests need one response. Replace in place so a changed
         // sender MAC is reflected without changing FIFO order or adding owners.
         if let Some(reply) = self

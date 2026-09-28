@@ -45,7 +45,7 @@ fn main() {
     // from the lease below.
     let mut config = DhcpConfig::default();
     config.parameter_request_list = Some(&[1, 3, 6, 42]);
-    stack.iface(iface).set_dhcpv4(Some(config));
+    stack.iface(iface).set_dhcpv4(Some(config)).unwrap();
 
     let mut generation = stack.iface(iface).config_generation();
     loop {
@@ -67,15 +67,9 @@ fn main() {
             }
         }
 
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 

@@ -75,11 +75,11 @@ impl RawSocketDriver {
     /// This requires superuser privileges or a corresponding capability bit
     /// set on the executable.
     ///
-    /// Errors:
-    /// - the OS error if the socket cannot be opened or bound, or the
-    ///   interface does not exist.
-    /// - `Unsupported` for [`HardwareAddress::Ip`], and for an IEEE 802.15.4
+    /// # Errors
+    /// - `Unsupported`: for [`HardwareAddress::Ip`], and for an IEEE 802.15.4
     ///   address that is not an extended address.
+    /// - the OS error, if the socket cannot be opened or bound, or the interface
+    ///   does not exist.
     pub fn new(
         name: &str,
         hardware_addr: HardwareAddress,

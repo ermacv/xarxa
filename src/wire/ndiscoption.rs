@@ -1,9 +1,9 @@
 use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::time::Duration;
-use crate::wire::{Ipv6Address, MAX_HARDWARE_ADDRESS_LEN};
+use crate::wire::{Ipv6Addr, MAX_HARDWARE_ADDRESS_LEN};
 
 use crate::wire::RawHardwareAddress;
 
@@ -125,6 +125,7 @@ mod field {
     //  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 
     //  MTU
+    pub const MTU_RESERVED: Field = 2..4;
     pub const MTU: Field = 4..8;
 }
 
@@ -139,39 +140,41 @@ impl<'a> NdiscOption<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<NdiscOption<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<NdiscOption<'a>, Malformed> {
         let opt = Self::new_unchecked(buffer);
         opt.check_len()?;
 
         // A data length field of 0 is invalid.
         if opt.data_len() == 0 {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         Ok(opt)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
     ///
     /// The result of this check is invalidated by calling [set_data_len].
     ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    ///
     /// [set_data_len]: #method.set_data_len
-    pub fn check_len(&self) -> Result<()> {
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
 
         if len < field::MIN_OPT_LEN {
-            Err(Error)
+            Err(Malformed)
         } else {
             let data_range = field::DATA(self.buffer[field::LENGTH]);
             if len < data_range.end {
-                Err(Error)
+                Err(Malformed)
             } else {
                 match self.option_type() {
                     Type::SourceLinkLayerAddr | Type::TargetLinkLayerAddr | Type::Mtu => Ok(()),
                     Type::PrefixInformation if data_range.end >= field::PREFIX.end => Ok(()),
                     Type::RedirectedHeader if data_range.end >= field::REDIR_MIN_SZ => Ok(()),
-                    Type::PrefixInformation | Type::RedirectedHeader => Err(Error),
+                    Type::PrefixInformation | Type::RedirectedHeader => Err(Malformed),
                     _ => Ok(()),
                 }
             }
@@ -227,19 +230,19 @@ impl<'a> NdiscOption<'a> {
     /// Return the valid lifetime of the prefix.
     #[inline]
     pub fn valid_lifetime(&self) -> Duration {
-        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::VALID_LT]) as u64)
+        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::VALID_LT]))
     }
 
     /// Return the preferred lifetime of the prefix.
     #[inline]
     pub fn preferred_lifetime(&self) -> Duration {
-        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::PREF_LT]) as u64)
+        Duration::from_secs(NetworkEndian::read_u32(&self.buffer[field::PREF_LT]))
     }
 
     /// Return the prefix.
     #[inline]
-    pub fn prefix(&self) -> Ipv6Address {
-        Ipv6Address::from_octets(self.buffer[field::PREFIX].try_into().unwrap())
+    pub fn prefix(&self) -> Ipv6Addr {
+        Ipv6Addr::from_octets(self.buffer[field::PREFIX].try_into().unwrap())
     }
 }
 
@@ -278,6 +281,12 @@ impl<'a> NdiscOption<'a> {
 
 /// Setter methods only relevant for the MTU option.
 impl<'a> NdiscOption<'a> {
+    /// Clear the reserved area of the MTU option.
+    #[inline]
+    pub fn clear_mtu_reserved(&mut self) {
+        NetworkEndian::write_u16(&mut self.buffer[field::MTU_RESERVED], 0);
+    }
+
     /// Set the MTU value.
     #[inline]
     pub fn set_mtu(&mut self, value: u32) {
@@ -302,13 +311,13 @@ impl<'a> NdiscOption<'a> {
     /// Set the valid lifetime of the prefix.
     #[inline]
     pub fn set_valid_lifetime(&mut self, time: Duration) {
-        NetworkEndian::write_u32(&mut self.buffer[field::VALID_LT], time.secs() as u32);
+        NetworkEndian::write_u32(&mut self.buffer[field::VALID_LT], time.as_secs());
     }
 
     /// Set the preferred lifetime of the prefix.
     #[inline]
     pub fn set_preferred_lifetime(&mut self, time: Duration) {
-        NetworkEndian::write_u32(&mut self.buffer[field::PREF_LT], time.secs() as u32);
+        NetworkEndian::write_u32(&mut self.buffer[field::PREF_LT], time.as_secs());
     }
 
     /// Clear the reserved bits.
@@ -319,7 +328,7 @@ impl<'a> NdiscOption<'a> {
 
     /// Set the prefix.
     #[inline]
-    pub fn set_prefix(&mut self, addr: Ipv6Address) {
+    pub fn set_prefix(&mut self, addr: Ipv6Addr) {
         self.buffer[field::PREFIX].copy_from_slice(&addr.octets());
     }
 }
@@ -344,9 +353,10 @@ impl<'a> NdiscOption<'a> {
 
 #[cfg(test)]
 mod test {
-    use super::Error;
+    use super::Malformed;
     use super::{NdiscOption, PrefixInfoFlags, Type};
-    use crate::wire::Ipv6Address;
+    use crate::time::Duration;
+    use crate::wire::Ipv6Addr;
 
     static PREFIX_OPT_BYTES: [u8; 32] = [
         0x03, 0x04, 0x40, 0xc0, 0x00, 0x00, 0x03, 0x84, 0x00, 0x00, 0x03, 0xe8, 0x00, 0x00, 0x00, 0x00, 0xfe, 0x80,
@@ -361,7 +371,75 @@ mod test {
         assert_eq!(opt.data_len(), 4);
         assert_eq!(opt.prefix_len(), 64);
         assert_eq!(opt.prefix_flags(), PrefixInfoFlags::ON_LINK | PrefixInfoFlags::ADDRCONF);
-        assert_eq!(opt.prefix(), Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(opt.valid_lifetime(), Duration::from_secs(900));
+        assert_eq!(opt.preferred_lifetime(), Duration::from_secs(1000));
+        assert_eq!(opt.prefix(), Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+    }
+
+    #[test]
+    fn test_construct() {
+        // Into a buffer full of stale bytes: every byte of the option is written.
+        let mut bytes = [0x2a; 32];
+        let mut opt = NdiscOption::new_unchecked(&mut bytes[..]);
+        opt.set_option_type(Type::PrefixInformation);
+        opt.set_data_len(4);
+        opt.set_prefix_len(64);
+        opt.set_prefix_flags(PrefixInfoFlags::ON_LINK | PrefixInfoFlags::ADDRCONF);
+        opt.set_valid_lifetime(Duration::from_secs(900));
+        opt.set_preferred_lifetime(Duration::from_secs(1000));
+        opt.clear_prefix_reserved();
+        opt.set_prefix(Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1));
+        assert_eq!(&bytes[..], &PREFIX_OPT_BYTES[..]);
+    }
+
+    #[test]
+    fn test_mtu() {
+        let mut bytes = [0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x05, 0xdc];
+        let opt = NdiscOption::new_checked(&mut bytes[..]).unwrap();
+        assert_eq!(opt.option_type(), Type::Mtu);
+        assert_eq!(opt.data_len(), 1);
+        assert_eq!(opt.mtu(), 1500);
+
+        let mut built = [0x2a; 8];
+        let mut opt = NdiscOption::new_unchecked(&mut built[..]);
+        opt.set_option_type(Type::Mtu);
+        opt.set_data_len(1);
+        opt.clear_mtu_reserved();
+        opt.set_mtu(1500);
+        assert_eq!(built, bytes);
+    }
+
+    /// An 8-byte link-layer address option (data length 1) carries an Ethernet
+    /// address, as a source or a target option alike.
+    #[test]
+    #[cfg(feature = "medium-ethernet")]
+    fn test_link_layer_addr_ethernet() {
+        use crate::iface::Medium;
+        use crate::wire::{EthernetAddress, HardwareAddress};
+        let mut bytes = [0x01, 0x01, 0x54, 0x52, 0x00, 0x12, 0x23, 0x34];
+        let addr = HardwareAddress::Ethernet(EthernetAddress([0x54, 0x52, 0x00, 0x12, 0x23, 0x34]));
+        {
+            let opt = NdiscOption::new_checked(&mut bytes[..]).unwrap();
+            assert_eq!(opt.option_type(), Type::SourceLinkLayerAddr);
+            assert_eq!(opt.data_len(), 1);
+            assert_eq!(opt.link_layer_addr().parse(Medium::Ethernet), Ok(addr));
+            #[cfg(feature = "medium-ieee802154")]
+            assert!(opt.link_layer_addr().parse(Medium::Ieee802154).is_err());
+        }
+        bytes[0] = 0x02;
+        {
+            let opt = NdiscOption::new_checked(&mut bytes[..]).unwrap();
+            assert_eq!(opt.option_type(), Type::TargetLinkLayerAddr);
+            assert_eq!(opt.link_layer_addr().parse(Medium::Ethernet), Ok(addr));
+        }
+
+        // The same option, built with the setters.
+        let mut built = [0x2a; 8];
+        let mut opt = NdiscOption::new_unchecked(&mut built[..]);
+        opt.set_option_type(Type::TargetLinkLayerAddr);
+        opt.set_data_len(1);
+        opt.set_link_layer_addr(addr.into());
+        assert_eq!(built, bytes);
     }
 
     /// A 16-byte link-layer address option (data length 2) carries an
@@ -388,9 +466,9 @@ mod test {
 
     #[test]
     fn test_short_packet() {
-        assert_eq!(NdiscOption::new_checked(&mut [0x00, 0x00]), Err(Error));
+        assert_eq!(NdiscOption::new_checked(&mut [0x00, 0x00]), Err(Malformed));
         let mut bytes = [0x03, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert_eq!(NdiscOption::new_checked(&mut bytes), Err(Error));
+        assert_eq!(NdiscOption::new_checked(&mut bytes), Err(Malformed));
     }
 }
 

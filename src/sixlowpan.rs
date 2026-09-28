@@ -9,10 +9,14 @@
 
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
 use crate::driver::PacketBuf;
+use crate::error::{Full, Malformed};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
 use crate::rand::Rand;
+#[cfg(feature = "sixlowpan-fragmentation")]
+use crate::stack::Blocked;
 use crate::stack::{Stack, StackInner};
-use crate::storage::{Full, Vec};
+use crate::storage::Vec;
+use crate::time::Instant;
 use crate::wire::ip::checksum;
 use crate::wire::*;
 
@@ -114,15 +118,15 @@ impl Iface<'_, '_> {
     /// identifier are resolved with the context at that index. Sent packets
     /// never use contexts.
     ///
-    /// Errors:
-    /// - `Full` if the contexts do not fit. Only possible without the `alloc`
+    /// # Errors
+    /// - `Full`: if the contexts do not fit. Only possible without the `alloc`
     ///   feature, where the limit is
     ///   [`SIXLOWPAN_ADDRESS_CONTEXT_COUNT`].
     ///   The interface is left unchanged.
     pub fn set_sixlowpan_address_context(
         &mut self,
         contexts: impl IntoIterator<Item = SixlowpanAddressContext>,
-    ) -> core::result::Result<(), Full> {
+    ) -> Result<(), Full> {
         let mut new: Vec<SixlowpanAddressContext, SIXLOWPAN_ADDRESS_CONTEXT_COUNT> = Vec::new();
         new.try_extend(contexts)?;
         self.state_mut().sixlowpan.sixlowpan_address_context = new;
@@ -132,7 +136,7 @@ impl Iface<'_, '_> {
 
 // Ingress.
 impl Stack<'_> {
-    pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf) {
+    pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf, now: Instant) {
         let (ieee802154_repr, header_len) = check!(Ieee802154Repr::parse(&buf));
 
         if ieee802154_repr.frame_type != Ieee802154FrameType::Data {
@@ -161,10 +165,16 @@ impl Stack<'_> {
         }
 
         buf.pull_front(header_len);
-        self.process_sixlowpan(iface, &ieee802154_repr, buf)
+        self.process_sixlowpan(iface, &ieee802154_repr, buf, now)
     }
 
-    fn process_sixlowpan(&mut self, iface: IfaceHandle, ieee802154_repr: &Ieee802154Repr, mut buf: PacketBuf) {
+    fn process_sixlowpan(
+        &mut self,
+        iface: IfaceHandle,
+        ieee802154_repr: &Ieee802154Repr,
+        mut buf: PacketBuf,
+        now: Instant,
+    ) {
         let buf = match check!(SixlowpanPacket::dispatch(&buf)) {
             #[cfg(not(feature = "sixlowpan-reassembly"))]
             SixlowpanPacket::FragmentHeader => {
@@ -176,7 +186,7 @@ impl Stack<'_> {
             }
             #[cfg(feature = "sixlowpan-reassembly")]
             SixlowpanPacket::FragmentHeader => {
-                let Some(buf) = self.process_sixlowpan_fragment(iface, ieee802154_repr, buf) else {
+                let Some(buf) = self.process_sixlowpan_fragment(iface, ieee802154_repr, buf, now) else {
                     return;
                 };
                 buf
@@ -205,6 +215,7 @@ impl Stack<'_> {
                 ieee802154_repr.src_addr.unwrap_or(Ieee802154Address::Absent),
             )),
             buf,
+            now,
         )
     }
 }
@@ -244,7 +255,7 @@ pub(crate) fn sixlowpan_to_ipv6(
     ll_dst_addr: Option<Ieee802154Address>,
     address_context: &[SixlowpanAddressContext],
     total_len: Option<usize>,
-) -> Result<()> {
+) -> Result<(), Malformed> {
     // Parse everything first. The write pass below overwrites the compressed
     // headers, so nothing may be read from them after it starts.
     let (iphc_repr, iphc_len) = SixlowpanIphcRepr::parse(buf, ll_src_addr, ll_dst_addr, address_context)?;
@@ -267,11 +278,11 @@ pub(crate) fn sixlowpan_to_ipv6(
                     let (ext_repr, hdr_len) = SixlowpanExtHeaderRepr::parse(&buf[offset..])?;
                     let data_len = ext_repr.length as usize;
                     if offset + hdr_len + data_len > buf.len() {
-                        return Err(Error);
+                        return Err(Malformed);
                     }
                     let nh = decompress_next_header(ext_repr.next_header, &buf[offset + hdr_len + data_len..])?;
                     if n_ext == MAX_NHC_EXT_HEADERS {
-                        return Err(Error);
+                        return Err(Malformed);
                     }
                     exts[n_ext] = ExtInfo {
                         next_header: nh,
@@ -309,9 +320,9 @@ pub(crate) fn sixlowpan_to_ipv6(
     // Make room. The uncompressed chain is always longer: the IPHC header
     // alone frees at least 38 bytes, and a compressed extension header is at
     // most 1 byte shorter than its IPv6 form.
-    let grow = uncompressed_len.checked_sub(compressed_len).ok_or(Error)?;
+    let grow = uncompressed_len.checked_sub(compressed_len).ok_or(Malformed)?;
     if !buf.ensure_headroom(grow) {
-        return Err(Error);
+        return Err(Malformed);
     }
     buf.push_front(grow);
     // Everything recorded above moved by `grow`. The payload, at the end of
@@ -319,7 +330,7 @@ pub(crate) fn sixlowpan_to_ipv6(
 
     let packet_len = total_len.unwrap_or(buf.len());
     if packet_len < uncompressed_len {
-        return Err(Error);
+        return Err(Malformed);
     }
 
     // Write forward. Each header's data is moved to its place before the
@@ -365,7 +376,7 @@ pub(crate) fn sixlowpan_to_ipv6(
             // An elided checksum can only be computed over the whole datagram.
             None if total_len.is_some() => {
                 debug!("6LoWPAN: elided UDP checksum on a fragmented packet");
-                return Err(Error);
+                return Err(Malformed);
             }
             None => !checksum::combine(&[
                 checksum::pseudo_header_v6(
@@ -396,7 +407,7 @@ pub(crate) fn sixlowpan_to_ipv6(
 /// converted: for a compressed next header, that is where the compressed
 /// header it names starts.
 #[inline]
-fn decompress_next_header(next_header: SixlowpanNextHeader, payload: &[u8]) -> Result<IpProtocol> {
+fn decompress_next_header(next_header: SixlowpanNextHeader, payload: &[u8]) -> Result<IpProtocol, Malformed> {
     match next_header {
         SixlowpanNextHeader::Compressed => match SixlowpanNhcPacket::dispatch(payload)? {
             SixlowpanNhcPacket::ExtHeader => {
@@ -428,7 +439,7 @@ struct ExtHeader {
 ///
 /// Returns the difference between the uncompressed and the compressed header
 /// chain lengths, which fragmentation needs for its offsets.
-pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr) -> Result<usize> {
+pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr) -> Result<usize, Malformed> {
     // Parse the uncompressed chain.
     let packet = Ipv6Packet::new_checked(buf)?;
     let src_addr = packet.src_addr();
@@ -529,7 +540,7 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
     // ending where the header ended; what does not fit spills into the headroom.
     let extra = compressed_len.saturating_sub(IPV6_HEADER_LEN);
     if !buf.ensure_headroom(extra) {
-        return Err(Error);
+        return Err(Malformed);
     }
     buf.push_front(extra);
 
@@ -610,7 +621,7 @@ impl StackInner {
 
         let total_size = buf.len();
         let ieee_len = ieee_repr.buffer_len();
-        let mtu = iface.driver.capabilities().max_transmission_unit;
+        let mtu = iface.caps.max_transmission_unit;
 
         if total_size + ieee_len > mtu {
             #[cfg(feature = "sixlowpan-fragmentation")]
@@ -643,6 +654,7 @@ impl Stack<'_> {
         iface: IfaceHandle,
         ieee802154_repr: &Ieee802154Repr,
         mut buf: PacketBuf,
+        now: Instant,
     ) -> Option<PacketBuf> {
         use crate::reassembly::FragKey;
 
@@ -679,7 +691,7 @@ impl Stack<'_> {
         let frag_slot = match self
             .fragments
             .assembler
-            .get(&key, self.inner.now + self.fragments.reassembly_timeout)
+            .get(&key, now + self.fragments.reassembly_timeout)
         {
             Ok(frag) => frag,
             Err(_) => {
@@ -761,7 +773,7 @@ impl StackInner {
 
         let total_size = buf.len();
         let ieee_len = ieee_repr.buffer_len();
-        let mtu = iface.driver.capabilities().max_transmission_unit;
+        let mtu = iface.caps.max_transmission_unit;
 
         // We calculate how much data we can send in the first fragment and the other
         // fragments. The eventual IPv6 sizes of these fragments need to be a multiple of eight
@@ -802,31 +814,33 @@ impl StackInner {
         frag.buffer = Some(buf);
 
         // Transmit as many fragments as the device takes now. The rest go
-        // out on the next polls.
-        self.sixlowpan_egress(iface);
+        // out on the next polls, which also schedule the retry if the pool ran out.
+        let _ = self.sixlowpan_egress(iface);
     }
 
     /// Process fragments that still need to be sent for 6LoWPAN packets.
     ///
     /// Fragments go out while the device has room for them and the pool has
-    /// buffers. The rest wait in the fragmenter for the next poll.
-    pub(crate) fn sixlowpan_egress(&mut self, iface: &mut IfaceState<'_>) {
+    /// buffers. The rest wait in the fragmenter for the next poll, and the error
+    /// says which of the two ran out.
+    pub(crate) fn sixlowpan_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
         if iface.fragmenter.is_empty() {
-            return;
+            return Ok(());
         }
 
         while !iface.fragmenter.finished() {
             if !iface.can_transmit() {
                 trace!("fragmenter: device has no room, fragments wait");
-                return;
+                return Err(Blocked::DeviceBusy);
             }
             if !self.dispatch_ieee802154_frag(iface) {
-                return;
+                return Err(Blocked::NoBuffer);
             }
         }
 
         // Reset the buffer when we transmitted everything.
         iface.fragmenter.reset();
+        Ok(())
     }
 
     /// Transmit the next fragment of the packet in the interface's fragmenter.
@@ -904,7 +918,8 @@ impl StackInner {
     feature = "medium-ip",
     feature = "ipv4",
     feature = "ipv6",
-    feature = "raw",
+    feature = "raw-ethernet",
+    feature = "raw-ip",
     feature = "udp",
     feature = "tcp"
 ))]
@@ -914,6 +929,8 @@ impl StackInner {
     allow(unused_imports, dead_code)
 )]
 mod test {
+    use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
     use super::*;
     use crate::iface::Medium;
     use crate::iface::{AddrOrigin, IfaceHandle};
@@ -930,17 +947,17 @@ mod test {
     /// test vectors are addressed to.
     const OUR_LL: Ieee802154Address = Ieee802154Address::Extended([0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42]);
     /// OUR_LL as a link-local address.
-    const OUR_LINK_LOCAL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242);
+    const OUR_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x180b, 0x4242, 0x4242, 0x4242);
     /// The sender of the echo request test vector.
     const PEER_LL: Ieee802154Address = Ieee802154Address::Extended([0x26, 0x1c, 0x29, 0x57, 0x34, 0xa6, 0x3a, 0x62]);
-    const PEER_LINK_LOCAL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0x241c, 0x2957, 0x34a6, 0x3a62);
+    const PEER_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x241c, 0x2957, 0x34a6, 0x3a62);
 
     /// The Contiki-NG node of the fragmentation test vectors, and the address
     /// the vectors are addressed to.
     const CONTIKI_LL: Ieee802154Address = Ieee802154Address::Extended([0x42, 0x42, 0x42, 0x42, 0x42, 0x42, 0x0b, 0x1a]);
-    const CONTIKI_LINK_LOCAL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0x4042, 0x4242, 0x4242, 0x0b1a);
+    const CONTIKI_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x4042, 0x4242, 0x4242, 0x0b1a);
     const VECTOR_LL: Ieee802154Address = Ieee802154Address::Extended([0x90, 0xfc, 0x48, 0xc2, 0xa4, 0x41, 0xfc, 0x76]);
-    const VECTOR_LINK_LOCAL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0x92fc, 0x48c2, 0xa441, 0xfc76);
+    const VECTOR_LINK_LOCAL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0x92fc, 0x48c2, 0xa441, 0xfc76);
     /// The old test harness's own address.
     const ZERO_LL: Ieee802154Address = Ieee802154Address::Extended([0; 8]);
     const TWO_LL: Ieee802154Address = Ieee802154Address::Extended([0x02; 8]);
@@ -962,7 +979,7 @@ mod test {
         (stack, handle, rx, tx, room)
     }
 
-    fn fill_neighbor(stack: &mut Stack, iface: IfaceHandle, addr: Ipv6Address, ll: Ieee802154Address) {
+    fn fill_neighbor(stack: &mut Stack, iface: IfaceHandle, addr: Ipv6Addr, ll: Ieee802154Address) {
         stack
             .inner
             .neighbor_cache
@@ -1006,7 +1023,7 @@ mod test {
     /// the header difference.
     fn compress(packet: &[u8], src: Ieee802154Address, dst: Ieee802154Address, headroom: usize) -> (Vec<u8>, usize) {
         let mut buf = crate::test_device::packet_allocator().try_alloc().unwrap();
-        buf.reserve(headroom);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(packet.len());
         buf.copy_from_slice(packet);
         let header_diff = ipv6_to_sixlowpan(&mut buf, &mac_repr(src, dst, None)).unwrap();
@@ -1022,9 +1039,9 @@ mod test {
         context: &[SixlowpanAddressContext],
         headroom: usize,
         total_len: Option<usize>,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<Vec<u8>, Malformed> {
         let mut buf = crate::test_device::packet_allocator().try_alloc().unwrap();
-        buf.reserve(headroom);
+        buf.reserve(PACKET_BUF_DRIVER_HEADROOM + headroom);
         buf.set_len(payload.len());
         buf.copy_from_slice(payload);
         sixlowpan_to_ipv6(&mut buf, Some(src), Some(dst), context, total_len)?;
@@ -1223,9 +1240,9 @@ mod test {
     /// An NDISC message from `src` to `dst`, as an IPv6 packet with hop limit 255.
     fn ndisc_packet(
         msg_type: Icmpv6Message,
-        src: Ipv6Address,
-        dst: Ipv6Address,
-        target: Ipv6Address,
+        src: Ipv6Addr,
+        dst: Ipv6Addr,
+        target: Ipv6Addr,
         option_type: NdiscOptionType,
         ll: Ieee802154Address,
     ) -> Vec<u8> {
@@ -1318,15 +1335,15 @@ mod test {
     #[test]
     fn test_ipv4_dropped() {
         let (mut stack, iface, _rx, tx, _room) = test_stack(OUR_LL, None);
-        let our_v4 = Ipv4Address::new(192, 168, 1, 1);
-        let remote_v4 = Ipv4Address::new(192, 168, 1, 2);
+        let our_v4 = Ipv4Addr::new(192, 168, 1, 1);
+        let remote_v4 = Ipv4Addr::new(192, 168, 1, 2);
         stack.iface(iface).add_ip_addr(IpCidr::new(our_v4.into(), 24)).unwrap();
         tx.borrow_mut().clear();
         let udp = stack.add_udp_socket().unwrap();
         let mut socket = stack.udp_socket(udp);
-        socket.bind(1234, IpListenEndpoint::UNSPECIFIED).unwrap();
+        socket.bind(1234, ListenSocketAddr::UNSPECIFIED).unwrap();
         assert_eq!(
-            socket.send_slice(b"hello", IpEndpoint::new(remote_v4.into(), 5678)),
+            socket.send_slice(b"hello", SocketAddr::new(remote_v4.into(), 5678)),
             Ok(())
         );
         stack.poll(Instant::ZERO);
@@ -1339,9 +1356,9 @@ mod test {
     fn test_handle_udp_broadcast() {
         let (mut stack, _iface, rx, _tx, _room) = test_stack(OUR_LL, Some(PAN));
         let udp = stack.add_udp_socket().unwrap();
-        stack.udp_socket(udp).bind(68, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).bind(68, ListenSocketAddr::UNSPECIFIED).unwrap();
 
-        let src = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let src = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
         let dst = IPV6_LINK_LOCAL_ALL_NODES;
         let datagram = udp_datagram(src.into(), 67, dst.into(), 68, b"Hello");
         let packet = ipv6_packet(src, dst, IpProtocol::Udp, &datagram);
@@ -1364,8 +1381,8 @@ mod test {
         let mut socket = stack.udp_socket(udp);
         let received = socket.recv().unwrap();
         assert_eq!(&*received, b"Hello");
-        assert_eq!(received.meta().endpoint, IpEndpoint::new(src.into(), 67));
-        assert_eq!(received.meta().local_address, Some(dst.into()));
+        assert_eq!(received.meta().remote_addr, SocketAddr::new(src.into(), 67));
+        assert_eq!(received.meta().local_addr, Some(dst.into()));
     }
 
     /// A UDP datagram whose NHC header elides the checksum is delivered, with
@@ -1374,7 +1391,7 @@ mod test {
     fn test_elided_udp_checksum() {
         let (mut stack, _iface, rx, _tx, _room) = test_stack(OUR_LL, Some(PAN));
         let udp = stack.add_udp_socket().unwrap();
-        stack.udp_socket(udp).bind(6969, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).bind(6969, ListenSocketAddr::UNSPECIFIED).unwrap();
 
         // IPHC: TF elided, NH compressed, hop limit 64, both addresses elided.
         let mut payload = vec![0x7e, 0x33];
@@ -1388,7 +1405,10 @@ mod test {
         let mut socket = stack.udp_socket(udp);
         let received = socket.recv().unwrap();
         assert_eq!(&*received, b"no checksum");
-        assert_eq!(received.meta().endpoint, IpEndpoint::new(PEER_LINK_LOCAL.into(), 1234));
+        assert_eq!(
+            received.meta().remote_addr,
+            SocketAddr::new(PEER_LINK_LOCAL.into(), 1234)
+        );
     }
 
     static SIXLOWPAN_COMPRESSED_RPL_DAO: [u8; 99] = [
@@ -1441,11 +1461,11 @@ mod test {
         let mut our = [0u8; 16];
         our[..8].copy_from_slice(&context.0);
         our[8..].copy_from_slice(&OUR_LL.as_eui_64().unwrap());
-        let our = Ipv6Address::from_octets(our);
+        let our = Ipv6Addr::from_octets(our);
         let mut peer = [0u8; 16];
         peer[..8].copy_from_slice(&context.0);
         peer[8..].copy_from_slice(&PEER_LL.as_eui_64().unwrap());
-        let peer = Ipv6Address::from_octets(peer);
+        let peer = Ipv6Addr::from_octets(peer);
 
         let (mut stack, iface, rx, tx, _room) = test_stack(OUR_LL, None);
         stack.iface(iface).add_ip_addr(IpCidr::new(our.into(), 64)).unwrap();
@@ -1534,27 +1554,27 @@ mod test {
     fn test_roundtrip_matrix() {
         let short_ll = Ieee802154Address::Short([0x12, 0x34]);
         // (address, link-layer address it is sent with, compressed size)
-        let unicast: &[(Ipv6Address, Ieee802154Address, usize)] = &[
+        let unicast: &[(Ipv6Addr, Ieee802154Address, usize)] = &[
             (OUR_LINK_LOCAL, OUR_LL, 0),
-            (Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x1234), short_ll, 0),
-            (Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x5678), OUR_LL, 2),
-            (Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), OUR_LL, 8),
-            (Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), OUR_LL, 16),
+            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x1234), short_ll, 0),
+            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0xff, 0xfe00, 0x5678), OUR_LL, 2),
+            (Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1), OUR_LL, 8),
+            (Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1), OUR_LL, 16),
         ];
-        let multicast: &[(Ipv6Address, Ieee802154Address, usize)] = &[
+        let multicast: &[(Ipv6Addr, Ieee802154Address, usize)] = &[
             (IPV6_LINK_LOCAL_ALL_NODES, Ieee802154Address::BROADCAST, 1),
             (
-                Ipv6Address::new(0xff05, 0, 0, 0, 0, 0, 0x0001, 0x0203),
+                Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0x0001, 0x0203),
                 Ieee802154Address::BROADCAST,
                 4,
             ),
             (
-                Ipv6Address::new(0xff05, 0, 0, 0, 0, 0x0001, 0x0203, 0x0405),
+                Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0x0001, 0x0203, 0x0405),
                 Ieee802154Address::BROADCAST,
                 6,
             ),
             (
-                Ipv6Address::new(0xff15, 0x1234, 0, 0, 0, 0, 0, 1),
+                Ipv6Addr::new(0xff15, 0x1234, 0, 0, 0, 0, 0, 1),
                 Ieee802154Address::BROADCAST,
                 16,
             ),
@@ -1562,7 +1582,7 @@ mod test {
         let hbh = [0x01, 0x04, 0, 0, 0, 0];
 
         let mut cases = 0;
-        for &(src, src_ll, src_len) in unicast.iter().chain([(Ipv6Address::UNSPECIFIED, OUR_LL, 0)].iter()) {
+        for &(src, src_ll, src_len) in unicast.iter().chain([(Ipv6Addr::UNSPECIFIED, OUR_LL, 0)].iter()) {
             for &(dst, dst_ll, dst_len) in unicast.iter().chain(multicast) {
                 for hop_limit in [1u8, 64, 255, 17] {
                     for (kind, ports) in [
@@ -1642,8 +1662,8 @@ mod test {
     /// the extra headroom the compressed chain needs.
     #[test]
     fn test_compress_no_room() {
-        let src = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
-        let dst = Ipv6Address::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
+        let src = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 2);
         let mut buf = crate::test_device::packet_allocator().try_alloc().unwrap();
         let len = buf.capacity();
         buf.set_len(len);
@@ -1788,20 +1808,20 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         let udp = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(udp)
-            .bind((VECTOR_LINK_LOCAL, 6969), IpListenEndpoint::UNSPECIFIED)
+            .bind((VECTOR_LINK_LOCAL, 6969), ListenSocketAddr::UNSPECIFIED)
             .unwrap();
 
         inject(&mut stack, &rx, frame(CONTIKI_LL, VECTOR_LL, PAN, &UDP_FIRST_PART));
         assert_eq!(stack.udp_socket(udp).recv().err(), Some(RecvError::Exhausted));
         inject(&mut stack, &rx, frame(CONTIKI_LL, VECTOR_LL, PAN, &UDP_SECOND_PART));
 
-        let remote = IpEndpoint::new(CONTIKI_LINK_LOCAL.into(), 54217);
+        let remote = SocketAddr::new(CONTIKI_LINK_LOCAL.into(), 54217);
         {
             let mut socket = stack.udp_socket(udp);
             let received = socket.recv().unwrap();
             assert_eq!(&*received, UDP_DATA);
-            assert_eq!(received.meta().endpoint, remote);
-            assert_eq!(received.meta().local_address, Some(VECTOR_LINK_LOCAL.into()));
+            assert_eq!(received.meta().remote_addr, remote);
+            assert_eq!(received.meta().local_addr, Some(VECTOR_LINK_LOCAL.into()));
         }
         assert!(tx.borrow().is_empty());
 
@@ -1831,7 +1851,7 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         let (mut stack, iface, rx, tx, room) = test_stack(OUR_LL, Some(PAN));
         fill_neighbor(&mut stack, iface, PEER_LINK_LOCAL, PEER_LL);
         let udp = stack.add_udp_socket().unwrap();
-        stack.udp_socket(udp).bind(6969, IpListenEndpoint::UNSPECIFIED).unwrap();
+        stack.udp_socket(udp).bind(6969, ListenSocketAddr::UNSPECIFIED).unwrap();
         (stack, iface, rx, tx, room, udp)
     }
 
@@ -1851,7 +1871,10 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         let received = socket.recv().unwrap();
         assert_eq!(received.len(), 300);
         assert!(received.iter().enumerate().all(|(i, &b)| b == i as u8));
-        assert_eq!(received.meta().endpoint, IpEndpoint::new(PEER_LINK_LOCAL.into(), 1234));
+        assert_eq!(
+            received.meta().remote_addr,
+            SocketAddr::new(PEER_LINK_LOCAL.into(), 1234)
+        );
         assert_eq!(socket.recv().err(), Some(RecvError::Exhausted));
     }
 
@@ -1915,7 +1938,11 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         assert_eq!(stack.poll(Instant::ZERO), Instant::from_secs(1));
         // The fragments are forgotten by then: the last one alone completes nothing.
         stack.poll(Instant::from_secs(2));
-        assert_eq!(stack.poll(Instant::from_secs(2)), Instant::MAX);
+        // Only the sender's neighbor entry, learned at 0, is left to expire.
+        assert_eq!(
+            stack.poll(Instant::from_secs(2)),
+            Instant::ZERO + crate::neighbor::NeighborCache::ENTRY_LIFETIME
+        );
         inject(&mut stack, &rx, frames[3].clone());
         assert_eq!(stack.udp_socket(udp).recv().err(), Some(RecvError::Exhausted));
     }
@@ -1952,7 +1979,7 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
     #[cfg(feature = "sixlowpan-fragmentation")]
     fn test_fragmenter_holds_sockets_back() {
         let (mut stack, _iface, _rx, tx, room, udp) = reassembly_stack();
-        let remote = IpEndpoint::new(PEER_LINK_LOCAL.into(), 1234);
+        let remote = SocketAddr::new(PEER_LINK_LOCAL.into(), 1234);
         let payload = vec![0x55; 300];
 
         room.set(Some(1));
@@ -1989,14 +2016,14 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
     fn test_parked_packet_waits_for_fragmenter() {
         let (mut stack, _iface, rx, tx, room, udp) = reassembly_stack();
         let other_ll = Ieee802154Address::Extended([0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02]);
-        let other = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+        let other = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
         let payload = vec![0x55; 300];
 
         // Park a big packet on the unresolved neighbor: only a solicitation goes out.
         assert_eq!(
             stack
                 .udp_socket(udp)
-                .send_slice(&payload, IpEndpoint::new(other.into(), 1)),
+                .send_slice(&payload, SocketAddr::new(other.into(), 1)),
             Ok(())
         );
         assert_eq!(tx.borrow().len(), 1);
@@ -2007,12 +2034,12 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         assert_eq!(
             stack
                 .udp_socket(udp)
-                .send_slice(&payload, IpEndpoint::new(PEER_LINK_LOCAL.into(), 1)),
+                .send_slice(&payload, SocketAddr::new(PEER_LINK_LOCAL.into(), 1)),
             Ok(())
         );
         assert_eq!(tx.borrow().len(), 1);
 
-        // The neighbor resolves: its packet stays parked.
+        // The neighbor resolves while the fragmenter is busy: its packet stays parked.
         room.set(None);
         let na = ndisc_packet(
             Icmpv6Message::NeighborAdvert,
@@ -2024,15 +2051,14 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
         );
         let (compressed, _) = compress(&na, other_ll, OUR_LL, 0);
         rx.borrow_mut().push_back(frame(other_ll, OUR_LL, PAN, &compressed));
-        stack.poll(Instant::ZERO);
-        // The poll that processed the advertisement also drained the fragmenter.
-        assert_eq!(tx.borrow().len(), 4);
-        for frame in tx.borrow().iter() {
-            assert_eq!(parse_frame(frame).0.dst_addr, Some(PEER_LL));
-        }
-        // The next poll flushes the parked packet, in fragments.
+        // The poll that processed the advertisement drains the fragmenter, then
+        // flushes the parked packet, in fragments. Nothing would bring another poll
+        // for it: the device never said no.
         stack.poll(Instant::ZERO);
         assert_eq!(tx.borrow().len(), 8);
+        for frame in tx.borrow()[..4].iter() {
+            assert_eq!(parse_frame(frame).0.dst_addr, Some(PEER_LL));
+        }
         for frame in tx.borrow()[4..].iter() {
             assert_eq!(parse_frame(frame).0.dst_addr, Some(other_ll));
         }

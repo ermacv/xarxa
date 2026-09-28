@@ -7,15 +7,16 @@ os.chdir(dname)
 features = []
 
 
-def _feature(into, name, default, min, max, pow2=None):
-    vals = set()
-    val = min
-    while val <= max:
-        vals.add(val)
-        if pow2 == True or (isinstance(pow2, int) and val >= pow2):
-            val *= 2
-        else:
-            val += 1
+def _feature(into, name, default, min=None, max=None, pow2=None, vals=None):
+    vals = set(vals or [])
+    if min is not None:
+        val = min
+        while val <= max:
+            vals.add(val)
+            if pow2 == True or (isinstance(pow2, int) and val >= pow2):
+                val *= 2
+            else:
+                val += 1
     vals.add(default)
 
     into.append(
@@ -27,9 +28,22 @@ def _feature(into, name, default, min, max, pow2=None):
     )
 
 
-def feature(name, default, min, max, pow2=None):
-    _feature(features, name, default, min, max, pow2)
+def feature(name, default, min=None, max=None, pow2=None, vals=None):
+    _feature(features, name, default, min, max, pow2, vals)
 
+
+def driver_feature(name, default, min=None, max=None, pow2=None, vals=None):
+    _feature(driver_features, name, default, min, max, pow2, vals)
+
+
+# Packet pool. Lives in `xarxa-driver`; `xarxa` forwards these features there.
+# Buffer size: 802.15.4 frames, the IPv4 and IPv6 minimums plus an Ethernet
+# header, Ethernet with and without VLAN tags, and jumbo frames.
+driver_feature(
+    "packet_buf_size",
+    default=1514,
+    vals=[128, 256, 512, 590, 1024, 1294, 1514, 1518, 1522, 1536, 2048, 4096, 8192, 9018, 9022, 9216, 16384],
+)
 
 # Interfaces and tables (only bounded without `alloc`).
 feature("iface_count", default=2, min=1, max=8)
@@ -41,7 +55,8 @@ feature("slaac_router_count", default=2, min=1, max=16, pow2=8)
 
 # Always bounded.
 feature("neighbor_cache_count", default=8, min=1, max=1024, pow2=8)
-feature("pending_queue_count", default=16, min=1, max=256, pow2=8)
+feature("pending_queue_count", default=2, min=1, max=256, pow2=8)
+feature("tx_timestamp_queue_count", default=4, min=1, max=64, pow2=8)
 
 # Socket slabs (only bounded without `alloc`).
 feature("udp_socket_count", default=4, min=1, max=64, pow2=8)
@@ -70,6 +85,11 @@ feature("dns_max_server_count", default=4, min=1, max=32, pow2=4)
 feature("dns_max_name_size", default=255, min=64, max=255, pow2=True)
 feature("dhcp_max_dns_server_count", default=3, min=1, max=8)
 feature("dhcp_options_buf_size", default=128, min=16, max=1024, pow2=True)
+
+# DHCP server (feature `dhcpv4-server`): lease table entries per interface, and
+# the longest client identifier a lease can store.
+feature("dhcp_server_lease_count", default=8, min=1, max=64, pow2=8)
+feature("dhcp_server_client_id_size", default=24, min=8, max=64, pow2=True)
 
 # ========= Update Cargo.toml and build.rs of both crates
 

@@ -88,6 +88,10 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
     - Raw access to all lease options by option number. (feature `dhcpv4-options`)
+    - Sends the stack's hostname to the server, if set. (feature `hostname`)
+  - DHCP server (feature `dhcpv4-server`)
+    - Turned on per interface, hands out leases from a configured pool with gateway and DNS options.
+    - API to inspect and remove leases.
   - Fragmentation (feature `ipv4-fragmentation`)
   - Reassembly (feature `ipv4-reassembly`)
 - IPv6 (feature `ipv6`)
@@ -99,10 +103,10 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - UDP sockets (feature `udp`)
   - **zero-copy** on both TX and RX
   - Supports all binding modes Linux supports, including unconnected (receives from any IP) and connected sockets (receives from one fixed remote IP+port).
-- Raw sockets (feature `raw`)
+- Raw sockets
   - **zero-copy** on both TX and RX
-  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing, you choose the interface manually.
-  - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types.
+  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing. (feature `raw-ethernet`)
+  - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types. (feature `raw-ip`)
   - IP headers are byte-copied instead of parsed+re-emitted, so all fields and options are kept, even those unsupported by _xarxa_.
 - TCP sockets (feature `tcp`)
   - Full TCP implementation
@@ -123,6 +127,8 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Join and leave multicast groups per interface.
   - IGMPv1/IGMPv2 (IPv4) and MLDv2 (IPv6): membership is reported on join and leave, and in response to router queries.
   - The IPv6 solicited-node groups of the interface's addresses are joined automatically.
+  - The multicast hardware addresses the stack listens on are reported to the driver, for devices that filter multicast in hardware.
+- Bind sockets to an interface, like Linux's `SO_BINDTODEVICE`. (feature `iface-bind`)
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)
@@ -132,7 +138,6 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
-- DHCP server
 - Acting on link state: skipping down interfaces on egress routing, restarting DHCP/SLAAC on link-up.
 - IPv6 DAD (duplicate address detection)
 - IPv6 RDNSS (DNS servers from router advertisements)

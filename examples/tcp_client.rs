@@ -1,4 +1,4 @@
-//! TCP client: bring up a TUN/TAP interface, connect to a remote endpoint, send
+//! TCP client: bring up a TUN/TAP interface, connect to a remote peer, send
 //! a greeting, and print everything received until the remote end closes the
 //! connection.
 //!
@@ -11,7 +11,7 @@
 //! nc -l 1234
 //! ```
 //!
-//! Then run (the remote endpoint defaults to 192.168.69.100:1234):
+//! Then run (the remote peer defaults to 192.168.69.100:1234):
 //!
 //! ```sh
 //! cargo run --example tcp_client -- tap0        # TAP (Ethernet medium)
@@ -30,7 +30,7 @@ use std::os::unix::io::AsRawFd;
 use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
-use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address};
+use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr, SocketAddr};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -43,7 +43,7 @@ fn main() {
         HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]))
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
-    let remote: IpEndpoint = args
+    let remote: SocketAddr = args
         .get(1)
         .map(String::as_str)
         .unwrap_or("192.168.69.100:1234")
@@ -65,16 +65,16 @@ fn main() {
     stack
         .iface(iface)
         .set_ip_addrs([
-            IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-            IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
-            IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddr::v4(192, 168, 69, 1), 24),
+            IpCidr::new(IpAddr::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddr::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
         ])
         .unwrap();
 
     // Off-link traffic routes to the host's address on this interface.
     stack
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface)
+        .add_default_ipv4_route(Ipv4Addr::new(192, 168, 69, 100), iface)
         .unwrap();
 
     let tcp_handle = stack.add_tcp_socket_with_bufs(&mut rx_buffer, &mut tx_buffer).unwrap();
@@ -82,7 +82,7 @@ fn main() {
     // Local port 0: the stack allocates an ephemeral port.
     let mut socket = stack.tcp_socket(tcp_handle);
     socket.connect(remote, 0).unwrap();
-    log::info!("tcp: connecting to {remote} from {}", socket.local_endpoint().unwrap());
+    log::info!("tcp: connecting to {remote} from {}", socket.local_addr().unwrap());
 
     let mut greeting_sent = false;
     loop {
@@ -112,20 +112,14 @@ fn main() {
                 .unwrap();
         }
 
-        // The remote endpoint closed its transmit half: close ours too.
+        // The remote peer closed its transmit half: close ours too.
         if !socket.may_recv() && socket.may_send() {
             socket.close();
         }
 
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 

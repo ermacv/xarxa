@@ -28,7 +28,7 @@ use std::os::unix::io::AsRawFd;
 use xarxa::Stack;
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
-use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr};
 
 const PORT: u16 = 6969;
 
@@ -53,16 +53,16 @@ fn main() {
     stack
         .iface(iface)
         .set_ip_addrs([
-            IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-            IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
-            IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddr::v4(192, 168, 69, 1), 24),
+            IpCidr::new(IpAddr::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddr::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
         ])
         .unwrap();
 
     // Off-link traffic routes to the host's address on this interface.
     stack
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface)
+        .add_default_ipv4_route(Ipv4Addr::new(192, 168, 69, 100), iface)
         .unwrap();
 
     let listener = stack.add_tcp_listener().unwrap();
@@ -78,14 +78,12 @@ fn main() {
         // transmits (along with recomputing the wakeup deadline).
         stack.poll(Instant::now());
 
-        // Accept every queued connection attempt. Each accept allocates the
-        // connection's socket buffers, and the socket answers the SYN with a
-        // SYN|ACK on the next poll.
-        while let Some(handle) = stack.tcp_listener(listener).accept(4096, 4096) {
-            log::info!(
-                "tcp: connection from {}",
-                stack.tcp_socket(handle).remote_endpoint().unwrap()
-            );
+        // Accept every queued connection attempt into a fresh socket. The
+        // socket answers the SYN with a SYN|ACK on the next poll.
+        while let Some(token) = stack.tcp_listener(listener).accept() {
+            log::info!("tcp: connection from {}", token.remote_addr());
+            let handle = stack.add_tcp_socket(4096, 4096).unwrap();
+            stack.tcp_socket(handle).accept(token).unwrap();
             connections.push(handle);
         }
 
@@ -101,7 +99,7 @@ fn main() {
                 socket.send_slice(&buf[..len]).unwrap();
             }
 
-            // The remote endpoint closed its transmit half and everything
+            // The remote peer closed its transmit half and everything
             // received has been echoed back: close ours too.
             if !socket.may_recv() && socket.may_send() {
                 socket.close();
@@ -119,15 +117,9 @@ fn main() {
 
         let deadline = stack.poll(Instant::now());
 
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 

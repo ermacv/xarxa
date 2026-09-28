@@ -3,13 +3,13 @@
 // which `iface` re-exports.
 
 use crate::config::MULTICAST_GROUP_COUNT;
-use crate::storage::{Full, Vec};
-use core::result::Result;
+use crate::error::Full;
+use crate::storage::Vec;
 
 use crate::driver::PacketBuf;
 use crate::iface::{Iface, IfaceState};
 use crate::stack::StackInner;
-use crate::time::{Duration, Instant};
+use crate::time::{Clock, Duration, Instant};
 use crate::wire::*;
 
 /// Error type for [`Iface::join_multicast_group`] and [`Iface::leave_multicast_group`].
@@ -35,7 +35,7 @@ pub(crate) enum IgmpReportState {
     ToSpecificQuery {
         version: IgmpVersion,
         timeout: Instant,
-        group: Ipv4Address,
+        group: Ipv4Addr,
     },
 }
 
@@ -43,7 +43,7 @@ pub(crate) enum IgmpReportState {
 pub(crate) enum MldReportState {
     Inactive,
     ToGeneralQuery { timeout: Instant },
-    ToSpecificQuery { group: Ipv6Address, timeout: Instant },
+    ToSpecificQuery { group: Ipv6Addr, timeout: Instant },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,7 @@ enum GroupState {
 }
 
 pub(crate) struct State {
-    groups: Vec<(IpAddress, GroupState), MULTICAST_GROUP_COUNT>,
+    groups: Vec<(IpAddr, GroupState), MULTICAST_GROUP_COUNT>,
     /// When to report for (all or) the next multicast group membership via IGMP
     #[cfg(feature = "ipv4")]
     igmp_report_state: IgmpReportState,
@@ -76,7 +76,15 @@ impl State {
         }
     }
 
-    pub(crate) fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
+    pub(crate) fn rejoin(&mut self) {
+        for (_, state) in &mut self.groups {
+            if *state == GroupState::Joined {
+                *state = GroupState::Joining;
+            }
+        }
+    }
+
+    pub(crate) fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
         // Return false if we don't have the multicast group,
         // or we're leaving it.
         match self.get(&addr.into()) {
@@ -87,36 +95,15 @@ impl State {
         }
     }
 
-    /// The earliest time at which a pending membership report is due.
-    pub(crate) fn poll_at(&self) -> Instant {
-        #[allow(unused_mut)]
-        let mut deadline = Instant::MAX;
-        #[cfg(feature = "ipv4")]
-        match self.igmp_report_state {
-            IgmpReportState::Inactive => {}
-            IgmpReportState::ToGeneralQuery { timeout, .. } | IgmpReportState::ToSpecificQuery { timeout, .. } => {
-                deadline = deadline.min(timeout)
-            }
-        }
-        #[cfg(feature = "ipv6")]
-        match self.mld_report_state {
-            MldReportState::Inactive => {}
-            MldReportState::ToGeneralQuery { timeout } | MldReportState::ToSpecificQuery { timeout, .. } => {
-                deadline = deadline.min(timeout)
-            }
-        }
-        deadline
-    }
-
-    fn get(&self, addr: &IpAddress) -> Option<GroupState> {
+    fn get(&self, addr: &IpAddr) -> Option<GroupState> {
         self.groups.iter().find(|(a, _)| a == addr).map(|(_, state)| *state)
     }
 
-    fn get_mut(&mut self, addr: &IpAddress) -> Option<&mut GroupState> {
+    fn get_mut(&mut self, addr: &IpAddr) -> Option<&mut GroupState> {
         self.groups.iter_mut().find(|(a, _)| a == addr).map(|(_, state)| state)
     }
 
-    fn insert(&mut self, addr: IpAddress, state: GroupState) -> Result<(), Full> {
+    fn insert(&mut self, addr: IpAddr, state: GroupState) -> Result<(), Full> {
         match self.get_mut(&addr) {
             Some(old) => {
                 *old = state;
@@ -126,15 +113,25 @@ impl State {
         }
     }
 
-    fn remove(&mut self, addr: &IpAddress) {
+    fn remove(&mut self, addr: &IpAddr) {
         if let Some(index) = self.groups.iter().position(|(a, _)| a == addr) {
             self.groups.swap_remove(index);
         }
     }
 
     /// The joined addresses.
-    fn keys(&self) -> impl Iterator<Item = &IpAddress> + Clone + '_ {
+    fn keys(&self) -> impl Iterator<Item = &IpAddr> + Clone + '_ {
         self.groups.iter().map(|(addr, _)| addr)
+    }
+
+    /// The addresses of the groups the interface listens on: the joined
+    /// groups, not counting the ones being left.
+    #[cfg(feature = "medium-ethernet")]
+    pub(crate) fn active_groups(&self) -> impl Iterator<Item = &IpAddr> + '_ {
+        self.groups
+            .iter()
+            .filter(|(_, state)| !matches!(state, GroupState::Leaving))
+            .map(|(addr, _)| addr)
     }
 }
 
@@ -155,10 +152,13 @@ impl Iface<'_, '_> {
     /// The stack accepts packets sent to the group right away, and reports the
     /// membership to the routers on the link from the next [`Stack::poll`](crate::Stack::poll).
     ///
-    /// Errors:
-    /// - `Unaddressable` if the address is not a multicast address.
-    pub fn join_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
-        self.state_mut().join_multicast_group(addr)
+    /// # Errors
+    /// - `Unaddressable`: if the address is not a multicast address.
+    pub fn join_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
+        let res = self.state_mut().join_multicast_group(addr);
+        #[cfg(feature = "medium-ethernet")]
+        self.state_mut().sync_multicast_filter();
+        res
     }
 
     /// Leave a multicast group.
@@ -168,10 +168,13 @@ impl Iface<'_, '_> {
     /// [`Stack::poll`](crate::Stack::poll). Leaving a group that was not joined
     /// does nothing.
     ///
-    /// Errors:
-    /// - `Unaddressable` if the address is not a multicast address.
-    pub fn leave_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
-        self.state_mut().leave_multicast_group(addr)
+    /// # Errors
+    /// - `Unaddressable`: if the address is not a multicast address.
+    pub fn leave_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
+        let res = self.state_mut().leave_multicast_group(addr);
+        #[cfg(feature = "medium-ethernet")]
+        self.state_mut().sync_multicast_filter();
+        res
     }
 
     /// Check whether the interface listens to the given multicast address.
@@ -179,14 +182,14 @@ impl Iface<'_, '_> {
     /// Besides the joined groups, this is true for the groups every host is a
     /// member of: the IPv4 all systems group, the IPv6 all nodes group, and the
     /// IPv6 solicited node group of each address assigned to the interface.
-    pub fn has_multicast_group<T: Into<IpAddress>>(&self, addr: T) -> bool {
+    pub fn has_multicast_group(&self, addr: impl Into<IpAddr>) -> bool {
         self.state().has_multicast_group(addr)
     }
 }
 
 impl IfaceState<'_> {
     /// Add an address to a list of subscribed multicast IP addresses.
-    pub(crate) fn join_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
+    pub(crate) fn join_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
         let addr = addr.into();
         if !addr.is_multicast() {
             return Err(MulticastError::Unaddressable);
@@ -207,7 +210,7 @@ impl IfaceState<'_> {
     }
 
     /// Remove an address from the subscribed multicast IP addresses.
-    pub(crate) fn leave_multicast_group<T: Into<IpAddress>>(&mut self, addr: T) -> Result<(), MulticastError> {
+    pub(crate) fn leave_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
         let addr = addr.into();
         if !addr.is_multicast() {
             return Err(MulticastError::Unaddressable);
@@ -236,8 +239,7 @@ impl IfaceState<'_> {
         let mut i = 0;
         while i < self.multicast.groups.len() {
             let (addr, _) = self.multicast.groups[i];
-            let stale =
-                matches!(addr, IpAddress::Ipv6(a) if a.is_solicited_node_multicast() && !self.has_solicited_node(a));
+            let stale = matches!(addr, IpAddr::V6(a) if a.is_solicited_node_multicast() && !self.has_solicited_node(a));
             let len = self.multicast.groups.len();
             if stale {
                 let _ = self.leave_multicast_group(addr);
@@ -251,7 +253,7 @@ impl IfaceState<'_> {
         // walked by index.
         for i in 0..self.ip_addrs.len() {
             #[allow(irrefutable_let_patterns)]
-            if let IpCidr::Ipv6(cidr) = self.ip_addrs[i].cidr {
+            if let IpCidr::V6(cidr) = self.ip_addrs[i].cidr {
                 let _ = self.join_multicast_group(cidr.address().solicited_node());
             }
         }
@@ -262,26 +264,32 @@ impl IfaceState<'_> {
     /// - Send join/leave packets according to the multicast group state.
     /// - Depending on `igmp_report_state` and the therein contained
     ///   timeouts, send IGMP membership reports.
-    pub(crate) fn multicast_egress(&mut self, inner: &mut StackInner) {
-        // Process multicast joins.
-        while let Some(&(addr, _)) = self
-            .multicast
-            .groups
-            .iter()
-            .find(|&&(_, state)| state == GroupState::Joining)
-        {
+    pub(crate) fn multicast_egress(&mut self, inner: &mut StackInner, clock: &mut Clock) {
+        // IPv4 reports need an address. Keep joins pending across DHCP restart.
+        #[cfg(feature = "ipv4")]
+        let has_ipv4_addr = self.ipv4_addr().is_some();
+        while let Some(&(addr, _)) = self.multicast.groups.iter().find(|&&(addr, state)| {
+            state == GroupState::Joining
+                && match addr {
+                    #[cfg(feature = "ipv4")]
+                    IpAddr::V4(_) => has_ipv4_addr,
+                    #[cfg(feature = "ipv6")]
+                    IpAddr::V6(_) => true,
+                }
+        }) {
             match addr {
                 #[cfg(feature = "ipv4")]
-                IpAddress::Ipv4(addr) => {
+                IpAddr::V4(addr) => {
                     if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, IgmpVersion::Version2, addr) {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
                 #[cfg(feature = "ipv6")]
-                IpAddress::Ipv6(addr) => {
+                IpAddr::V6(addr) => {
+                    // An empty EXCLUDE list accepts every source; empty INCLUDE leaves.
                     if let Some(pkt) = self.mldv2_report_packet(
                         inner.packet_allocator,
-                        core::iter::once((MldRecordType::ChangeToInclude, addr)),
+                        core::iter::once((MldRecordType::ChangeToExclude, addr)),
                     ) {
                         self.dispatch_ip(inner, pkt);
                     }
@@ -301,16 +309,16 @@ impl IfaceState<'_> {
         {
             match addr {
                 #[cfg(feature = "ipv4")]
-                IpAddress::Ipv4(addr) => {
+                IpAddr::V4(addr) => {
                     if let Some(pkt) = self.igmp_leave_packet(inner.packet_allocator, addr) {
                         self.dispatch_ip(inner, pkt);
                     }
                 }
                 #[cfg(feature = "ipv6")]
-                IpAddress::Ipv6(addr) => {
+                IpAddr::V6(addr) => {
                     if let Some(pkt) = self.mldv2_report_packet(
                         inner.packet_allocator,
-                        core::iter::once((MldRecordType::ChangeToExclude, addr)),
+                        core::iter::once((MldRecordType::ChangeToInclude, addr)),
                     ) {
                         self.dispatch_ip(inner, pkt);
                     }
@@ -320,65 +328,69 @@ impl IfaceState<'_> {
             self.multicast.remove(&addr);
         }
 
+        // Send every report that is due. After a late poll, several of the reports
+        // a general query spreads out can be due at once.
         #[cfg(feature = "ipv4")]
-        match self.multicast.igmp_report_state {
-            IgmpReportState::ToSpecificQuery {
-                version,
-                timeout,
-                group,
-            } if inner.now >= timeout => {
-                if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, version, group) {
-                    // Send initial membership report
-                    self.dispatch_ip(inner, pkt);
+        loop {
+            match self.multicast.igmp_report_state {
+                IgmpReportState::ToSpecificQuery {
+                    version,
+                    timeout,
+                    group,
+                } if clock.expired(timeout) => {
+                    if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, version, group) {
+                        // Send initial membership report
+                        self.dispatch_ip(inner, pkt);
+                    }
+                    self.multicast.igmp_report_state = IgmpReportState::Inactive;
                 }
-                self.multicast.igmp_report_state = IgmpReportState::Inactive;
-            }
-            IgmpReportState::ToGeneralQuery {
-                version,
-                timeout,
-                interval,
-                next_index,
-            } if inner.now >= timeout => {
-                let addr = self
-                    .multicast
-                    .keys()
-                    .filter_map(|addr| match addr {
-                        IpAddress::Ipv4(addr) => Some(*addr),
-                        #[allow(unreachable_patterns)]
-                        _ => None,
-                    })
-                    .nth(next_index);
+                IgmpReportState::ToGeneralQuery {
+                    version,
+                    timeout,
+                    interval,
+                    next_index,
+                } if clock.expired(timeout) => {
+                    let addr = self
+                        .multicast
+                        .keys()
+                        .filter_map(|addr| match addr {
+                            IpAddr::V4(addr) => Some(*addr),
+                            #[allow(unreachable_patterns)]
+                            _ => None,
+                        })
+                        .nth(next_index);
 
-                match addr {
-                    Some(addr) => {
-                        if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, version, addr) {
-                            // Send initial membership report
-                            self.dispatch_ip(inner, pkt);
+                    match addr {
+                        Some(addr) => {
+                            if let Some(pkt) = self.igmp_report_packet(inner.packet_allocator, version, addr) {
+                                // Send initial membership report
+                                self.dispatch_ip(inner, pkt);
 
-                            let next_timeout = (timeout + interval).max(inner.now);
-                            self.multicast.igmp_report_state = IgmpReportState::ToGeneralQuery {
-                                version,
-                                timeout: next_timeout,
-                                interval,
-                                next_index: next_index + 1,
-                            };
-                        } else {
-                            // No address to report from: nothing else to send.
+                                let next_timeout = (timeout + interval).max(clock.now());
+                                self.multicast.igmp_report_state = IgmpReportState::ToGeneralQuery {
+                                    version,
+                                    timeout: next_timeout,
+                                    interval,
+                                    next_index: next_index + 1,
+                                };
+                            } else {
+                                // No address to report from: nothing else to send.
+                                self.multicast.igmp_report_state = IgmpReportState::Inactive;
+                            }
+                        }
+                        None => {
                             self.multicast.igmp_report_state = IgmpReportState::Inactive;
                         }
                     }
-                    None => {
-                        self.multicast.igmp_report_state = IgmpReportState::Inactive;
-                    }
                 }
+                _ => break,
             }
-            _ => {}
         }
         #[cfg(feature = "ipv6")]
         match self.multicast.mld_report_state {
-            MldReportState::ToGeneralQuery { timeout } if inner.now >= timeout => {
+            MldReportState::ToGeneralQuery { timeout } if clock.expired(timeout) => {
                 let records = self.multicast.keys().filter_map(|addr| match addr {
-                    IpAddress::Ipv6(addr) => Some((MldRecordType::ModeIsExclude, *addr)),
+                    IpAddr::V6(addr) => Some((MldRecordType::ModeIsExclude, *addr)),
                     #[allow(unreachable_patterns)]
                     _ => None,
                 });
@@ -387,7 +399,7 @@ impl IfaceState<'_> {
                 }
                 self.multicast.mld_report_state = MldReportState::Inactive;
             }
-            MldReportState::ToSpecificQuery { group, timeout } if inner.now >= timeout => {
+            MldReportState::ToSpecificQuery { group, timeout } if clock.expired(timeout) => {
                 let record = (MldRecordType::ModeIsExclude, group);
                 if let Some(pkt) = self.mldv2_report_packet(inner.packet_allocator, core::iter::once(record)) {
                     self.dispatch_ip(inner, pkt);
@@ -406,13 +418,13 @@ impl IfaceState<'_> {
     fn dispatch_ip(&mut self, inner: &mut StackInner, mut buf: PacketBuf) {
         let (dst_addr, ethertype) = match IpVersion::of_packet(&buf) {
             #[cfg(feature = "ipv4")]
-            Ok(IpVersion::Ipv4) => (
-                IpAddress::Ipv4(Ipv4Packet::new_unchecked(&mut buf).dst_addr()),
+            Ok(IpVersion::V4) => (
+                IpAddr::V4(Ipv4Packet::new_unchecked(&mut buf).dst_addr()),
                 EthernetProtocol::Ipv4,
             ),
             #[cfg(feature = "ipv6")]
-            Ok(IpVersion::Ipv6) => (
-                IpAddress::Ipv6(Ipv6Packet::new_unchecked(&mut buf).dst_addr()),
+            Ok(IpVersion::V6) => (
+                IpAddr::V6(Ipv6Packet::new_unchecked(&mut buf).dst_addr()),
                 EthernetProtocol::Ipv6,
             ),
             Err(_) => return,
@@ -423,10 +435,12 @@ impl IfaceState<'_> {
     /// Host duties of the **IGMPv2** protocol.
     ///
     /// Sets up `igmp_report_state` for responding to IGMP general/specific membership queries.
-    /// Membership must not be reported immediately in order to avoid flooding the network
-    /// after a query is broadcasted by a router; this is not currently done.
+    /// Membership is not reported immediately, to avoid flooding the network after a query
+    /// is multicast by a router. The delay is not random as RFC 2236 §3 asks for: a general
+    /// query is answered with one report per group, spread evenly over the query's Max Resp
+    /// Time, and a group-specific query after a quarter of it.
     #[cfg(feature = "ipv4")]
-    pub(crate) fn process_igmp(&mut self, inner: &mut StackInner, dst_addr: Ipv4Address, mut buf: PacketBuf) {
+    pub(crate) fn process_igmp(&mut self, dst_addr: Ipv4Addr, mut buf: PacketBuf, now: Instant) {
         let igmp_packet = check!(IgmpPacket::new_checked(&mut buf));
         if !igmp_packet.verify_checksum() {
             trace!("igmp: checksum incorrect");
@@ -440,7 +454,6 @@ impl IfaceState<'_> {
             return;
         }
 
-        // FIXME: report membership after a delay
         match igmp_packet.msg_type() {
             IgmpMessage::MembershipQuery => {
                 let max_resp_time = igmp_packet.max_resp_time();
@@ -453,11 +466,8 @@ impl IfaceState<'_> {
 
                 // General query
                 if group_addr.is_unspecified() && dst_addr == IPV4_MULTICAST_ALL_SYSTEMS {
-                    let ipv4_multicast_group_count = self
-                        .multicast
-                        .keys()
-                        .filter(|a| matches!(a, IpAddress::Ipv4(_)))
-                        .count();
+                    let ipv4_multicast_group_count =
+                        self.multicast.keys().filter(|a| matches!(a, IpAddr::V4(_))).count();
 
                     // Are we member in any groups?
                     if ipv4_multicast_group_count != 0 {
@@ -473,7 +483,7 @@ impl IfaceState<'_> {
                         };
                         self.multicast.igmp_report_state = IgmpReportState::ToGeneralQuery {
                             version,
-                            timeout: inner.now + interval,
+                            timeout: now + interval,
                             interval,
                             next_index: 0,
                         };
@@ -485,7 +495,7 @@ impl IfaceState<'_> {
                         let timeout = max_resp_time / 4;
                         self.multicast.igmp_report_state = IgmpReportState::ToSpecificQuery {
                             version,
-                            timeout: inner.now + timeout,
+                            timeout: now + timeout,
                             group: group_addr,
                         };
                     }
@@ -504,11 +514,13 @@ impl IfaceState<'_> {
         &self,
         allocator: crate::driver::PacketBufAllocator,
         version: IgmpVersion,
-        group_addr: Ipv4Address,
+        group_addr: Ipv4Addr,
     ) -> Option<PacketBuf> {
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
         let iface_addr = self.ipv4_addr()?;
         let mut pkt = allocator.try_alloc()?;
-        pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
             let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
@@ -537,11 +549,13 @@ impl IfaceState<'_> {
     fn igmp_leave_packet(
         &self,
         allocator: crate::driver::PacketBufAllocator,
-        group_addr: Ipv4Address,
+        group_addr: Ipv4Addr,
     ) -> Option<PacketBuf> {
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+
         let iface_addr = self.ipv4_addr()?;
         let mut pkt = allocator.try_alloc()?;
-        pkt.reserve(LINK_HEADER_LEN + IPV4_HEADER_LEN);
+        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV4_HEADER_LEN);
         pkt.set_len(IGMP_BUFFER_LEN);
         {
             let mut igmp_packet = IgmpPacket::new_unchecked(&mut pkt);
@@ -564,46 +578,45 @@ impl IfaceState<'_> {
     /// Host duties of the **MLDv2** protocol.
     ///
     /// Sets up `mld_report_state` for responding to MLD general/specific membership queries.
-    /// Membership must not be reported immediately in order to avoid flooding the network
-    /// after a query is broadcasted by a router; Currently the delay is fixed and not randomized.
+    /// Membership is not reported immediately, to avoid flooding the network after a query
+    /// is multicast by a router: the report is delayed by a random time below the query's
+    /// Maximum Response Delay (RFC 3810 §6.2). A Maximum Response Code of zero asks for an
+    /// immediate report.
     #[cfg(feature = "ipv6")]
     pub(crate) fn process_mldv2(
         &mut self,
         inner: &mut StackInner,
-        dst_addr: Ipv6Address,
+        dst_addr: Ipv6Addr,
         icmp_packet: &Icmpv6Packet<'_>,
+        now: Instant,
     ) {
         if icmp_packet.msg_code() != 0 {
             return;
         }
 
         let mcast_addr = icmp_packet.mcast_addr();
-        let max_resp_code = icmp_packet.max_resp_code();
 
-        // Do not respond immediately to the query, but wait a random time
-        let delay = if max_resp_code > 0 {
-            (inner.rand.rand_u16() % max_resp_code).into()
+        // Do not respond immediately to the query, but wait a random time in
+        // [0, Maximum Response Delay). The wire layer decodes the delay from the
+        // Maximum Response Code, including the floating point form of codes of
+        // 32768 and above (RFC 3810 §5.1.3), so it can be longer than 65535 ms.
+        let max_resp_delay = icmp_packet.max_resp_delay().as_millis();
+        let delay = if max_resp_delay > 0 {
+            Duration::from_millis(inner.rand.rand_u32() % max_resp_delay)
         } else {
-            0
+            Duration::ZERO
         };
-        let delay = Duration::from_millis(delay);
         // General query
         if mcast_addr.is_unspecified() && (dst_addr == IPV6_LINK_LOCAL_ALL_NODES || self.has_ip_addr(dst_addr)) {
-            let ipv6_multicast_group_count = self
-                .multicast
-                .keys()
-                .filter(|a| matches!(a, IpAddress::Ipv6(_)))
-                .count();
+            let ipv6_multicast_group_count = self.multicast.keys().filter(|a| matches!(a, IpAddr::V6(_))).count();
             if ipv6_multicast_group_count != 0 {
-                self.multicast.mld_report_state = MldReportState::ToGeneralQuery {
-                    timeout: inner.now + delay,
-                };
+                self.multicast.mld_report_state = MldReportState::ToGeneralQuery { timeout: now + delay };
             }
         }
         if self.has_multicast_group(mcast_addr) && dst_addr == mcast_addr {
             self.multicast.mld_report_state = MldReportState::ToSpecificQuery {
                 group: mcast_addr,
-                timeout: inner.now + delay,
+                timeout: now + delay,
             };
         }
     }
@@ -615,12 +628,14 @@ impl IfaceState<'_> {
     fn mldv2_report_packet(
         &self,
         allocator: crate::driver::PacketBufAllocator,
-        records: impl Iterator<Item = (MldRecordType, Ipv6Address)> + Clone,
+        records: impl Iterator<Item = (MldRecordType, Ipv6Addr)> + Clone,
     ) -> Option<PacketBuf> {
         // Per [RFC 3810 § 5.2.13], source addresses must be link-local, falling
         // back to the unspecified address if we haven't acquired one.
         // [RFC 3810 § 5.2.13]: https://tools.ietf.org/html/rfc3810#section-5.2.13
-        let src_addr = self.link_local_ipv6_address().unwrap_or(Ipv6Address::UNSPECIFIED);
+
+        use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
+        let src_addr = self.link_local_ipv6_address().unwrap_or(Ipv6Addr::UNSPECIFIED);
 
         // Per [RFC 3810 § 5.2.14], all MLDv2 reports are sent to ff02::16.
         // [RFC 3810 § 5.2.14]: https://tools.ietf.org/html/rfc3810#section-5.2.14
@@ -628,7 +643,7 @@ impl IfaceState<'_> {
 
         // MLD report: the report header (8 bytes) plus one record per group.
         let mut pkt = allocator.try_alloc()?;
-        pkt.reserve(LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
+        pkt.reserve(PACKET_BUF_DRIVER_HEADROOM + LINK_HEADER_LEN + IPV6_HEADER_LEN + MLDV2_ROUTER_ALERT_LEN);
         let max_records = (pkt.tailroom() - 8) / MLD_ADDRESS_RECORD_LEN;
         let record_count = records.clone().count();
         if record_count > max_records {
@@ -655,7 +670,7 @@ impl IfaceState<'_> {
                 record.set_mcast_addr(mcast_addr);
                 payload = &mut payload[MLD_ADDRESS_RECORD_LEN..];
             }
-            if self.checksum_caps().icmpv6.tx() {
+            if !self.checksum_caps().icmpv6.tx {
                 mld.fill_checksum(&src_addr, &dst_addr);
             } else {
                 mld.set_checksum(0);
@@ -702,31 +717,32 @@ mod test {
     use std::vec::Vec;
 
     use super::*;
-    use crate::driver::{Checksum, ChecksumCapabilities};
+    use crate::driver::{ChecksumCapabilities, ChecksumOffload};
     use crate::iface::IfaceHandle;
     use crate::iface::Medium;
     use crate::stack::Stack;
-    use crate::test_device::{Queue, Sent, TestDevice};
+    use crate::test_device::{Link, Queue, Sent, TestDevice};
+    use crate::time::idle_deadline;
 
     const OUR_HW: EthernetAddress = EthernetAddress([0x02, 0, 0, 0, 0, 0x01]);
     const REMOTE_HW: EthernetAddress = EthernetAddress([0x52, 0x54, 0x00, 0x00, 0x00, 0x00]);
-    const OUR_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-    const REMOTE_V4: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
-    const OUR_LL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    const REMOTE_LL: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100);
+    const OUR_V4: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+    const REMOTE_V4: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
+    const OUR_LL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    const REMOTE_LL: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 0x100);
     const IFACE: IfaceHandle = IfaceHandle::new(0);
 
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_LL`]/64 (plus, on Ethernet, the automatic link-local address, whose
     /// solicited-node group is the same as [`OUR_LL`]'s).
-    fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
+    fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
         test_stack_with_checksum(medium, ChecksumCapabilities::default())
     }
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
-    fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+    fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium).with_checksum(checksum);
-        let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
+        let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
         let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(
             &mut stack,
@@ -742,7 +758,7 @@ mod test {
             .iface(handle)
             .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_LL.into(), 64)])
             .unwrap();
-        (stack, rx, tx)
+        (stack, rx, tx, link)
     }
 
     /// The IP packets transmitted since the last call, link-layer header stripped.
@@ -794,7 +810,7 @@ mod test {
     }
 
     /// A parsed IGMP packet: source, destination, hop limit, message type, group.
-    type IgmpReport = (Ipv4Address, Ipv4Address, u8, IgmpMessage, Ipv4Address);
+    type IgmpReport = (Ipv4Addr, Ipv4Addr, u8, IgmpMessage, Ipv4Addr);
 
     fn recv_igmp(medium: Medium, tx: &Sent) -> Vec<IgmpReport> {
         recv_all(medium, tx)
@@ -822,11 +838,11 @@ mod test {
 
     /// A whole IPv4 packet carrying an IGMP message.
     fn igmp_packet(
-        src_addr: Ipv4Address,
-        dst_addr: Ipv4Address,
+        src_addr: Ipv4Addr,
+        dst_addr: Ipv4Addr,
         msg_type: IgmpMessage,
         max_resp_time: Duration,
-        group_addr: Ipv4Address,
+        group_addr: Ipv4Addr,
     ) -> Vec<u8> {
         let mut bytes = vec![0; IPV4_HEADER_LEN + IGMP_BUFFER_LEN];
         {
@@ -851,7 +867,7 @@ mod test {
     }
 
     /// A parsed MLDv2 report: source, destination, hop limit, and the address records.
-    type MldReport = (Ipv6Address, Ipv6Address, u8, Vec<(MldRecordType, Ipv6Address)>);
+    type MldReport = (Ipv6Addr, Ipv6Addr, u8, Vec<(MldRecordType, Ipv6Addr)>);
 
     fn recv_mld(medium: Medium, tx: &Sent) -> Vec<MldReport> {
         recv_all(medium, tx)
@@ -893,7 +909,7 @@ mod test {
 
     /// A whole IPv6 packet carrying an MLDv2 query from `src_addr` to `dst_addr`,
     /// with hop limit 1.
-    fn mld_query(src_addr: Ipv6Address, dst_addr: Ipv6Address, mcast_addr: Ipv6Address, max_resp_code: u16) -> Vec<u8> {
+    fn mld_query(src_addr: Ipv6Addr, dst_addr: Ipv6Addr, mcast_addr: Ipv6Addr, max_resp_code: u16) -> Vec<u8> {
         let mut bytes = vec![0; IPV6_HEADER_LEN + 28];
         {
             let mut query = Icmpv6Packet::new_unchecked(&mut bytes[IPV6_HEADER_LEN..]);
@@ -921,11 +937,39 @@ mod test {
     }
 
     #[test]
+    fn test_ipv4_membership_report_after_link_recovery() {
+        let medium = Medium::Ethernet;
+        let (mut stack, _rx, tx, link) = test_stack(medium);
+        let group = Ipv4Addr::new(224, 0, 0, 22);
+        let report = [(OUR_V4, group, 1, IgmpMessage::MembershipReportV2, group)];
+        stack.iface(IFACE).join_multicast_group(group).unwrap();
+        stack.poll(Instant::ZERO);
+        assert_eq!(recv_igmp(medium, &tx), report);
+
+        link.set(crate::driver::LinkState::Down);
+        stack.poll(Instant::ZERO);
+        link.set(crate::driver::LinkState::Up);
+        stack.poll(Instant::ZERO);
+        assert_eq!(recv_igmp(medium, &tx), report);
+
+        // Reports wait for an IPv4 source when DHCP restarts on link-up.
+        link.set(crate::driver::LinkState::Down);
+        stack.poll(Instant::ZERO);
+        stack.iface(IFACE).remove_ip_addr(OUR_V4);
+        link.set(crate::driver::LinkState::Up);
+        stack.poll(Instant::ZERO);
+        assert!(recv_igmp(medium, &tx).is_empty());
+        stack.iface(IFACE).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
+        stack.poll(Instant::ZERO);
+        assert_eq!(recv_igmp(medium, &tx), report);
+    }
+
+    #[test]
     fn test_handle_igmp() {
         for medium in [Medium::Ip, Medium::Ethernet] {
-            let groups = [Ipv4Address::new(224, 0, 0, 22), Ipv4Address::new(224, 0, 0, 56)];
+            let groups = [Ipv4Addr::new(224, 0, 0, 22), Ipv4Addr::new(224, 0, 0, 56)];
 
-            let (mut stack, rx, tx) = test_stack(medium);
+            let (mut stack, rx, tx, _link) = test_stack(medium);
             stack.poll(Instant::ZERO);
             tx.borrow_mut().clear();
 
@@ -936,7 +980,7 @@ mod test {
                 assert!(stack.iface(IFACE).has_multicast_group(*group));
             }
             assert!(stack.iface(IFACE).has_multicast_group(IPV4_MULTICAST_ALL_SYSTEMS));
-            assert_eq!(stack.poll(timestamp), Instant::MAX);
+            assert_eq!(stack.poll(timestamp), idle_deadline(timestamp));
 
             let reports = recv_igmp(medium, &tx);
             assert_eq!(reports.len(), 2);
@@ -956,7 +1000,7 @@ mod test {
                 IPV4_MULTICAST_ALL_SYSTEMS,
                 IgmpMessage::MembershipQuery,
                 max_resp_time,
-                Ipv4Address::UNSPECIFIED,
+                Ipv4Addr::UNSPECIFIED,
             );
             let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, query, timestamp);
             assert_eq!(deadline, timestamp + interval);
@@ -974,7 +1018,7 @@ mod test {
                 recv_igmp(medium, &tx),
                 [(OUR_V4, groups[1], 1, IgmpMessage::MembershipReportV2, groups[1])]
             );
-            assert_eq!(stack.poll(deadline), Instant::MAX);
+            assert_eq!(stack.poll(deadline), idle_deadline(deadline));
             assert!(recv_igmp(medium, &tx).is_empty());
 
             // Group-specific query: only the queried group is reported, after a
@@ -989,18 +1033,18 @@ mod test {
             let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, query, timestamp);
             assert_eq!(deadline, timestamp + max_resp_time / 4);
             assert!(recv_igmp(medium, &tx).is_empty());
-            assert_eq!(stack.poll(deadline), Instant::MAX);
+            assert_eq!(stack.poll(deadline), idle_deadline(deadline));
             assert_eq!(
                 recv_igmp(medium, &tx),
                 [(OUR_V4, groups[1], 1, IgmpMessage::MembershipReportV2, groups[1])]
             );
 
             // A query for a group we're not a member of is ignored.
-            let other = Ipv4Address::new(224, 0, 0, 99);
+            let other = Ipv4Addr::new(224, 0, 0, 99);
             let query = igmp_packet(REMOTE_V4, other, IgmpMessage::MembershipQuery, max_resp_time, other);
             assert_eq!(
                 inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, query, timestamp),
-                Instant::MAX
+                idle_deadline(timestamp)
             );
 
             // Leave multicast groups
@@ -1028,14 +1072,78 @@ mod test {
         }
     }
 
+    /// A general query's reports are spread over the maximum response time. A poll
+    /// that comes after several of them are due sends them all, instead of one per
+    /// poll with a request to be polled again right away.
+    #[test]
+    fn test_igmp_general_query_late_poll() {
+        for medium in [Medium::Ip, Medium::Ethernet] {
+            let groups = [Ipv4Addr::new(224, 0, 0, 22), Ipv4Addr::new(224, 0, 0, 56)];
+
+            let (mut stack, rx, tx, _link) = test_stack(medium);
+            for group in &groups {
+                stack.iface(IFACE).join_multicast_group(*group).unwrap();
+            }
+            stack.poll(Instant::ZERO);
+            tx.borrow_mut().clear();
+
+            let max_resp_time = Duration::from_secs(10);
+            let query = igmp_packet(
+                REMOTE_V4,
+                IPV4_MULTICAST_ALL_SYSTEMS,
+                IgmpMessage::MembershipQuery,
+                max_resp_time,
+                Ipv4Addr::UNSPECIFIED,
+            );
+            let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv4, query, Instant::ZERO);
+            assert_eq!(deadline, Instant::ZERO + max_resp_time / 3);
+
+            let deadline = stack.poll(Instant::from_secs(20));
+            assert_eq!(
+                recv_igmp(medium, &tx),
+                [
+                    (OUR_V4, groups[0], 1, IgmpMessage::MembershipReportV2, groups[0]),
+                    (OUR_V4, groups[1], 1, IgmpMessage::MembershipReportV2, groups[1]),
+                ]
+            );
+            // The next look for a group to report finds none left.
+            assert_eq!(stack.poll(deadline), idle_deadline(deadline));
+            assert!(recv_igmp(medium, &tx).is_empty());
+        }
+    }
+
+    #[test]
+    fn test_ipv6_membership_report_after_link_recovery() {
+        let medium = Medium::Ethernet;
+        let (mut stack, _rx, tx, link) = test_stack(medium);
+        let group = Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb);
+        stack.iface(IFACE).join_multicast_group(group).unwrap();
+        stack.poll(Instant::ZERO);
+        recv_mld(medium, &tx);
+
+        link.set(crate::driver::LinkState::Down);
+        stack.poll(Instant::ZERO);
+        link.set(crate::driver::LinkState::Up);
+        stack.poll(Instant::ZERO);
+        assert_eq!(
+            recv_mld(medium, &tx),
+            [OUR_LL.solicited_node(), group].map(|addr| (
+                OUR_LL,
+                IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
+                1,
+                vec![(MldRecordType::ChangeToExclude, addr)]
+            ))
+        );
+    }
+
     #[test]
     fn test_join_ipv6_multicast_group() {
         for medium in [Medium::Ip, Medium::Ethernet] {
-            let (mut stack, _rx, tx) = test_stack(medium);
+            let (mut stack, _rx, tx, _link) = test_stack(medium);
 
             let groups = [
-                Ipv6Address::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb),
-                Ipv6Address::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0017),
+                Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb),
+                Ipv6Addr::new(0xff0e, 0, 0, 0, 0, 0, 0, 0x0017),
             ];
 
             let timestamp = Instant::from_millis(0);
@@ -1062,7 +1170,7 @@ mod test {
                         OUR_LL,
                         IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
                         1,
-                        vec![(MldRecordType::ChangeToInclude, group_addr)]
+                        vec![(MldRecordType::ChangeToExclude, group_addr)]
                     )
                 );
 
@@ -1076,7 +1184,7 @@ mod test {
                         OUR_LL,
                         IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
                         1,
-                        vec![(MldRecordType::ChangeToExclude, group_addr)]
+                        vec![(MldRecordType::ChangeToInclude, group_addr)]
                     )]
                 );
             }
@@ -1086,11 +1194,11 @@ mod test {
     #[test]
     fn test_handle_valid_multicast_query() {
         let medium = Medium::Ethernet;
-        let (mut stack, rx, tx) = test_stack(medium);
+        let (mut stack, rx, tx, _link) = test_stack(medium);
 
         let mut timestamp = Instant::ZERO;
 
-        let query_ip_addr = Ipv6Address::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1234);
+        let query_ip_addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 0x1234);
 
         stack.iface(IFACE).join_multicast_group(query_ip_addr).unwrap();
 
@@ -1101,7 +1209,7 @@ mod test {
         let queries = [
             // General query, expect both multicast addresses back
             (
-                Ipv6Address::UNSPECIFIED,
+                Ipv6Addr::UNSPECIFIED,
                 IPV6_LINK_LOCAL_ALL_NODES,
                 vec![OUR_LL.solicited_node(), query_ip_addr],
             ),
@@ -1117,7 +1225,7 @@ mod test {
             assert!(recv_mld(medium, &tx).is_empty());
 
             timestamp += Duration::from_millis(1000);
-            assert_eq!(stack.poll(timestamp), Instant::MAX);
+            assert_eq!(stack.poll(timestamp), idle_deadline(timestamp));
 
             let expected_records = results
                 .iter()
@@ -1132,21 +1240,66 @@ mod test {
         // A query that didn't come from a link-local address, or with a hop limit
         // other than 1, is ignored.
         let query = mld_query(
-            Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2),
+            Ipv6Addr::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2),
             IPV6_LINK_LOCAL_ALL_NODES,
-            Ipv6Address::UNSPECIFIED,
+            Ipv6Addr::UNSPECIFIED,
             1000,
         );
         assert_eq!(
             inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp),
-            Instant::MAX
+            idle_deadline(timestamp)
         );
-        let mut query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Address::UNSPECIFIED, 1000);
+        let mut query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Addr::UNSPECIFIED, 1000);
         Ipv6Packet::new_unchecked(&mut query[..]).set_hop_limit(64);
         assert_eq!(
             inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp),
-            Instant::MAX
+            idle_deadline(timestamp)
         );
+    }
+
+    /// The report delay follows the query's Maximum Response Code: a code of
+    /// zero means report at once, and a code of 32768 or more is a floating
+    /// point value (RFC 3810 §5.1.3), not a count of milliseconds.
+    #[test]
+    fn test_multicast_query_max_resp_code() {
+        let medium = Medium::Ethernet;
+        let (mut stack, rx, tx, _link) = test_stack(medium);
+        let mut timestamp = Instant::ZERO;
+        stack.poll(timestamp);
+        // flush the report from joining the solicited-node group
+        recv_mld(medium, &tx);
+        let expected_records = vec![(MldRecordType::ModeIsExclude, OUR_LL.solicited_node())];
+
+        // Code 0: the report goes out in the same poll that handles the query.
+        let query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Addr::UNSPECIFIED, 0);
+        let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp);
+        assert_eq!(deadline, idle_deadline(timestamp));
+        assert_eq!(
+            recv_mld(medium, &tx),
+            [(OUR_LL, IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS, 1, expected_records.clone())]
+        );
+
+        // Code 0xffff decodes to 8387.584 s, not 65.535 s: every delay is below
+        // the former, and, the delays being random, some are above the latter.
+        let max_resp_delay = Duration::from_millis(8_387_584);
+        let mut above_linear = 0;
+        for _ in 0..16 {
+            let query = mld_query(REMOTE_LL, IPV6_LINK_LOCAL_ALL_NODES, Ipv6Addr::UNSPECIFIED, 0xffff);
+            let deadline = inject(&mut stack, &rx, medium, EthernetProtocol::Ipv6, query, timestamp);
+            assert!(deadline >= timestamp && deadline < timestamp + max_resp_delay);
+            if deadline >= timestamp + Duration::from_millis(65_535) {
+                above_linear += 1;
+            }
+            assert!(recv_mld(medium, &tx).is_empty());
+
+            timestamp += max_resp_delay;
+            assert_eq!(stack.poll(timestamp), idle_deadline(timestamp));
+            assert_eq!(
+                recv_mld(medium, &tx),
+                [(OUR_LL, IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS, 1, expected_records.clone())]
+            );
+        }
+        assert!(above_linear > 0);
     }
 
     /// The solicited-node group of every address is joined automatically on
@@ -1154,7 +1307,7 @@ mod test {
     #[test]
     fn test_solicited_node_groups() {
         let medium = Medium::Ethernet;
-        let (mut stack, _rx, tx) = test_stack(medium);
+        let (mut stack, _rx, tx, _link) = test_stack(medium);
         let solicited_node = OUR_LL.solicited_node();
         assert!(stack.iface(IFACE).has_multicast_group(solicited_node));
 
@@ -1165,11 +1318,11 @@ mod test {
                 OUR_LL,
                 IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
                 1,
-                vec![(MldRecordType::ChangeToInclude, solicited_node)]
+                vec![(MldRecordType::ChangeToExclude, solicited_node)]
             )]
         );
 
-        let new_addr = Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2);
+        let new_addr = Ipv6Addr::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2);
         stack
             .iface(IFACE)
             .add_ip_addr(IpCidr::new(new_addr.into(), 64))
@@ -1181,7 +1334,7 @@ mod test {
                 OUR_LL,
                 IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
                 1,
-                vec![(MldRecordType::ChangeToInclude, new_addr.solicited_node())]
+                vec![(MldRecordType::ChangeToExclude, new_addr.solicited_node())]
             )]
         );
 
@@ -1194,12 +1347,12 @@ mod test {
                 OUR_LL,
                 IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
                 1,
-                vec![(MldRecordType::ChangeToExclude, new_addr.solicited_node())]
+                vec![(MldRecordType::ChangeToInclude, new_addr.solicited_node())]
             )]
         );
 
         // Not on IP interfaces: there is no link to report on.
-        let (mut stack, _rx, tx) = test_stack(Medium::Ip);
+        let (mut stack, _rx, tx, _link) = test_stack(Medium::Ip);
         stack.poll(Instant::ZERO);
         assert!(recv_mld(Medium::Ip, &tx).is_empty());
     }
@@ -1209,12 +1362,12 @@ mod test {
     #[cfg(feature = "udp")]
     fn test_multicast_ingress() {
         let medium = Medium::Ip;
-        let (mut stack, rx, _tx) = test_stack(medium);
-        let group = Ipv4Address::new(224, 0, 0, 251);
+        let (mut stack, rx, _tx, _link) = test_stack(medium);
+        let group = Ipv4Addr::new(224, 0, 0, 251);
         let handle = stack.add_udp_socket().unwrap();
         stack
             .udp_socket(handle)
-            .bind(5353, IpListenEndpoint::UNSPECIFIED)
+            .bind(5353, ListenSocketAddr::UNSPECIFIED)
             .unwrap();
 
         let datagram = {
@@ -1267,7 +1420,7 @@ mod test {
         );
         let recv = stack.udp_socket(handle).recv().unwrap();
         assert_eq!(&*recv, b"hi");
-        assert_eq!(recv.meta().endpoint, IpEndpoint::new(REMOTE_V4.into(), 5353));
+        assert_eq!(recv.meta().remote_addr, SocketAddr::new(REMOTE_V4.into(), 5353));
         drop(recv);
 
         // Left: dropped again.
@@ -1283,19 +1436,19 @@ mod test {
     fn test_checksum_offload() {
         let medium = Medium::Ip;
         let mut caps = ChecksumCapabilities::default();
-        caps.ipv4 = Checksum::None;
-        caps.icmpv6 = Checksum::None;
-        let (mut stack, _rx, tx) = test_stack_with_checksum(medium, caps);
+        caps.ipv4 = ChecksumOffload::BOTH;
+        caps.icmpv6 = ChecksumOffload::BOTH;
+        let (mut stack, _rx, tx, _link) = test_stack_with_checksum(medium, caps);
         stack.poll(Instant::ZERO);
         tx.borrow_mut().clear();
 
         stack
             .iface(IFACE)
-            .join_multicast_group(Ipv4Address::new(224, 0, 0, 22))
+            .join_multicast_group(Ipv4Addr::new(224, 0, 0, 22))
             .unwrap();
         stack
             .iface(IFACE)
-            .join_multicast_group(Ipv6Address::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb))
+            .join_multicast_group(Ipv6Addr::new(0xff05, 0, 0, 0, 0, 0, 0, 0x00fb))
             .unwrap();
         stack.poll(Instant::ZERO);
 

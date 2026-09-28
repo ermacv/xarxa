@@ -1,7 +1,7 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
+use crate::error::Malformed;
 
 open_enum! {
     /// Ethernet protocol type.
@@ -106,17 +106,19 @@ impl<'a> Frame<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Frame<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Frame<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    pub fn check_len(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
-        if len < HEADER_LEN { Err(Error) } else { Ok(()) }
+        if len < HEADER_LEN { Err(Malformed) } else { Ok(()) }
     }
 
     /// Return the length of a frame header.
@@ -210,6 +212,19 @@ mod test {
         assert!(!Address::BROADCAST.is_unicast());
         assert!(Address::BROADCAST.is_multicast());
         assert!(Address::BROADCAST.is_local());
+    }
+
+    /// The modified EUI-64 of a MAC: the U/L bit flipped, `ff:fe` in the middle.
+    #[test]
+    fn test_as_eui_64() {
+        assert_eq!(
+            Address([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]).as_eui_64(),
+            [0xa8, 0xbb, 0xcc, 0xff, 0xfe, 0xdd, 0xee, 0xff]
+        );
+        assert_eq!(
+            Address([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]).as_eui_64(),
+            [0x00, 0x00, 0x00, 0xff, 0xfe, 0x00, 0x00, 0x01]
+        );
     }
 }
 

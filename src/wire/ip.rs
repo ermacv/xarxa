@@ -467,38 +467,65 @@ pub mod checksum {
         ((sum >> 16) as u16) + (sum as u16)
     }
 
+    #[inline(always)]
+    fn add_with_end_around_carry(accumulator: u32, word: u32) -> u32 {
+        // Accumulating modulo 2^32-1 preserves the final Internet-checksum
+        // fold because 2^32 is congruent to 1 modulo 2^16-1. This avoids
+        // splitting every native u32 load into two u16 addends.
+        let (sum, carry) = accumulator.overflowing_add(word);
+        sum + u32::from(carry)
+    }
+
     /// Compute an RFC 1071 compliant checksum (without the final complement).
     pub fn data(data: &[u8]) -> u16 {
-        // We calculate the sum in native-endian before converting to big-endian at the end
-        // see RFC 1071 section 2.(B) for details
-        let mut accum: u32 = 0;
-
-        // We manually unroll this hot loop.
-        // When optimizing for size (as is common for microcontrollers) the compiler will not unroll
-        // this. Manually unrolling allows us to do more work per loop tax (compare and branch).
-        // It does not seem to affect the auto-vectorization on bigger machines.
-        let (chunks, mut rem) = data.as_chunks::<4>();
-        for chunk in chunks {
-            let val_0 = u16::from_ne_bytes(chunk[..2].try_into().unwrap());
-            let val_1 = u16::from_ne_bytes(chunk[2..4].try_into().unwrap());
-            accum += val_0 as u32;
-            accum += val_1 as u32;
+        // This is the same aligned native-endian scheme as lwIP's
+        // LWIP_CHKSUM_ALGORITHM=2: the bulk path sums native u32 loads, two
+        // Internet-checksum words each. See RFC 1071 section 2(B).
+        // `pod_align_to` provides the aligned u32 view without unsafe code.
+        let start = data.as_ptr().addr();
+        let (head, words, tail) = bytemuck::pod_align_to::<u8, u32>(data);
+        let (quad_words, remaining_words) = words.as_chunks::<4>();
+        let mut accum_0 = edge_sum(head, start);
+        let mut accum_1 = 0u32;
+        let mut accum_2 = 0u32;
+        let mut accum_3 = 0u32;
+        for words in quad_words {
+            accum_0 = add_with_end_around_carry(accum_0, words[0]);
+            accum_1 = add_with_end_around_carry(accum_1, words[1]);
+            accum_2 = add_with_end_around_carry(accum_2, words[2]);
+            accum_3 = add_with_end_around_carry(accum_3, words[3]);
         }
-
-        // Handle 2 bytes of tail, if present.
-        if rem.len() >= 2 {
-            let val = u16::from_ne_bytes(rem[..2].try_into().unwrap());
-            accum += val as u32;
-            rem = &rem[2..];
+        let mut accum = add_with_end_around_carry(accum_0, accum_1);
+        accum = add_with_end_around_carry(accum, accum_2);
+        accum = add_with_end_around_carry(accum, accum_3);
+        for &word in remaining_words {
+            accum = add_with_end_around_carry(accum, word);
         }
+        let tail_start = start + head.len() + words.len() * 4;
+        accum = add_with_end_around_carry(accum, edge_sum(tail, tail_start));
 
-        // Add the last remaining odd byte, if any.
-        if let Some(&value) = rem.first() {
-            accum += u16::from_ne_bytes([value, 0]) as u32;
+        let mut collapsed = propagate_carries(accum);
+        collapsed = propagate_carries(collapsed as u32);
+        // Memory lanes pair each byte with its u16-aligned neighbour. When the
+        // data starts on an odd address its checksum words straddle those
+        // lanes, which RFC 1071 section 2(B) resolves by one byte swap.
+        if start & 1 != 0 {
+            collapsed = collapsed.swap_bytes();
         }
+        collapsed.to_be()
+    }
 
-        let collapsed = propagate_carries(accum);
-        u16::to_be(collapsed)
+    /// Sum up to three unaligned edge bytes, each in the native u16 lane its
+    /// address selects, so they line up with the bulk u32 loads.
+    fn edge_sum(bytes: &[u8], address: usize) -> u32 {
+        bytes.iter().enumerate().fold(0, |sum, (offset, &byte)| {
+            let lane = if (address + offset) & 1 == 0 {
+                [byte, 0]
+            } else {
+                [0, byte]
+            };
+            sum + u32::from(u16::from_ne_bytes(lane))
+        })
     }
 
     /// Combine several RFC 1071 compliant checksums.
@@ -540,6 +567,89 @@ pub mod checksum {
             }
             #[allow(unreachable_patterns)]
             _ => unreachable!(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::data;
+
+        fn reference(bytes: &[u8]) -> u16 {
+            let mut accum = 0u32;
+            let mut chunks = bytes.chunks_exact(2);
+            for chunk in &mut chunks {
+                accum += u16::from_be_bytes([chunk[0], chunk[1]]) as u32;
+            }
+            if let Some(&last) = chunks.remainder().first() {
+                accum += (last as u32) << 8;
+            }
+            let sum = (accum >> 16) + (accum & 0xffff);
+            ((sum >> 16) + (sum & 0xffff)) as u16
+        }
+
+        #[test]
+        fn aligned_native_words_match_reference() {
+            let mut storage = [0u8; 264];
+            for (index, byte) in storage.iter_mut().enumerate() {
+                *byte = (index as u8).wrapping_mul(37).wrapping_add(11);
+            }
+
+            for offset in 0..8 {
+                for length in 0..=255 {
+                    let bytes = &storage[offset..offset + length];
+                    assert_eq!(data(bytes), reference(bytes), "offset={offset} length={length}");
+                }
+            }
+        }
+
+        /// Deterministic xorshift bytes, so failures reproduce.
+        fn random_bytes(length: usize, mut state: u32) -> Vec<u8> {
+            (0..length)
+                .map(|_| {
+                    state ^= state << 13;
+                    state ^= state >> 17;
+                    state ^= state << 5;
+                    state as u8
+                })
+                .collect()
+        }
+
+        #[test]
+        fn every_length_and_alignment_up_to_two_kilobytes_matches_reference() {
+            let random = random_bytes(2048 + 4, 0x9e37_79b9);
+            let saturated = vec![0xffu8; 2048 + 4];
+            for storage in [&random, &saturated] {
+                for offset in 0..=3 {
+                    for length in 0..=2048 {
+                        let bytes = &storage[offset..offset + length];
+                        assert_eq!(data(bytes), reference(bytes), "offset={offset} length={length}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn a_saturated_maximum_datagram_folds_every_carry() {
+            let storage = vec![0xffu8; 65_535 + 3];
+            for offset in 0..=3 {
+                for length in [65_534, 65_535] {
+                    let bytes = &storage[offset..offset + length];
+                    assert_eq!(data(bytes), reference(bytes), "offset={offset} length={length}");
+                }
+            }
+        }
+
+        #[test]
+        fn maximum_ipv4_datagram_matches_reference() {
+            let mut storage = vec![0xffu8; 65_542];
+            for (index, byte) in storage.iter_mut().enumerate() {
+                *byte ^= (index as u8).wrapping_mul(17);
+            }
+
+            for offset in 0..8 {
+                let bytes = &storage[offset..offset + 65_535];
+                assert_eq!(data(bytes), reference(bytes), "offset={offset}");
+            }
         }
     }
 }

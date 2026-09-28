@@ -410,6 +410,7 @@ dhcp-options-buf-size-1024 = []
 xarxa-driver = { git = "https://github.com/ermacv/xarxa.git", rev = "3953379094ae1d90f1a89d8bb85dfe3ebd8a9d19" }
 document-features = "0.2.11"
 bitflags = { version = "2", default-features = false }
+bytemuck = { version = "1", default-features = false }
 byteorder = { version = "1", default-features = false }
 heapless = { version = "0.9", default-features = false }
 libc = { version = "0.2", optional = true }

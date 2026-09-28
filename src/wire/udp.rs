@@ -95,6 +95,11 @@ impl<'a> Packet<'a> {
     ///
     /// # Fuzzing
     /// This function always returns `true` when fuzzing.
+    #[cfg_attr(
+        feature = "hot-rx-section",
+        unsafe(link_section = ".hot.text.xarxa_rx"),
+        inline(never)
+    )]
     pub fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
         if cfg!(fuzzing) {
             return true;

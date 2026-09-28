@@ -138,6 +138,11 @@ packetmeta-timestamp = ["packetmeta-id", "xarxa-driver/packetmeta-timestamp"]
 log = ["dep:log"]
 ## Log with the `defmt` crate.
 defmt = ["dep:defmt", "heapless/defmt", "xarxa-driver/defmt"]
+## Place the measured per-packet receive hot path in a `.hot.text.xarxa_rx`
+## input section and keep it out of line, so a linker which executes
+## `.hot.text.*` from fast memory runs it there. Only placement changes; the
+## generated code is otherwise the same.
+hot-rx-section = []
 ## Log every packet received and sent, decoded.
 ## Needs `log` or `defmt` to print anything.
 packet-log = []

@@ -481,7 +481,7 @@ dependencies = [
  "libc",
  "log",
  "rand",
- "xarxa-driver 0.1.0 (git+https://github.com/ermacv/xarxa.git?rev=122e97146fc0a174ef3310f4526defc37663bed4)",
+ "xarxa-driver 0.1.0 (git+https://github.com/ermacv/xarxa.git?rev=3953379094ae1d90f1a89d8bb85dfe3ebd8a9d19)",
 ]
 
 [[package]]
@@ -497,7 +497,7 @@ dependencies = [
 [[package]]
 name = "xarxa-driver"
 version = "0.1.0"
-source = "git+https://github.com/ermacv/xarxa.git?rev=122e97146fc0a174ef3310f4526defc37663bed4#122e97146fc0a174ef3310f4526defc37663bed4"
+source = "git+https://github.com/ermacv/xarxa.git?rev=3953379094ae1d90f1a89d8bb85dfe3ebd8a9d19#3953379094ae1d90f1a89d8bb85dfe3ebd8a9d19"
 dependencies = [
  "atomic-waker",
  "defmt",

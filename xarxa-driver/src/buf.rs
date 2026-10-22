@@ -133,6 +133,7 @@ impl PacketPoolHeader {
     }
 
     #[cfg(feature = "async")]
+    #[inline(never)]
     fn has_available(&self) -> bool {
         #[cfg(feature = "external-origin")]
         if !matches!(self.kind, PacketOriginKind::Pool { .. }) {

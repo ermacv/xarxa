@@ -14,9 +14,9 @@ use core::task::Waker;
 
 #[cfg(feature = "async")]
 pub use buf::PacketPoolWaiter;
-pub use buf::{
-    ExternalPacketOrigin, ExternalPacketRelease, PacketBuf, PacketBufAllocator, PacketPool, PacketPoolStorage,
-};
+#[cfg(feature = "external-origin")]
+pub use buf::{ExternalPacketOrigin, ExternalPacketRelease};
+pub use buf::{PacketBuf, PacketBufAllocator, PacketPool, PacketPoolStorage};
 pub use meta::PacketMeta;
 #[cfg(feature = "packetmeta-timestamp")]
 pub use meta::{Timestamp, TxTimestamp};

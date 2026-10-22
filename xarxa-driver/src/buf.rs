@@ -88,6 +88,7 @@ enum PacketOriginKind {
     Pool {
         storage: *const UnsafeCell<MaybeUninit<Data>>,
     },
+    #[cfg(feature = "external-origin")]
     External {
         context: *const (),
         release: ExternalPacketRelease,
@@ -133,6 +134,7 @@ impl PacketPoolHeader {
 
     #[cfg(feature = "async")]
     fn has_available(&self) -> bool {
+        #[cfg(feature = "external-origin")]
         if !matches!(self.kind, PacketOriginKind::Pool { .. }) {
             return false;
         }
@@ -369,8 +371,10 @@ impl<const COUNT: usize> PacketPool<COUNT> {
 unsafe fn allocate_from_pool(origin: NonNull<PacketPoolHeader>) -> Option<PacketBuf> {
     // SAFETY: the caller guarantees the header's lifetime and provenance.
     let header = unsafe { origin.as_ref() };
-    let PacketOriginKind::Pool { storage } = header.kind else {
-        return None;
+    let storage = match header.kind {
+        PacketOriginKind::Pool { storage } => storage,
+        #[cfg(feature = "external-origin")]
+        PacketOriginKind::External { .. } => return None,
     };
     let index = header.alloc_slot()?;
     // SAFETY: PacketPool is repr(C), with its only COUNT-dependent field last.
@@ -408,6 +412,7 @@ unsafe fn allocate_from_pool(origin: NonNull<PacketPoolHeader>) -> Option<Packet
 }
 
 /// Return an exclusively owned slot to its stable static origin.
+#[inline(never)]
 unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
     // SAFETY: PacketBuf carries the header and index initialized by allocation
     // or adoption; its lifetime is contained in that of its static origin.
@@ -421,6 +426,7 @@ unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
             #[cfg(feature = "async")]
             header.waiter.wake();
         }
+        #[cfg(feature = "external-origin")]
         PacketOriginKind::External { context, release } => {
             // SAFETY: ExternalPacketOrigin::new requires this owner callback
             // to be callable from any core, once per adoption. The packet no
@@ -431,6 +437,7 @@ unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
 }
 
 /// Release callback of an [`ExternalPacketOrigin`]: `(context, slot)`.
+#[cfg(feature = "external-origin")]
 pub type ExternalPacketRelease = unsafe fn(*const (), usize);
 
 /// Packet buffers whose payload storage belongs to another owner.
@@ -440,6 +447,7 @@ pub type ExternalPacketRelease = unsafe fn(*const (), usize);
 /// copying it into a [`PacketPool`]. Dropping the packet returns the storage
 /// by calling the owner's release function with the adopted slot index. The
 /// origin never allocates, so it is not an allocator for the stack.
+#[cfg(feature = "external-origin")]
 #[repr(C)]
 pub struct ExternalPacketOrigin<const COUNT: usize> {
     header: PacketPoolHeader,
@@ -450,8 +458,10 @@ pub struct ExternalPacketOrigin<const COUNT: usize> {
 // adoption set its `adopted` bit, and Drop clears that bit with Release
 // ordering. `context` is only passed back to the owner's release function,
 // whose contract makes it callable from any core.
+#[cfg(feature = "external-origin")]
 unsafe impl<const COUNT: usize> Sync for ExternalPacketOrigin<COUNT> {}
 
+#[cfg(feature = "external-origin")]
 impl<const COUNT: usize> ExternalPacketOrigin<COUNT> {
     /// Bind the origin to the storage owner's release function.
     ///
@@ -772,17 +782,20 @@ mod tests {
         new_pool::<1>().try_alloc().unwrap()
     }
 
+    #[cfg(feature = "external-origin")]
     struct ExternalStorage {
         bytes: std::vec::Vec<Box<Data>>,
         released: std::sync::Mutex<std::vec::Vec<usize>>,
     }
 
+    #[cfg(feature = "external-origin")]
     unsafe fn record_release(context: *const (), slot: usize) {
         // SAFETY: the tests pass a leaked `ExternalStorage` as context.
         let storage = unsafe { &*context.cast::<ExternalStorage>() };
         storage.released.lock().unwrap().push(slot);
     }
 
+    #[cfg(feature = "external-origin")]
     fn external<const COUNT: usize>() -> (&'static ExternalStorage, &'static ExternalPacketOrigin<COUNT>) {
         let storage: &'static ExternalStorage = Box::leak(Box::new(ExternalStorage {
             bytes: (0..COUNT)
@@ -795,6 +808,7 @@ mod tests {
         (storage, Box::leak(Box::new(origin)))
     }
 
+    #[cfg(feature = "external-origin")]
     fn adopt<const COUNT: usize>(
         storage: &'static ExternalStorage,
         origin: &'static ExternalPacketOrigin<COUNT>,
@@ -809,6 +823,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn an_adopted_packet_views_the_external_bytes_and_returns_its_slot() {
         let (storage, origin) = external::<2>();
         let mut packet = adopt(storage, origin, 1, 10, 4);
@@ -827,23 +842,27 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "adopted twice")]
+    #[cfg(feature = "external-origin")]
     fn a_slot_cannot_be_adopted_twice() {
         let (storage, origin) = external::<1>();
         let _first = adopt(storage, origin, 0, 0, 0);
         let _second = adopt(storage, origin, 0, 0, 0);
     }
 
+    #[cfg(feature = "external-origin")]
     struct StaticExternal {
         origin: ExternalPacketOrigin<1>,
         released: AtomicU32,
     }
 
+    #[cfg(feature = "external-origin")]
     unsafe fn count_static_release(context: *const (), _slot: usize) {
         // SAFETY: the context is the address of `STATIC_EXTERNAL` below.
         let owner = unsafe { &*context.cast::<StaticExternal>() };
         owner.released.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "external-origin")]
     static STATIC_EXTERNAL: StaticExternal = StaticExternal {
         // SAFETY: `count_static_release` only increments a counter of this
         // static, which is callable from any thread at any time.
@@ -852,6 +871,7 @@ mod tests {
     };
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn a_static_origin_can_name_its_enclosing_static_as_context() {
         let data: &'static Data = Box::leak(Box::new(Data([7; PACKET_BUF_SIZE])));
         // SAFETY: the leaked `Data` is aligned, initialized and only accessed
@@ -863,6 +883,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn an_external_origin_never_allocates() {
         let (_, origin) = external::<1>();
         let header = NonNull::from(&origin.header);
@@ -957,6 +978,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn external_maximum_returns_every_slot_once_per_adoption() {
         let (storage, origin) = external::<1024>();
         let buffers: std::vec::Vec<_> = (0..1024).map(|slot| adopt(storage, origin, slot, 0, 1)).collect();
@@ -972,6 +994,7 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "more than 1024")]
+    #[cfg(feature = "external-origin")]
     fn external_capacity_above_the_limit_is_rejected() {
         // SAFETY: this constructor rejects the capacity before publication.
         let _ = unsafe { ExternalPacketOrigin::<1025>::new(core::ptr::null(), record_release) };
@@ -993,6 +1016,7 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
+    #[cfg(feature = "external-origin")]
     fn an_external_double_release_does_not_call_the_owner_twice() {
         let (storage, origin) = external::<1>();
         let buffer = core::mem::ManuallyDrop::new(adopt(storage, origin, 0, 0, 0));

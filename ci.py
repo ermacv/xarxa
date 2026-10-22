@@ -193,12 +193,16 @@ def collect():
         "packetmeta-id",
         "packetmeta-timestamp",
         "packetmeta-timestamp,defmt",
+        "external-origin",
+        "external-origin,async",
+        "external-origin,async,packetmeta-timestamp,defmt",
     ]:
         args = ["check", "-p", "xarxa-driver"]
         if extra:
             args += ["--features", extra]
         cmds.raw(args)
     cmds.raw(["test", "-p", "xarxa-driver"])
+    cmds.raw(["test", "-p", "xarxa-driver", "--features", "external-origin,async"])
 
     cmds.raw(["test"])
     # Test serde (de)serialize specifically with just ipv4 or just ipv6

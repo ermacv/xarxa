@@ -10,6 +10,7 @@
 use core::fmt;
 
 use crate::config::REASSEMBLY_BUFFER_COUNT;
+use crate::driver::Driver;
 use crate::driver::config::PACKET_BUF_SIZE;
 use crate::driver::{PacketBuf, PacketBufAllocator};
 use crate::stack::Stack;
@@ -253,7 +254,7 @@ impl FragmentsBuffer {
     }
 }
 
-impl Stack<'_> {
+impl<D: Driver> Stack<'_, D> {
     /// Get the packet reassembly timeout.
     ///
     /// This is how long the fragments of an incoming IPv4 or 6LoWPAN packet are

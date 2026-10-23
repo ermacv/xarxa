@@ -25,6 +25,7 @@ use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use super::IfaceState;
 use crate::config::{DHCP_MAX_DNS_SERVER_COUNT, DHCP_SERVER_CLIENT_ID_SIZE, DHCP_SERVER_LEASE_COUNT};
+use crate::driver::Driver;
 use crate::driver::PacketBufAllocator;
 use crate::driver::{ChecksumCapabilities, PacketBuf};
 use crate::stack::{StackInner, push_ipv4_header};
@@ -783,7 +784,7 @@ fn addr_valid(addr: Ipv4Addr, server_cidr: &Ipv4Cidr) -> bool {
         && server_cidr.broadcast() != Some(addr)
 }
 
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     /// The subnet the server serves: the interface's first IPv4 address.
     fn dhcpv4_server_cidr(&self) -> Option<Ipv4Cidr> {
         self.cidrs().find_map(|cidr| match cidr {
@@ -911,11 +912,11 @@ mod test {
     }
 
     /// A stack with one Ethernet interface at 192.168.1.1/24, DHCP server on.
-    fn test_stack() -> (Stack<'static>, Queue, Sent) {
+    fn test_stack() -> (Stack<'static, TestDevice>, Queue, Sent) {
         test_stack_with_checksum(ChecksumCapabilities::default())
     }
 
-    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static, TestDevice>, Queue, Sent) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx) = (driver.rx.clone(), driver.tx.clone());
         let mut stack = Stack::new(1, crate::test_device::packet_allocator());
@@ -1042,7 +1043,7 @@ mod test {
     }
 
     /// Feed one client message and run the stack.
-    fn send(stack: &mut Stack<'_>, rx: &Queue, msg: Msg, t: u32) {
+    fn send(stack: &mut Stack<'_, TestDevice>, rx: &Queue, msg: Msg, t: u32) {
         rx.borrow_mut().push_back(frame(&msg));
         stack.poll(at(t));
     }
@@ -1089,13 +1090,13 @@ mod test {
     }
 
     /// The lease table, cloned out of the short-lived interface view.
-    fn leases(stack: &mut Stack<'_>) -> Vec<DhcpServerLease> {
+    fn leases(stack: &mut Stack<'_, TestDevice>) -> Vec<DhcpServerLease> {
         stack.iface(IFACE).dhcpv4_server_leases().to_vec()
     }
 
     /// Drive a client to a bound lease on `POOL_START`: DISCOVER at `t`, REQUEST
     /// at `t + 1`.
-    fn bind_first_client(stack: &mut Stack<'_>, rx: &Queue, t: u32) {
+    fn bind_first_client(stack: &mut Stack<'_, TestDevice>, rx: &Queue, t: u32) {
         send(stack, rx, Msg::new(DhcpMessageType::Discover, CLIENT_HW), t);
         send(
             stack,

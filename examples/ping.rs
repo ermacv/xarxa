@@ -153,7 +153,7 @@ fn main() {
 
 /// Build and send one echo request.
 fn send_request(
-    socket: &mut xarxa::raw::RawSocket<'_, '_>,
+    socket: &mut xarxa::raw::RawSocket<'_, '_, TunTapDriver>,
     target: IpAddr,
     ident: u16,
     seq: u16,

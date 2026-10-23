@@ -9,6 +9,7 @@
 use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::config::{UDP_RX_QUEUE_COUNT, UDP_SOCKET_COUNT};
+use crate::driver::Driver;
 use crate::storage::BoundedDeque;
 use core::fmt;
 use core::ops::{Deref, Range};
@@ -371,13 +372,13 @@ fn parse_datagram(buf: &mut PacketBuf) -> (UdpMetadata, Range<usize>) {
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::udp_socket`]: crate::Stack::udp_socket
-pub struct UdpSocket<'a, 'd> {
+pub struct UdpSocket<'a, 'd, D: Driver> {
     pub(crate) sockets: &'a mut Slab<UdpSocketState, UDP_SOCKET_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tx: TxContext<'a, 'd>,
+    pub(crate) tx: TxContext<'a, 'd, D>,
 }
 
-impl UdpSocket<'_, '_> {
+impl<D: Driver> UdpSocket<'_, '_, D> {
     /// This socket's state in the slab.
     #[inline]
     fn inner(&self) -> &UdpSocketState {
@@ -951,7 +952,7 @@ impl UdpSocket<'_, '_> {
     }
 }
 
-impl Stack<'_> {
+impl<D: Driver> Stack<'_, D> {
     /// Process an ingress UDP packet: validate it and queue it on the first matching
     /// socket.
     ///
@@ -1083,24 +1084,24 @@ pub(crate) fn process_icmp_error(
 ///
 /// ```no_run
 /// # use xarxa::Stack;
-/// # fn f(stack: &mut Stack) {
+/// # fn f<D: xarxa::driver::Driver>(stack: &mut Stack<'_, D>) {
 /// let mut iter = stack.udp_sockets();
 /// while let Some((handle, item)) = iter.next() {
 ///     let _ = (handle, item.can_recv());
 /// }
 /// # }
 /// ```
-pub struct UdpSocketIter<'a, 'd> {
-    pub(crate) stack: &'a mut Stack<'d>,
+pub struct UdpSocketIter<'a, 'd, D: Driver> {
+    pub(crate) stack: &'a mut Stack<'d, D>,
     pub(crate) next: usize,
 }
 
-impl<'d> UdpSocketIter<'_, 'd> {
+impl<'d, D: Driver> UdpSocketIter<'_, 'd, D> {
     /// Get the next UDP socket, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_, 'd>)> {
+    pub fn next(&mut self) -> Option<(UdpHandle, UdpSocket<'_, 'd, D>)> {
         let index = self.stack.sockets.udp.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = UdpHandle::new(index);
@@ -1116,8 +1117,9 @@ mod test {
     use crate::test_device::TestDevice;
     use crate::wire::{HardwareAddress, IpCidr, Ipv4Addr, Ipv6Addr};
 
-    fn stack_with_socket() -> (Stack<'static>, UdpHandle) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+    fn stack_with_socket() -> (Stack<'static, TestDevice>, UdpHandle) {
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = stack.add_udp_socket().unwrap();
         (stack, handle)
     }
@@ -1133,8 +1135,9 @@ mod test {
 
     /// A stack with one interface owning `LOCAL_ADDR`, so that binds with a
     /// specified remote can resolve their local address.
-    fn stack_with_iface() -> Stack<'static> {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+    fn stack_with_iface() -> Stack<'static, TestDevice> {
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -1184,18 +1187,24 @@ mod test {
     }
 
     /// Run a packet through the stack's UDP ingress demux.
-    fn deliver(stack: &mut Stack, src_addr: Ipv4Addr, src_port: u16, payload: &[u8]) {
+    fn deliver(stack: &mut Stack<'_, TestDevice>, src_addr: Ipv4Addr, src_port: u16, payload: &[u8]) {
         deliver_to(stack, src_addr, src_port, LOCAL_ADDR, payload)
     }
 
     /// Like [`deliver`], with an explicit destination address.
-    fn deliver_to(stack: &mut Stack, src_addr: Ipv4Addr, src_port: u16, dst_addr: Ipv4Addr, payload: &[u8]) {
+    fn deliver_to(
+        stack: &mut Stack<'_, TestDevice>,
+        src_addr: Ipv4Addr,
+        src_port: u16,
+        dst_addr: Ipv4Addr,
+        payload: &[u8],
+    ) {
         deliver_on(stack, IfaceHandle::new(0), src_addr, src_port, dst_addr, payload)
     }
 
     /// Like [`deliver_to`], with an explicit arrival interface.
     fn deliver_on(
-        stack: &mut Stack,
+        stack: &mut Stack<'_, TestDevice>,
         iface: IfaceHandle,
         src_addr: Ipv4Addr,
         src_port: u16,
@@ -1208,7 +1217,7 @@ mod test {
     }
 
     /// Like [`deliver`], with an explicit destination port.
-    fn deliver_to_port(stack: &mut Stack, dst_port: u16, payload: &[u8]) {
+    fn deliver_to_port(stack: &mut Stack<'_, TestDevice>, dst_port: u16, payload: &[u8]) {
         let mut buf = queued_packet_to_port(REMOTE_ADDR, REMOTE_PORT, LOCAL_ADDR, dst_port, payload);
         buf.pull_front(IPV4_HEADER_LEN);
         stack.process_udp(
@@ -1248,7 +1257,8 @@ mod test {
     fn test_bind_ephemeral() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
 
@@ -1330,7 +1340,8 @@ mod test {
 
     #[test]
     fn test_bind_conflicts_per_version() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack.add_udp_socket().unwrap();
         let h2 = stack.add_udp_socket().unwrap();
         let h3 = stack.add_udp_socket().unwrap();
@@ -1657,7 +1668,8 @@ mod test {
     fn test_packet_meta() {
         let driver = TestDevice::new(Medium::Ip);
         let sent = driver.tx_meta.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -1744,7 +1756,8 @@ mod test {
     #[cfg(not(feature = "alloc"))]
     #[test]
     fn test_socket_slab_full() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let mut handles = std::vec::Vec::new();
         for _ in 0..UDP_SOCKET_COUNT {
             handles.push(stack.add_udp_socket().unwrap());
@@ -1859,7 +1872,8 @@ mod test {
         // sends, 64 by default. The rest of the headers are checked while at it.
         let driver = TestDevice::new(Medium::Ip);
         let tx = driver.tx.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -1943,7 +1957,8 @@ mod test {
         // interface MTU is never what limits the datagram.
         let driver = TestDevice::new(Medium::Ip).with_mtu(crate::driver::config::PACKET_BUF_SIZE);
         let tx = driver.tx.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(iface)
@@ -2048,13 +2063,14 @@ mod test {
     /// interface 0 owns `LOCAL_ADDR`, interface 1 owns `LOCAL2_ADDR`.
     #[cfg(feature = "iface-bind")]
     fn stack_with_two_ifaces() -> (
-        Stack<'static>,
+        Stack<'static, TestDevice>,
         IfaceHandle,
         IfaceHandle,
         crate::test_device::Sent,
         crate::test_device::Sent,
     ) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let d0 = TestDevice::new(Medium::Ip);
         let tx0 = d0.tx.clone();
         let if0 = d0.install(&mut stack, HardwareAddress::Ip);

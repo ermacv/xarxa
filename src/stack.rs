@@ -53,9 +53,9 @@ use crate::udp::{UdpHandle, UdpSocket, UdpSocketIter, UdpSocketState};
 use crate::wire::*;
 
 /// A network stack.
-pub struct Stack<'d> {
+pub struct Stack<'d, D: Driver> {
     pub(crate) inner: StackInner,
-    pub(crate) ifaces: Slab<IfaceState<'d>, IFACE_COUNT>,
+    pub(crate) ifaces: Slab<IfaceState<'d, D>, IFACE_COUNT>,
     #[allow(unused)]
     pub(crate) sockets: Sockets<'d>,
     #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
@@ -293,9 +293,9 @@ enum TcpEgressStop {
 }
 
 /// Borrowed stack context for socket egress.
-pub(crate) struct TxContext<'a, 'd> {
+pub(crate) struct TxContext<'a, 'd, D: Driver> {
     pub(crate) inner: &'a mut StackInner,
-    pub(crate) ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
+    pub(crate) ifaces: &'a mut Slab<IfaceState<'d, D>, IFACE_COUNT>,
 }
 
 /// The interface a socket is bound to, if any.
@@ -371,7 +371,7 @@ pub(crate) struct EgressRoute {
     pub(crate) ip_mtu: usize,
 }
 
-impl TxContext<'_, '_> {
+impl<D: Driver> TxContext<'_, '_, D> {
     /// Allocate a packet owned by the stack's configured memory domain.
     #[cfg(any(feature = "udp", feature = "_raw"))]
     pub(crate) fn alloc_packet(&mut self) -> Option<PacketBuf> {
@@ -622,7 +622,7 @@ enum NeighborLookup {
     Pending { next_hop: IpAddr },
 }
 
-impl<'d> Stack<'d> {
+impl<'d, D: Driver> Stack<'d, D> {
     /// Create a network stack.
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
@@ -716,7 +716,7 @@ impl<'d> Stack<'d> {
     ///
     /// ```no_run
     /// # use xarxa::{Stack, driver::Driver, wire::{IpCidr, Ipv4Addr}};
-    /// # fn configure(stack: &mut Stack, driver: Box<dyn Driver>) {
+    /// # fn configure<D: Driver>(stack: &mut Stack<'_, D>, driver: Box<D>) {
     /// let handle = stack.add_iface(driver).unwrap();
     /// stack
     ///     .iface(handle)
@@ -734,7 +734,7 @@ impl<'d> Stack<'d> {
     /// - `HardwareAddrMismatch`: if the hardware address the device reports is
     ///   not of the kind its medium uses.
     #[cfg(feature = "alloc")]
-    pub fn add_iface(&mut self, driver: alloc::boxed::Box<dyn Driver + 'd>) -> Result<IfaceHandle, AddIfaceError> {
+    pub fn add_iface(&mut self, driver: alloc::boxed::Box<D>) -> Result<IfaceHandle, AddIfaceError> {
         self.add_iface_inner(driver.into())
     }
 
@@ -753,11 +753,11 @@ impl<'d> Stack<'d> {
     ///   device's medium.
     /// - `HardwareAddrMismatch`: if the hardware address the device reports is
     ///   not of the kind its medium uses.
-    pub fn add_iface_borrowed(&mut self, driver: &'d mut dyn Driver) -> Result<IfaceHandle, AddIfaceError> {
+    pub fn add_iface_borrowed(&mut self, driver: &'d mut D) -> Result<IfaceHandle, AddIfaceError> {
         self.add_iface_inner(driver.into())
     }
 
-    fn add_iface_inner(&mut self, driver: MaybeBox<'d, dyn Driver + 'd>) -> Result<IfaceHandle, AddIfaceError> {
+    fn add_iface_inner(&mut self, driver: MaybeBox<'d, D>) -> Result<IfaceHandle, AddIfaceError> {
         let caps = driver.capabilities();
         let medium = Medium::from_driver(caps.medium).ok_or(AddIfaceError::UnsupportedMedium)?;
         // The medium is supported, so an address kind the build does not have is
@@ -848,7 +848,7 @@ impl<'d> Stack<'d> {
     ///
     /// # Panics
     /// Panics if the handle is stale (the interface was removed).
-    pub fn iface(&mut self, handle: IfaceHandle) -> Iface<'_, 'd> {
+    pub fn iface(&mut self, handle: IfaceHandle) -> Iface<'_, 'd, D> {
         self.ifaces.get(handle.index()); // Stale handles panic here, not on first use.
         Iface {
             inner: &mut self.inner,
@@ -934,7 +934,7 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "udp")]
-    pub fn udp_socket(&mut self, handle: UdpHandle) -> UdpSocket<'_, 'd> {
+    pub fn udp_socket(&mut self, handle: UdpHandle) -> UdpSocket<'_, 'd, D> {
         self.sockets.udp.get(handle.index()); // Stale handles panic here, not on first use.
         UdpSocket {
             sockets: &mut self.sockets.udp,
@@ -971,7 +971,7 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "_raw")]
-    pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_, 'd> {
+    pub fn raw_socket(&mut self, handle: RawHandle) -> RawSocket<'_, 'd, D> {
         RawSocket {
             state: self.sockets.raw.get_mut(handle.index()),
             tx: TxContext {
@@ -1012,7 +1012,7 @@ impl<'d> Stack<'d> {
     ///
     /// ```no_run
     /// # use xarxa::Stack;
-    /// # fn add<'d>(stack: &mut Stack<'d>, rx: &'d mut [u8; 4096], tx: &'d mut [u8; 4096]) {
+    /// # fn add<'d, D: xarxa::driver::Driver>(stack: &mut Stack<'d, D>, rx: &'d mut [u8; 4096], tx: &'d mut [u8; 4096]) {
     /// let handle = stack.add_tcp_socket_with_bufs(rx, tx).unwrap();
     /// # }
     /// ```
@@ -1063,7 +1063,7 @@ impl<'d> Stack<'d> {
     /// # Panics
     /// Panics if the handle is stale (the socket was already removed).
     #[cfg(feature = "tcp")]
-    pub fn tcp_socket(&mut self, handle: TcpHandle) -> TcpSocket<'_, 'd> {
+    pub fn tcp_socket(&mut self, handle: TcpHandle) -> TcpSocket<'_, 'd, D> {
         self.sockets.tcp.get(handle.index()); // Stale handles panic here, not on first use.
         TcpSocket {
             sockets: &mut self.sockets.tcp,
@@ -1111,7 +1111,7 @@ impl<'d> Stack<'d> {
     }
 
     /// Borrow the stack context for egress.
-    pub(crate) fn tx_context(&mut self) -> TxContext<'_, 'd> {
+    pub(crate) fn tx_context(&mut self) -> TxContext<'_, 'd, D> {
         TxContext {
             inner: &mut self.inner,
             ifaces: &mut self.ifaces,
@@ -1121,7 +1121,7 @@ impl<'d> Stack<'d> {
     /// Iterate over the interfaces added to the stack.
     ///
     /// See [`IfaceIter`] for how to use it.
-    pub fn ifaces(&mut self) -> IfaceIter<'_, 'd> {
+    pub fn ifaces(&mut self) -> IfaceIter<'_, 'd, D> {
         IfaceIter { stack: self, next: 0 }
     }
 
@@ -1129,7 +1129,7 @@ impl<'d> Stack<'d> {
     ///
     /// See [`UdpSocketIter`] for how to use it.
     #[cfg(feature = "udp")]
-    pub fn udp_sockets(&mut self) -> UdpSocketIter<'_, 'd> {
+    pub fn udp_sockets(&mut self) -> UdpSocketIter<'_, 'd, D> {
         UdpSocketIter { stack: self, next: 0 }
     }
 
@@ -1137,7 +1137,7 @@ impl<'d> Stack<'d> {
     ///
     /// See [`RawSocketIter`] for how to use it.
     #[cfg(feature = "_raw")]
-    pub fn raw_sockets(&mut self) -> RawSocketIter<'_, 'd> {
+    pub fn raw_sockets(&mut self) -> RawSocketIter<'_, 'd, D> {
         RawSocketIter { stack: self, next: 0 }
     }
 
@@ -1145,7 +1145,7 @@ impl<'d> Stack<'d> {
     ///
     /// See [`TcpSocketIter`] for how to use it.
     #[cfg(feature = "tcp")]
-    pub fn tcp_sockets(&mut self) -> TcpSocketIter<'_, 'd> {
+    pub fn tcp_sockets(&mut self) -> TcpSocketIter<'_, 'd, D> {
         TcpSocketIter { stack: self, next: 0 }
     }
 
@@ -1153,7 +1153,7 @@ impl<'d> Stack<'d> {
     ///
     /// See [`TcpListenerIter`] for how to use it.
     #[cfg(feature = "tcp-listener")]
-    pub fn tcp_listeners(&mut self) -> TcpListenerIter<'_, 'd> {
+    pub fn tcp_listeners(&mut self) -> TcpListenerIter<'_, 'd, D> {
         TcpListenerIter { stack: self, next: 0 }
     }
 
@@ -1461,7 +1461,7 @@ impl<'d> Stack<'d> {
     }
 }
 
-impl<'d> Stack<'d> {
+impl<'d, D: Driver> Stack<'d, D> {
     /// Expire things that need expiring:
     /// - Remove the expired routes and neighbor entries.
     /// - Deprecate the addresses whose preferred lifetime ran out.
@@ -2426,7 +2426,7 @@ impl<'d> Stack<'d> {
 // because they serve both ingress (above) and socket egress (`TxContext`).
 impl StackInner {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn process_arp(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf, now: Instant) {
+    fn process_arp<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>, mut buf: PacketBuf, now: Instant) {
         let arp_packet = check!(ArpPacket::new_checked(&mut buf));
 
         if arp_packet.hardware_type() != ArpHardware::Ethernet
@@ -2520,9 +2520,9 @@ impl StackInner {
     }
 
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-    fn process_ndisc_solicit(
+    fn process_ndisc_solicit<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
         icmp_packet: &mut Icmpv6Packet<'_>,
@@ -2589,9 +2589,9 @@ impl StackInner {
     /// record the new address as reachable (§7.2.5 II), and the IsRouter flag
     /// is not tracked.
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-    fn process_ndisc_advert(
+    fn process_ndisc_advert<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         dst_addr: Ipv6Addr,
         icmp_packet: &mut Icmpv6Packet<'_>,
         now: Instant,
@@ -2652,7 +2652,7 @@ impl StackInner {
 
     /// Send a solicitation (ARP request / NDISC neighbor solicit) for the given address.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn solicit_neighbor(&mut self, iface: &mut IfaceState<'_>, addr: IpAddr) {
+    fn solicit_neighbor<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>, addr: IpAddr) {
         match addr {
             #[cfg(all(feature = "ipv4", feature = "medium-ethernet"))]
             IpAddr::V4(addr) => self.transmit_arp_request(iface, addr),
@@ -2668,9 +2668,9 @@ impl StackInner {
     /// Fill the neighbor cache, and flush any packets that were queued waiting for
     /// this neighbor to resolve.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    pub(crate) fn fill_neighbor(
+    pub(crate) fn fill_neighbor<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         addr: IpAddr,
         hardware_addr: HardwareAddress,
         now: Instant,
@@ -2687,9 +2687,9 @@ impl StackInner {
     /// `flush_resolved_pending` retries them on the next `poll`, and the error
     /// says what they wait for.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn flush_pending(
+    fn flush_pending<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         key: &NeighborKey,
         hardware_addr: HardwareAddress,
     ) -> Result<(), Blocked> {
@@ -2709,9 +2709,9 @@ impl StackInner {
     /// Hand an IP packet whose next hop resolved to `hardware_addr` to the
     /// link layer of the interface's medium. `dst_addr` names the IP version.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn transmit_link(
+    fn transmit_link<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         hardware_addr: HardwareAddress,
         buf: PacketBuf,
         dst_addr: IpAddr,
@@ -2740,7 +2740,7 @@ impl StackInner {
     /// they were left parked because the interface took no new packet when the
     /// resolution came in. The error says what they wait for.
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    pub(crate) fn flush_resolved_pending(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
+    pub(crate) fn flush_resolved_pending<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>) -> Result<(), Blocked> {
         let mut cursor = 0;
         while let Some((index, key)) = self.pending.next_on(iface.handle, cursor) {
             match self.neighbor_cache.lookup(&key) {
@@ -2763,9 +2763,9 @@ impl StackInner {
     /// `next_hop` is the pre-routed address to resolve on the link, from an
     /// [`EgressRoute`].
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
-    fn lookup_hardware_addr(
+    fn lookup_hardware_addr<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         dst_addr: &IpAddr,
         next_hop: IpAddr,
     ) -> NeighborLookup {
@@ -2812,7 +2812,7 @@ impl StackInner {
     }
 
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
-    fn transmit_arp_request(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv4Addr) {
+    fn transmit_arp_request<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>, target_addr: Ipv4Addr) {
         use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
         let Some(source_protocol_addr) = iface.get_source_address_ipv4(&target_addr) else {
@@ -2843,7 +2843,7 @@ impl StackInner {
     }
 
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-    fn transmit_ndisc_solicit(&mut self, iface: &mut IfaceState<'_>, target_addr: Ipv6Addr) {
+    fn transmit_ndisc_solicit<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>, target_addr: Ipv6Addr) {
         use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
         let src_addr = iface.get_source_address_ipv6(&target_addr);
@@ -2886,9 +2886,9 @@ impl StackInner {
     /// NDISC is link-scoped: the packet is never routed, and the next hop is the
     /// destination itself (an on-link neighbor or a multicast group).
     #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
-    pub(crate) fn transmit_ndisc(
+    pub(crate) fn transmit_ndisc<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         mut buf: PacketBuf,
         src_addr: Ipv6Addr,
         dst_addr: Ipv6Addr,
@@ -2918,9 +2918,9 @@ impl StackInner {
     /// that has no address yet. A unicast destination that is not on-link is sent
     /// via the routing table's gateway, if any, else directly.
     #[cfg(feature = "dhcpv4")]
-    pub(crate) fn transmit_ipv4_on(
+    pub(crate) fn transmit_ipv4_on<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         src_addr: Ipv4Addr,
         dst_addr: Ipv4Addr,
         mut buf: PacketBuf,
@@ -2947,9 +2947,9 @@ impl StackInner {
 
     /// Transmit a fully-built IP packet on an interface, fragmenting it first if it
     /// is larger than the interface's MTU (IPv4 only).
-    pub(crate) fn transmit_ip(
+    pub(crate) fn transmit_ip<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
         buf: PacketBuf,
@@ -2978,9 +2978,9 @@ impl StackInner {
     }
 
     /// Hand an IP packet that fits the interface's MTU to the link layer.
-    pub(crate) fn dispatch_ip(
+    pub(crate) fn dispatch_ip<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
         buf: PacketBuf,
@@ -3026,9 +3026,9 @@ impl StackInner {
     }
 
     #[cfg(feature = "medium-ethernet")]
-    pub(crate) fn transmit_ethernet(
+    pub(crate) fn transmit_ethernet<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         dst_hw: EthernetAddress,
         mut buf: PacketBuf,
         ethertype: EthernetProtocol,
@@ -3041,7 +3041,11 @@ impl StackInner {
         self.transmit_raw(iface, buf);
     }
 
-    pub(crate) fn transmit_raw(&mut self, iface: &mut IfaceState<'_>, #[allow(unused_mut)] mut buf: PacketBuf) {
+    pub(crate) fn transmit_raw<D: Driver>(
+        &mut self,
+        iface: &mut IfaceState<'_, D>,
+        #[allow(unused_mut)] mut buf: PacketBuf,
+    ) {
         debug_assert!(buf.headroom() >= xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
 
         #[cfg(feature = "packet-log")]
@@ -3361,24 +3365,27 @@ pub(crate) mod test {
 
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_V6`]/64.
-    fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent) {
+    fn test_stack(medium: Medium) -> (Stack<'static, TestDevice>, Queue, Sent) {
         let (stack, rx, tx, _room) = test_stack_with_room(medium);
         (stack, rx, tx)
     }
 
     /// [`test_stack`], also handing out the device's transmit room control.
-    fn test_stack_with_room(medium: Medium) -> (Stack<'static>, Queue, Sent, Room) {
+    fn test_stack_with_room(medium: Medium) -> (Stack<'static, TestDevice>, Queue, Sent, Room) {
         test_stack_with_mtu(medium, 1500)
     }
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
-    fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent) {
+    fn test_stack_with_checksum(
+        medium: Medium,
+        checksum: ChecksumCapabilities,
+    ) -> (Stack<'static, TestDevice>, Queue, Sent) {
         let (stack, rx, tx, _room) = test_stack_inner(medium, 1500, checksum);
         (stack, rx, tx)
     }
 
     /// [`test_stack_with_room`], with a device of the given MTU.
-    fn test_stack_with_mtu(medium: Medium, mtu: usize) -> (Stack<'static>, Queue, Sent, Room) {
+    fn test_stack_with_mtu(medium: Medium, mtu: usize) -> (Stack<'static, TestDevice>, Queue, Sent, Room) {
         test_stack_inner(medium, mtu, ChecksumCapabilities::default())
     }
 
@@ -3386,10 +3393,11 @@ pub(crate) mod test {
         medium: Medium,
         mtu: usize,
         checksum: ChecksumCapabilities,
-    ) -> (Stack<'static>, Queue, Sent, Room) {
+    ) -> (Stack<'static, TestDevice>, Queue, Sent, Room) {
         let driver = TestDevice::new(medium).with_mtu(mtu).with_checksum(checksum);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(
             &mut stack,
             match medium {
@@ -3417,7 +3425,8 @@ pub(crate) mod test {
         let second = TestDevice::new(Medium::Ethernet);
         let first_rx = first.rx.clone();
         let second_rx = second.rx.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         first.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         second.install(
             &mut stack,
@@ -3458,7 +3467,8 @@ pub(crate) mod test {
     fn test_iface_reports_device_state() {
         let driver = TestDevice::new(Medium::Ethernet);
         let link = driver.link.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
 
         // The hardware address is read from the device at add time.
@@ -3982,10 +3992,11 @@ pub(crate) mod test {
     /// A router advertisement that is not from a link-local source is ignored.
     /// [`test_stack`], also handing out control of the link state the device reports.
     #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
-    fn test_stack_with_link(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
+    fn test_stack_with_link(medium: Medium) -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         stack
             .iface(handle)
@@ -4001,7 +4012,7 @@ pub(crate) mod test {
     /// it just after the link comes back. Polling while down is what lets the stack observe
     /// the falling edge.
     #[cfg(all(feature = "slaac", feature = "medium-ethernet"))]
-    fn bounce_link(stack: &mut Stack<'static>, tx: &Sent, link: &Link, at: u32) {
+    fn bounce_link(stack: &mut Stack<'static, TestDevice>, tx: &Sent, link: &Link, at: u32) {
         link.set(crate::driver::LinkState::Down);
         stack.poll(Instant::from_secs(at));
         tx.borrow_mut().clear();
@@ -4329,7 +4340,7 @@ pub(crate) mod test {
     }
 
     /// Inject a packet into the device and poll the stack to process it.
-    pub(crate) fn inject(stack: &mut Stack, rx: &Queue, bytes: Vec<u8>) {
+    pub(crate) fn inject(stack: &mut Stack<'_, TestDevice>, rx: &Queue, bytes: Vec<u8>) {
         rx.borrow_mut().push_back(bytes);
         stack.poll(Instant::ZERO);
     }
@@ -4447,8 +4458,9 @@ pub(crate) mod test {
 
     /// A stack with two IP-medium interfaces: the first owns [`OUR_V4`]/24,
     /// the second 10.0.0.1/24, and both own fe80::1/64.
-    fn test_stack_two_ifaces() -> (Stack<'static>, [Queue; 2], [Sent; 2]) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+    fn test_stack_two_ifaces() -> (Stack<'static, TestDevice>, [Queue; 2], [Sent; 2]) {
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let mut rxs = Vec::new();
         let mut txs = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
@@ -4891,7 +4903,8 @@ pub(crate) mod test {
             .with_rx_meta(rx_meta)
             .with_tx_stamp(TX_STAMP);
         let (rx, sent) = (driver.rx.clone(), driver.tx_meta.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ip);
         stack.iface(iface).add_ip_addr(IpCidr::new(OUR_V4.into(), 24)).unwrap();
 
@@ -4966,7 +4979,7 @@ pub(crate) mod test {
             .bind(319, ListenSocketAddr::UNSPECIFIED)
             .unwrap();
 
-        let send = |stack: &mut Stack<'_>, dst: Ipv4Addr, id: u32| {
+        let send = |stack: &mut Stack<'_, TestDevice>, dst: Ipv4Addr, id: u32| {
             let mut meta: crate::udp::UdpMetadata = SocketAddr::new(dst.into(), 319).into();
             meta.meta.id = id;
             meta.meta.request_timestamp = true;
@@ -5102,7 +5115,8 @@ pub(crate) mod test {
         let tx = driver.tx.clone();
         // 1.5 s before the clock wraps around.
         let start = Instant::from_millis(0u32.wrapping_sub(1500));
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let iface = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
         stack
             .iface(iface)
@@ -5135,7 +5149,8 @@ pub(crate) mod test {
     /// A route's expiry is a deadline, and the poll at it removes the route.
     #[test]
     fn test_expired_route_removed() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let route = crate::route::Route {
             expires_at: Some(Instant::from_secs(1)),
             ..crate::route::Route::new_ipv4_gateway(Ipv4Addr::new(192, 168, 1, 254), IfaceHandle::new(0))
@@ -5547,7 +5562,7 @@ pub(crate) mod test {
     #[test]
     #[cfg(feature = "hostname")]
     fn test_set_hostname_too_long() {
-        let mut stack = Stack::new(1, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> = Stack::new(1, crate::test_device::packet_allocator());
         stack.set_hostname("xarxa").unwrap();
         let long = "x".repeat(64);
         assert_eq!(stack.set_hostname(&long), Err(crate::error::HostnameTooLong));
@@ -5651,6 +5666,36 @@ pub(crate) mod test {
         stack.raw_socket(raw_ip).send_slice(&packet).unwrap();
         assert_eq!(tx.borrow().len(), 3);
         assert_eq!(room.get(), Some(0));
+    }
+
+    /// The stack is generic over its driver: a transmitted frame reaches that
+    /// driver, and `driver_mut` hands the same concrete driver back.
+    #[test]
+    #[cfg(all(feature = "raw-ethernet", feature = "medium-ethernet"))]
+    fn driver_mut_returns_the_concrete_driver() {
+        let (mut stack, _rx, tx) = test_stack(Medium::Ethernet);
+        let (handle, _) = stack.ifaces().next().unwrap();
+        let raw = stack.add_raw_socket().unwrap();
+        stack
+            .raw_socket(raw)
+            .bind(RawMode::Ethernet { ethertype: None })
+            .unwrap();
+        let mut frame = vec![0; ETHERNET_HEADER_LEN + 4];
+        EthernetFrame::new_unchecked(&mut frame[..]).set_ethertype(EthernetProtocol::Ipv4);
+
+        // The type annotation is the check: no trait object is involved.
+        let mut iface = stack.iface(handle);
+        let device: &mut TestDevice = iface.driver_mut();
+        device.room.set(Some(0));
+        assert_eq!(
+            stack.raw_socket(raw).send_slice(&frame),
+            Err(crate::raw::SendError::DeviceBusy)
+        );
+        assert!(tx.borrow().is_empty());
+
+        stack.iface(handle).driver_mut().room.set(None);
+        stack.raw_socket(raw).send_slice(&frame).unwrap();
+        assert_eq!(tx.borrow().len(), 1);
     }
 
     /// A DNS query whose send finds the device full is not failed: it is treated
@@ -5899,7 +5944,7 @@ pub(crate) mod test {
         let packet = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol::Udp, &[0; 8]);
 
         let (counts, wakers): (Vec<_>, Vec<_>) = (0..3).map(|_| WakeCount::new()).unzip();
-        let register = |stack: &mut Stack<'_>| {
+        let register = |stack: &mut Stack<'_, TestDevice>| {
             stack.udp_socket(udp).register_send_waker(&wakers[0]);
             stack.raw_socket(raw).register_send_waker(&wakers[1]);
             stack.raw_socket(raw_ip).register_send_waker(&wakers[2]);
@@ -5946,7 +5991,8 @@ pub(crate) mod test {
     #[test]
     #[cfg(all(feature = "async", feature = "medium-ip", feature = "ipv4", feature = "udp"))]
     fn test_device_full_wakes_only_senders_waiting_on_it() {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let mut rooms = Vec::new();
         for addr in [IpCidr::new(OUR_V4.into(), 24), IpCidr::new(OUR_V4_B.into(), 24)] {
             let driver = TestDevice::new(Medium::Ip);
@@ -6920,7 +6966,8 @@ pub(crate) mod test {
 
         let driver = TestDevice::new(Medium::Ethernet);
         let filter = driver.mcast_filter.clone();
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ethernet(OUR_HW));
 
         // The lists the driver was given since the last call, each sorted, so the
@@ -7494,7 +7541,11 @@ pub(crate) mod test {
 
     /// The first frame transmitted for a datagram to `dst`: an IPv6 packet to
     /// `Some(mac)` if the neighbor was known, or `None` for a neighbor solicitation.
-    fn send_udp_v6_and_classify(stack: &mut Stack<'static>, tx: &Sent, dst: Ipv6Addr) -> Option<EthernetAddress> {
+    fn send_udp_v6_and_classify(
+        stack: &mut Stack<'static, TestDevice>,
+        tx: &Sent,
+        dst: Ipv6Addr,
+    ) -> Option<EthernetAddress> {
         let udp = stack.add_udp_socket().unwrap();
         stack.udp_socket(udp).bind(5555, ListenSocketAddr::UNSPECIFIED).unwrap();
         stack.udp_socket(udp).send_slice(b"hi", (dst, 1000)).unwrap();
@@ -7517,7 +7568,7 @@ pub(crate) mod test {
     }
 
     /// The hardware address the cache holds for `addr`, if the entry is reachable.
-    fn cached_lladdr(stack: &Stack<'static>, addr: Ipv6Addr) -> Option<EthernetAddress> {
+    fn cached_lladdr(stack: &Stack<'static, TestDevice>, addr: Ipv6Addr) -> Option<EthernetAddress> {
         match stack.neighbor_cache().get(IfaceHandle::new(0), addr.into())?.state {
             NeighborState::Reachable {
                 hardware_addr: HardwareAddress::Ethernet(hw),
@@ -7534,7 +7585,7 @@ pub(crate) mod test {
 
     /// A stack that is resolving [`NA_TARGET`]: the solicitation went out and the
     /// entry is incomplete.
-    fn resolving_stack() -> (Stack<'static>, Queue, Sent) {
+    fn resolving_stack() -> (Stack<'static, TestDevice>, Queue, Sent) {
         let (mut stack, rx, tx) = test_stack(Medium::Ethernet);
         assert_eq!(send_udp_v6_and_classify(&mut stack, &tx, NA_TARGET), None);
         tx.borrow_mut().clear();
@@ -7549,7 +7600,7 @@ pub(crate) mod test {
     }
 
     /// A stack that holds [`NA_TARGET`] as reachable at [`NA_LLADDR`].
-    fn resolved_stack() -> (Stack<'static>, Queue, Sent) {
+    fn resolved_stack() -> (Stack<'static, TestDevice>, Queue, Sent) {
         let (mut stack, rx, tx) = resolving_stack();
         let flags = NdiscNeighborFlags::SOLICITED | NdiscNeighborFlags::OVERRIDE;
         inject(
@@ -7725,11 +7776,11 @@ pub(crate) mod test {
     #[test]
     fn test_ndisc_advert_refreshes_reachable() {
         let (mut stack, rx, tx) = resolved_stack();
-        let inject_at = |stack: &mut Stack<'static>, bytes: Vec<u8>, at: Instant| {
+        let inject_at = |stack: &mut Stack<'static, TestDevice>, bytes: Vec<u8>, at: Instant| {
             rx.borrow_mut().push_back(bytes);
             stack.poll(at);
         };
-        let expires_at = |stack: &Stack<'static>| match stack
+        let expires_at = |stack: &Stack<'static, TestDevice>| match stack
             .neighbor_cache()
             .get(IfaceHandle::new(0), NA_TARGET.into())
             .unwrap()

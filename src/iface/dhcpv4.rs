@@ -22,6 +22,7 @@ use crate::config::DHCP_MAX_DNS_SERVER_COUNT;
 #[cfg(feature = "dhcpv4-options")]
 use crate::config::DHCP_OPTIONS_BUF_SIZE;
 use crate::driver::ChecksumCapabilities;
+use crate::driver::Driver;
 use crate::driver::PacketBuf;
 use crate::route::{Route, RouteOrigin};
 use crate::stack::StackInner;
@@ -558,7 +559,7 @@ impl Client {
     }
 }
 
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     /// Process a DHCP packet received on this interface from `src_ip`. `payload` is
     /// the UDP payload, the ports have already been checked by the caller.
     pub(crate) fn dhcpv4_process(
@@ -915,18 +916,18 @@ mod test {
     const IFACE: IfaceHandle = IfaceHandle::new(0);
 
     /// A stack with one Ethernet interface, no addresses, DHCP on.
-    fn test_stack() -> (Stack<'static>, Queue, Sent) {
+    fn test_stack() -> (Stack<'static, TestDevice>, Queue, Sent) {
         let (stack, rx, tx, _link) = test_stack_with_checksum(ChecksumCapabilities::default());
         (stack, rx, tx)
     }
 
     /// [`test_stack`], also handing out control of the link state the device reports.
-    fn test_stack_with_link() -> (Stack<'static>, Queue, Sent, Link) {
+    fn test_stack_with_link() -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         test_stack_with_checksum(ChecksumCapabilities::default())
     }
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
-    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
+    fn test_stack_with_checksum(checksum: ChecksumCapabilities) -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         let driver = TestDevice::new(Medium::Ethernet).with_checksum(checksum);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
         let mut stack = Stack::new(1, crate::test_device::packet_allocator());
@@ -1084,17 +1085,17 @@ mod test {
 
     /// Drive the client to BOUND: DISCOVER, OFFER, REQUEST, ACK. Returns the stack
     /// with the lease applied at `at(2)`.
-    fn bound_stack() -> (Stack<'static>, Queue, Sent) {
+    fn bound_stack() -> (Stack<'static, TestDevice>, Queue, Sent) {
         let (stack, rx, tx, _link) = bound_stack_with(DhcpConfig::default());
         (stack, rx, tx)
     }
 
     /// [`bound_stack`], also handing out control of the link state the device reports.
-    fn bound_stack_with_link() -> (Stack<'static>, Queue, Sent, Link) {
+    fn bound_stack_with_link() -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         bound_stack_with(DhcpConfig::default())
     }
 
-    fn bound_stack_with(config: DhcpConfig) -> (Stack<'static>, Queue, Sent, Link) {
+    fn bound_stack_with(config: DhcpConfig) -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         let (mut stack, rx, tx, link) = test_stack_with_link();
         stack.iface(IFACE).set_dhcpv4(Some(config)).unwrap();
 
@@ -1168,7 +1169,7 @@ mod test {
     }
 
     /// The interface's IPv4 addresses, leaving out the automatic IPv6 link-local.
-    fn ipv4_addrs(stack: &mut Stack) -> Vec<IfaceAddr> {
+    fn ipv4_addrs(stack: &mut Stack<'_, TestDevice>) -> Vec<IfaceAddr> {
         stack
             .iface(IFACE)
             .ip_addrs()
@@ -1584,7 +1585,7 @@ mod test {
 
     /// Drive the client to REQUESTING at `at(0)`: DISCOVER, OFFER, REQUEST, all
     /// at time zero. Returns the xid of the exchange.
-    fn requesting_stack_with(config: DhcpConfig) -> (Stack<'static>, Queue, Sent, u32) {
+    fn requesting_stack_with(config: DhcpConfig) -> (Stack<'static, TestDevice>, Queue, Sent, u32) {
         let (mut stack, rx, tx) = test_stack();
         stack.iface(IFACE).set_dhcpv4(Some(config)).unwrap();
 
@@ -1602,14 +1603,14 @@ mod test {
         (stack, rx, tx, xid)
     }
 
-    fn requesting_stack() -> (Stack<'static>, Queue, Sent, u32) {
+    fn requesting_stack() -> (Stack<'static, TestDevice>, Queue, Sent, u32) {
         requesting_stack_with(DhcpConfig::default())
     }
 
     /// Exactly [`test_renew`]'s setup, up to the renew REQUEST at T1 (32 s):
     /// a lease capped at 60 s, the server's MAC learned from an ARP request.
     /// Returns the xid of the renew REQUEST.
-    fn renewing_stack_with(mut config: DhcpConfig) -> (Stack<'static>, Queue, Sent, u32) {
+    fn renewing_stack_with(mut config: DhcpConfig) -> (Stack<'static, TestDevice>, Queue, Sent, u32) {
         config.max_lease_duration = Some(Duration::from_secs(60));
         let (mut stack, rx, tx, _link) = bound_stack_with(config);
 
@@ -1629,7 +1630,7 @@ mod test {
     }
 
     /// Poll at `t` and check that no frame went out. Returns the poll deadline.
-    fn poll_quiet(stack: &mut Stack<'_>, tx: &Sent, t: Instant) -> Instant {
+    fn poll_quiet(stack: &mut Stack<'_, TestDevice>, tx: &Sent, t: Instant) -> Instant {
         let before = tx.borrow().len();
         let deadline = stack.poll(t);
         assert_eq!(tx.borrow().len(), before, "unexpected frame at {}", t);
@@ -1639,7 +1640,7 @@ mod test {
     /// Poll at `t` and check that exactly one frame went out: a renew or rebind
     /// REQUEST from the leased address to `dst_ip`, with the leased address in
     /// ciaddr and no requested-ip or server-id options. Returns its xid.
-    fn poll_renew(stack: &mut Stack<'_>, tx: &Sent, t: Instant, dst_ip: Ipv4Addr) -> u32 {
+    fn poll_renew(stack: &mut Stack<'_, TestDevice>, tx: &Sent, t: Instant, dst_ip: Ipv4Addr) -> u32 {
         let before = tx.borrow().len();
         stack.poll(t);
         assert_eq!(tx.borrow().len(), before + 1, "expected one REQUEST at {}", t);

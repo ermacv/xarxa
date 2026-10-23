@@ -13,6 +13,7 @@ use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 use crate::config::TCP_LISTENER_BACKLOG;
 use crate::config::TCP_SOCKET_COUNT;
 use crate::driver::ChecksumCapabilities;
+use crate::driver::Driver;
 use crate::driver::PacketBuf;
 use crate::driver::config::PACKET_BUF_SIZE;
 #[cfg(feature = "icmp-errors")]
@@ -1799,11 +1800,11 @@ impl<'d> TcpSocketState<'d> {
     ///
     /// Packets are sent using the `emit` closure. Real egress uses the [`transmit`] function,
     /// tests pass a closure that captures what's sent.
-    pub(crate) fn dispatch<E>(
+    pub(crate) fn dispatch<D: Driver, E>(
         &mut self,
-        cx: &mut TxContext<'_, '_>,
+        cx: &mut TxContext<'_, '_, D>,
         clock: &mut Clock,
-        mut emit: impl FnMut(&mut TxContext<'_, '_>, Option<EgressRoute>, IpAddr, IpAddr, u8, TcpRepr) -> Result<(), E>,
+        mut emit: impl FnMut(&mut TxContext<'_, '_, D>, Option<EgressRoute>, IpAddr, IpAddr, u8, TcpRepr) -> Result<(), E>,
     ) -> Result<(), E> {
         let Some(tuple) = self.tuple else {
             return Ok(());
@@ -2274,8 +2275,8 @@ pub(crate) fn process_icmp_error(
 ///
 /// A segment the device has no room for, or no packet buffer is free for, is held
 /// back: `dispatch` stops, and the socket is left as if it had never tried.
-pub(crate) fn transmit(
-    cx: &mut TxContext<'_, '_>,
+pub(crate) fn transmit<D: Driver>(
+    cx: &mut TxContext<'_, '_, D>,
     route: Option<EgressRoute>,
     src_addr: IpAddr,
     dst_addr: IpAddr,
@@ -2316,13 +2317,13 @@ pub(crate) fn transmit(
 ///
 /// [`Stack`]: crate::Stack
 /// [`Stack::tcp_socket`]: crate::Stack::tcp_socket
-pub struct TcpSocket<'a, 'd> {
+pub struct TcpSocket<'a, 'd, D: Driver> {
     pub(crate) sockets: &'a mut Slab<TcpSocketState<'d>, TCP_SOCKET_COUNT>,
     pub(crate) index: usize,
-    pub(crate) tx: TxContext<'a, 'd>,
+    pub(crate) tx: TxContext<'a, 'd, D>,
 }
 
-impl<'d> TcpSocket<'_, 'd> {
+impl<'d, D: Driver> TcpSocket<'_, 'd, D> {
     /// This socket's state in the slab.
     #[inline]
     fn inner(&self) -> &TcpSocketState<'d> {
@@ -2982,24 +2983,24 @@ impl<'d> TcpSocket<'_, 'd> {
 ///
 /// ```no_run
 /// # use xarxa::Stack;
-/// # fn f(stack: &mut Stack) {
+/// # fn f<D: xarxa::driver::Driver>(stack: &mut Stack<'_, D>) {
 /// let mut iter = stack.tcp_sockets();
 /// while let Some((handle, item)) = iter.next() {
 ///     let _ = (handle, item.state());
 /// }
 /// # }
 /// ```
-pub struct TcpSocketIter<'a, 'd> {
-    pub(crate) stack: &'a mut Stack<'d>,
+pub struct TcpSocketIter<'a, 'd, D: Driver> {
+    pub(crate) stack: &'a mut Stack<'d, D>,
     pub(crate) next: usize,
 }
 
-impl<'d> TcpSocketIter<'_, 'd> {
+impl<'d, D: Driver> TcpSocketIter<'_, 'd, D> {
     /// Get the next TCP socket, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_, 'd>)> {
+    pub fn next(&mut self) -> Option<(TcpHandle, TcpSocket<'_, 'd, D>)> {
         let index = self.stack.sockets.tcp.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = TcpHandle::new(index);
@@ -3093,13 +3094,13 @@ mod test {
 
     struct TestSocket {
         sockets: Slab<TcpSocketState<'static>, TCP_SOCKET_COUNT>,
-        stack: Stack<'static>,
+        stack: Stack<'static, TestDevice>,
         /// The deadline the last dispatch counted, as `Stack::poll` would return it.
         deadline: Instant,
     }
 
     impl TestSocket {
-        fn view(&mut self) -> TcpSocket<'_, 'static> {
+        fn view(&mut self) -> TcpSocket<'_, 'static, TestDevice> {
             TcpSocket {
                 sockets: &mut self.sockets,
                 index: 0,
@@ -3261,8 +3262,9 @@ mod test {
     }
 
     /// A stack with one interface owning `LOCAL_ADDR`.
-    fn test_stack() -> Stack<'static> {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+    fn test_stack() -> Stack<'static, TestDevice> {
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = TestDevice::new(Medium::Ip).install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)
@@ -3442,7 +3444,7 @@ mod test {
     /// capacities, returning its handle, or `None` if nothing is queued.
     #[cfg(feature = "tcp-listener")]
     fn listener_accept(
-        stack: &mut Stack<'static>,
+        stack: &mut Stack<'static, TestDevice>,
         h: TcpListenerHandle,
         rx_capacity: usize,
         tx_capacity: usize,
@@ -3457,7 +3459,7 @@ mod test {
 
     /// A stack with a listener on `LOCAL_PORT` (any address).
     #[cfg(feature = "tcp-listener")]
-    fn listener_stack() -> (Stack<'static>, TcpListenerHandle) {
+    fn listener_stack() -> (Stack<'static, TestDevice>, TcpListenerHandle) {
         let mut stack = test_stack();
         let h = stack.add_tcp_listener().unwrap();
         stack.tcp_listener(h).listen(LOCAL_PORT).unwrap();
@@ -3467,13 +3469,13 @@ mod test {
     /// Offer a segment from `REMOTE_END` to `LOCAL_END` to the stack's
     /// listeners the way `process_tcp` does, returning whether it was consumed.
     #[cfg(feature = "tcp-listener")]
-    fn listener_deliver(stack: &mut Stack, repr: &TcpRepr) -> bool {
+    fn listener_deliver(stack: &mut Stack<'_, TestDevice>, repr: &TcpRepr) -> bool {
         listener_deliver_to(stack, LOCAL_ADDR, repr)
     }
 
     /// Like [`listener_deliver`], with an explicit destination address.
     #[cfg(feature = "tcp-listener")]
-    fn listener_deliver_to(stack: &mut Stack, dst_addr: Ipv4Addr, repr: &TcpRepr) -> bool {
+    fn listener_deliver_to(stack: &mut Stack<'_, TestDevice>, dst_addr: Ipv4Addr, repr: &TcpRepr) -> bool {
         process_listeners(
             &mut stack.sockets.tcp_listeners,
             IfaceHandle::new(0),
@@ -3665,13 +3667,14 @@ mod test {
     /// interface 0 owns `LOCAL_ADDR`, interface 1 owns `LOCAL2_ADDR`.
     #[cfg(feature = "iface-bind")]
     fn stack_with_two_ifaces() -> (
-        Stack<'static>,
+        Stack<'static, TestDevice>,
         IfaceHandle,
         IfaceHandle,
         crate::test_device::Sent,
         crate::test_device::Sent,
     ) {
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let d0 = TestDevice::new(Medium::Ip);
         let tx0 = d0.tx.clone();
         let if0 = d0.install(&mut stack, HardwareAddress::Ip);
@@ -3757,7 +3760,7 @@ mod test {
 
     /// Like [`listener_deliver`], with an explicit arrival interface.
     #[cfg(all(feature = "tcp-listener", feature = "iface-bind"))]
-    fn listener_deliver_on(stack: &mut Stack, iface: IfaceHandle, repr: &TcpRepr) -> bool {
+    fn listener_deliver_on(stack: &mut Stack<'_, TestDevice>, iface: IfaceHandle, repr: &TcpRepr) -> bool {
         process_listeners(
             &mut stack.sockets.tcp_listeners,
             iface,
@@ -4573,7 +4576,8 @@ mod test {
     fn test_connect_ephemeral_port() {
         use crate::stack::EPHEMERAL_PORT_MIN;
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -4602,7 +4606,8 @@ mod test {
             port: REMOTE_PORT,
         };
 
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let h1 = stack
             .add_tcp_socket_with_bufs(vec![0; 64].leak(), vec![0; 64].leak())
             .unwrap();
@@ -12308,9 +12313,10 @@ mod stack_test {
         payload2: &[],
     };
 
-    fn stack() -> (Stack<'static>, TestDevice) {
+    fn stack() -> (Stack<'static, TestDevice>, TestDevice) {
         let driver = TestDevice::new(Medium::Ip);
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ip);
         stack
             .iface(handle)

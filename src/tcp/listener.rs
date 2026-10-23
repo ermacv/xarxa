@@ -4,6 +4,7 @@
 use super::TcpTimestampRepr;
 use super::{DEFAULT_MSS, ListenError, MIN_REMOTE_MSS, State, TcpControl, TcpRepr, TcpSocketState, Tuple};
 use crate::config::{TCP_LISTENER_BACKLOG, TCP_LISTENER_COUNT};
+use crate::driver::Driver;
 use crate::iface::IfaceHandle;
 use crate::rand::Rand;
 use crate::stack::{IfaceBinding, Stack, addr_score};
@@ -434,19 +435,19 @@ impl TcpListener<'_> {
 ///
 /// ```no_run
 /// # use xarxa::Stack;
-/// # fn f(stack: &mut Stack) {
+/// # fn f<D: xarxa::driver::Driver>(stack: &mut Stack<'_, D>) {
 /// let mut iter = stack.tcp_listeners();
 /// while let Some((handle, item)) = iter.next() {
 ///     let _ = (handle, item.is_open());
 /// }
 /// # }
 /// ```
-pub struct TcpListenerIter<'a, 'd> {
-    pub(crate) stack: &'a mut Stack<'d>,
+pub struct TcpListenerIter<'a, 'd, D: Driver> {
+    pub(crate) stack: &'a mut Stack<'d, D>,
     pub(crate) next: usize,
 }
 
-impl<'d> TcpListenerIter<'_, 'd> {
+impl<'d, D: Driver> TcpListenerIter<'_, 'd, D> {
     /// Get the next TCP listener, with its handle.
     ///
     /// Returns `None` when there are no more.

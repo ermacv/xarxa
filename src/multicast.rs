@@ -3,6 +3,7 @@
 // which `iface` re-exports.
 
 use crate::config::MULTICAST_GROUP_COUNT;
+use crate::driver::Driver;
 use crate::error::Full;
 use crate::storage::Vec;
 
@@ -146,7 +147,7 @@ impl core::fmt::Display for MulticastError {
 
 impl core::error::Error for MulticastError {}
 
-impl Iface<'_, '_> {
+impl<D: Driver> Iface<'_, '_, D> {
     /// Join a multicast group.
     ///
     /// The stack accepts packets sent to the group right away, and reports the
@@ -187,7 +188,7 @@ impl Iface<'_, '_> {
     }
 }
 
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     /// Add an address to a list of subscribed multicast IP addresses.
     pub(crate) fn join_multicast_group(&mut self, addr: impl Into<IpAddr>) -> Result<(), MulticastError> {
         let addr = addr.into();
@@ -735,15 +736,19 @@ mod test {
     /// A stack with one interface of the given medium, owning [`OUR_V4`]/24 and
     /// [`OUR_LL`]/64 (plus, on Ethernet, the automatic link-local address, whose
     /// solicited-node group is the same as [`OUR_LL`]'s).
-    fn test_stack(medium: Medium) -> (Stack<'static>, Queue, Sent, Link) {
+    fn test_stack(medium: Medium) -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         test_stack_with_checksum(medium, ChecksumCapabilities::default())
     }
 
     /// [`test_stack`], with a device that claims to handle the given checksums itself.
-    fn test_stack_with_checksum(medium: Medium, checksum: ChecksumCapabilities) -> (Stack<'static>, Queue, Sent, Link) {
+    fn test_stack_with_checksum(
+        medium: Medium,
+        checksum: ChecksumCapabilities,
+    ) -> (Stack<'static, TestDevice>, Queue, Sent, Link) {
         let driver = TestDevice::new(medium).with_checksum(checksum);
         let (rx, tx, link) = (driver.rx.clone(), driver.tx.clone(), driver.link.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(
             &mut stack,
             match medium {
@@ -782,7 +787,7 @@ mod test {
 
     /// Inject an IP packet, framed for the medium, and poll the stack to process it.
     fn inject(
-        stack: &mut Stack,
+        stack: &mut Stack<'_, TestDevice>,
         rx: &Queue,
         medium: Medium,
         ethertype: EthernetProtocol,

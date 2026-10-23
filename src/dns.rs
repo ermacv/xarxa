@@ -19,6 +19,7 @@ use crate::error::{Full, Malformed};
 use crate::storage::Slab;
 use heapless::Vec;
 
+use crate::driver::Driver;
 use crate::stack::Stack;
 use crate::time::{Clock, Duration, Instant};
 use crate::udp::{RecvError, SendError, UdpHandle};
@@ -166,7 +167,7 @@ impl DnsClient {
     ///
     /// # Errors
     /// - `Full`: if the stack has no room for another UDP socket.
-    pub fn new(stack: &mut Stack, servers: &[IpAddr]) -> Result<DnsClient, Full> {
+    pub fn new<D: Driver>(stack: &mut Stack<'_, D>, servers: &[IpAddr]) -> Result<DnsClient, Full> {
         let truncated_servers = &servers[..min(servers.len(), DNS_MAX_SERVER_COUNT)];
 
         let socket = stack.add_udp_socket()?;
@@ -184,7 +185,7 @@ impl DnsClient {
     /// Destroy the client, removing its UDP socket from `stack`.
     ///
     /// Pending queries are cancelled.
-    pub fn remove(self, stack: &mut Stack) {
+    pub fn remove<D: Driver>(self, stack: &mut Stack<'_, D>) {
         stack.remove_udp_socket(self.socket);
     }
 
@@ -214,9 +215,9 @@ impl DnsClient {
     /// the same (there's no support for DNS search path).
     ///
     /// With the `mdns` feature, names ending in `.local` are sent with multicast DNS.
-    pub fn start_query(
+    pub fn start_query<D: Driver>(
         &mut self,
-        stack: &mut Stack,
+        stack: &mut Stack<'_, D>,
         name: &str,
         query_type: Type,
     ) -> Result<DnsQueryHandle, StartQueryError> {
@@ -271,9 +272,9 @@ impl DnsClient {
     /// With the `mdns` feature, names ending in `.local` are sent with multicast DNS.
     ///
     /// You probably want to use [`start_query`](Self::start_query) instead.
-    pub fn start_query_raw(
+    pub fn start_query_raw<D: Driver>(
         &mut self,
-        stack: &mut Stack,
+        stack: &mut Stack<'_, D>,
         raw_name: &[u8],
         query_type: Type,
         mdns: MulticastDns,
@@ -356,7 +357,7 @@ impl DnsClient {
     /// later than `now`. Call it after every [`Stack::poll`], and again when that
     /// deadline arrives.
     #[must_use]
-    pub fn poll(&mut self, stack: &mut Stack, now: Instant) -> Instant {
+    pub fn poll<D: Driver>(&mut self, stack: &mut Stack<'_, D>, now: Instant) -> Instant {
         self.process(stack);
         self.dispatch(stack, now)
     }
@@ -365,7 +366,7 @@ impl DnsClient {
         (remote.port == DNS_PORT && self.servers.contains(&remote.addr)) || (remote.port == MDNS_DNS_PORT)
     }
 
-    fn process(&mut self, stack: &mut Stack) {
+    fn process<D: Driver>(&mut self, stack: &mut Stack<'_, D>) {
         loop {
             let mut pkt = match stack.udp_socket(self.socket).recv() {
                 Ok(pkt) => pkt,
@@ -523,7 +524,7 @@ impl DnsClient {
         }
     }
 
-    fn dispatch(&mut self, stack: &mut Stack, now: Instant) -> Instant {
+    fn dispatch<D: Driver>(&mut self, stack: &mut Stack<'_, D>, now: Instant) -> Instant {
         let now = now;
         let mut clock = Clock::new(now);
 

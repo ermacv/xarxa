@@ -281,11 +281,11 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
 }
 
 /// An interface added to the stack, with its configuration.
-pub(crate) struct IfaceState<'d> {
+pub(crate) struct IfaceState<'d, D: Driver> {
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
     pub(crate) arp_replies: arp_reply::Replies,
     pub(crate) handle: IfaceHandle,
-    pub(crate) driver: MaybeBox<'d, dyn Driver + 'd>,
+    pub(crate) driver: MaybeBox<'d, D>,
     /// The driver's medium, converted and checked when the interface is added.
     pub(crate) medium: Medium,
     /// The driver's capabilities, read when the interface is added.
@@ -314,24 +314,24 @@ pub(crate) struct IfaceState<'d> {
 }
 
 /// An interface borrowed from a [`Stack`], returned by [`Stack::iface`].
-pub struct Iface<'a, 'd> {
+pub struct Iface<'a, 'd, D: Driver> {
     #[cfg_attr(
         not(any(feature = "medium-ethernet", feature = "medium-ieee802154")),
         allow(dead_code)
     )]
     pub(crate) inner: &'a mut StackInner,
-    pub(crate) ifaces: &'a mut Slab<IfaceState<'d>, IFACE_COUNT>,
+    pub(crate) ifaces: &'a mut Slab<IfaceState<'d, D>, IFACE_COUNT>,
     pub(crate) index: usize,
 }
 
-impl<'d> Iface<'_, 'd> {
+impl<'d, D: Driver> Iface<'_, 'd, D> {
     #[inline]
-    pub(crate) fn state(&self) -> &IfaceState<'d> {
+    pub(crate) fn state(&self) -> &IfaceState<'d, D> {
         self.ifaces.get(self.index)
     }
 
     #[inline]
-    pub(crate) fn state_mut(&mut self) -> &mut IfaceState<'d> {
+    pub(crate) fn state_mut(&mut self) -> &mut IfaceState<'d, D> {
         self.ifaces.get_mut(self.index)
     }
 
@@ -341,8 +341,8 @@ impl<'d> Iface<'_, 'd> {
     }
 
     /// The interface's driver.
-    pub fn driver_mut(&mut self) -> &mut dyn Driver {
-        &mut *self.state_mut().driver
+    pub fn driver_mut(&mut self) -> &mut D {
+        &mut self.state_mut().driver
     }
 
     /// The link state reported by the device.
@@ -666,24 +666,24 @@ impl<'d> Iface<'_, 'd> {
 ///
 /// ```no_run
 /// # use xarxa::Stack;
-/// # fn f(stack: &mut Stack) {
+/// # fn f<D: xarxa::driver::Driver>(stack: &mut Stack<'_, D>) {
 /// let mut iter = stack.ifaces();
 /// while let Some((handle, item)) = iter.next() {
 ///     let _ = (handle, item.hardware_addr());
 /// }
 /// # }
 /// ```
-pub struct IfaceIter<'a, 'd> {
-    pub(crate) stack: &'a mut Stack<'d>,
+pub struct IfaceIter<'a, 'd, D: Driver> {
+    pub(crate) stack: &'a mut Stack<'d, D>,
     pub(crate) next: usize,
 }
 
-impl<'d> IfaceIter<'_, 'd> {
+impl<'d, D: Driver> IfaceIter<'_, 'd, D> {
     /// Get the next interface, with its handle.
     ///
     /// Returns `None` when there are no more.
     #[allow(clippy::should_implement_trait)]
-    pub fn next(&mut self) -> Option<(IfaceHandle, Iface<'_, 'd>)> {
+    pub fn next(&mut self) -> Option<(IfaceHandle, Iface<'_, 'd, D>)> {
         let index = self.stack.ifaces.next_occupied(self.next)?;
         self.next = index + 1;
         let handle = IfaceHandle::new(index);
@@ -691,7 +691,7 @@ impl<'d> IfaceIter<'_, 'd> {
     }
 }
 
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     /// The interface's medium.
     #[allow(dead_code)]
     pub(crate) fn medium(&self) -> Medium {

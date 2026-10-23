@@ -10,6 +10,7 @@
 #[cfg(feature = "ipv4-fragmentation")]
 use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
+use crate::driver::Driver;
 use crate::driver::PacketBuf;
 use crate::iface::IfaceState;
 #[cfg(feature = "ipv4-fragmentation")]
@@ -138,7 +139,7 @@ impl StackInner {
     /// other's an IPv4 packet.
     ///
     /// The error says why the rest of the fragments have to wait.
-    pub(crate) fn fragment_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
+    pub(crate) fn fragment_egress<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>) -> Result<(), Blocked> {
         match iface.medium() {
             #[cfg(feature = "medium-ieee802154")]
             crate::iface::Medium::Ieee802154 => {
@@ -177,9 +178,9 @@ impl StackInner {
 
     /// Fragment an IPv4 packet larger than the interface's MTU, and start
     /// transmitting the fragments.
-    pub(crate) fn fragment_ipv4(
+    pub(crate) fn fragment_ipv4<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         dst_addr: IpAddr,
         next_hop: IpAddr,
         mut buf: PacketBuf,
@@ -229,7 +230,7 @@ impl StackInner {
     /// Fragments go out while the device has room for them and the pool has
     /// buffers. The rest wait in the fragmenter for the next poll, and the error
     /// says which of the two ran out.
-    pub(crate) fn ipv4_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
+    pub(crate) fn ipv4_egress<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>) -> Result<(), Blocked> {
         if iface.fragmenter.is_empty() {
             return Ok(());
         }
@@ -252,7 +253,7 @@ impl StackInner {
     /// Transmit the next fragment of the packet in the interface's fragmenter.
     ///
     /// Returns `false` if no packet buffer is free, leaving the fragmenter as it was.
-    fn dispatch_ipv4_frag(&mut self, iface: &mut IfaceState<'_>) -> bool {
+    fn dispatch_ipv4_frag<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>) -> bool {
         // NOTE(unwrap): the fragmenter is not empty, checked by the caller.
         let ip_header_len = Ipv4Packet::new_unchecked(unwrap!(iface.fragmenter.buffer.as_mut())).header_len() as usize;
         let max_fragment_size = iface.max_ipv4_fragment_size(ip_header_len);
@@ -302,7 +303,7 @@ impl StackInner {
 }
 
 #[cfg(feature = "ipv4-fragmentation")]
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     /// The maximum IPv4 payload fragment size, aligned per spec.
     pub(crate) fn max_ipv4_fragment_size(&self, ip_header_len: usize) -> usize {
         let payload_mtu = self.ip_mtu().saturating_sub(ip_header_len);

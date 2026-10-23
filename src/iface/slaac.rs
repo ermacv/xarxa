@@ -11,6 +11,7 @@
 use xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM;
 
 use crate::config::{SLAAC_PREFIX_COUNT, SLAAC_ROUTER_COUNT};
+use crate::driver::Driver;
 use crate::storage::Vec;
 
 use super::{AddrOrigin, IfaceAddr, IfaceState, Preferred};
@@ -378,7 +379,7 @@ fn from_link_prefix(link_prefix: &Ipv6Cidr, hardware_addr: HardwareAddress) -> O
     Some(Ipv6Cidr::new(Ipv6Addr::from_octets(bytes), 64))
 }
 
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     /// Process a router advertisement that passed the NDISC validity checks.
     pub(crate) fn slaac_process_advertisement(
         &mut self,

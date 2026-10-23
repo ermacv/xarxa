@@ -166,7 +166,7 @@ impl TestDevice {
     ///
     /// The stack gets its own copy, sharing this one's queues. It is leaked, so
     /// the interface lives as long as the test wants it to.
-    pub fn install(&self, stack: &mut Stack<'_>, hw: HardwareAddress) -> IfaceHandle {
+    pub fn install(&self, stack: &mut Stack<'_, TestDevice>, hw: HardwareAddress) -> IfaceHandle {
         let mut driver = self.clone();
         driver.hardware_addr = hw;
         stack.add_iface_borrowed(Box::leak(Box::new(driver))).unwrap()

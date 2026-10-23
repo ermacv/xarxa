@@ -8,6 +8,7 @@
 //! around, with the headroom taking up the difference.
 
 use crate::config::SIXLOWPAN_ADDRESS_CONTEXT_COUNT;
+use crate::driver::Driver;
 use crate::driver::PacketBuf;
 use crate::error::{Full, Malformed};
 use crate::iface::{Iface, IfaceHandle, IfaceState};
@@ -90,7 +91,7 @@ impl State {
     }
 }
 
-impl Iface<'_, '_> {
+impl<D: Driver> Iface<'_, '_, D> {
     /// The PAN identifier of an IEEE 802.15.4 interface, `None` for any PAN.
     pub fn pan_id(&self) -> Option<Ieee802154Pan> {
         self.state().sixlowpan.pan_id
@@ -135,7 +136,7 @@ impl Iface<'_, '_> {
 }
 
 // Ingress.
-impl Stack<'_> {
+impl<D: Driver> Stack<'_, D> {
     pub(crate) fn process_ieee802154(&mut self, iface: IfaceHandle, mut buf: PacketBuf, now: Instant) {
         let (ieee802154_repr, header_len) = check!(Ieee802154Repr::parse(&buf));
 
@@ -582,9 +583,9 @@ pub(crate) fn ipv6_to_sixlowpan(buf: &mut PacketBuf, ieee_repr: &Ieee802154Repr)
 // Egress.
 impl StackInner {
     /// Send an IPv6 packet to `ll_dst_a` on an IEEE 802.15.4 interface.
-    pub(crate) fn dispatch_ieee802154(
+    pub(crate) fn dispatch_ieee802154<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         ll_dst_a: Ieee802154Address,
         buf: PacketBuf,
     ) {
@@ -608,7 +609,12 @@ impl StackInner {
         self.dispatch_sixlowpan(iface, buf, ieee_repr);
     }
 
-    fn dispatch_sixlowpan(&mut self, iface: &mut IfaceState<'_>, mut buf: PacketBuf, ieee_repr: Ieee802154Repr) {
+    fn dispatch_sixlowpan<D: Driver>(
+        &mut self,
+        iface: &mut IfaceState<'_, D>,
+        mut buf: PacketBuf,
+        ieee_repr: Ieee802154Repr,
+    ) {
         let header_diff = match ipv6_to_sixlowpan(&mut buf, &ieee_repr) {
             Ok(header_diff) => header_diff,
             Err(_) => {
@@ -643,7 +649,7 @@ impl StackInner {
 
 // Reassembly (feature `sixlowpan-reassembly`).
 #[cfg(feature = "sixlowpan-reassembly")]
-impl Stack<'_> {
+impl<D: Driver> Stack<'_, D> {
     /// Add a 6LoWPAN fragment to the packet it belongs to.
     ///
     /// The first fragment is decompressed in its own buffer, then copied into
@@ -759,9 +765,9 @@ impl StackInner {
     /// `buf` starts at the IPHC header. `header_diff` is what compression took
     /// off the header chain, so `buf.len() + header_diff` is the size of the
     /// IPv6 datagram.
-    fn fragment_sixlowpan(
+    fn fragment_sixlowpan<D: Driver>(
         &mut self,
-        iface: &mut IfaceState<'_>,
+        iface: &mut IfaceState<'_, D>,
         buf: PacketBuf,
         ieee_repr: Ieee802154Repr,
         header_diff: usize,
@@ -823,7 +829,7 @@ impl StackInner {
     /// Fragments go out while the device has room for them and the pool has
     /// buffers. The rest wait in the fragmenter for the next poll, and the error
     /// says which of the two ran out.
-    pub(crate) fn sixlowpan_egress(&mut self, iface: &mut IfaceState<'_>) -> Result<(), Blocked> {
+    pub(crate) fn sixlowpan_egress<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>) -> Result<(), Blocked> {
         if iface.fragmenter.is_empty() {
             return Ok(());
         }
@@ -846,7 +852,7 @@ impl StackInner {
     /// Transmit the next fragment of the packet in the interface's fragmenter.
     ///
     /// Returns `false` if no packet buffer is free, leaving the fragmenter as it was.
-    fn dispatch_ieee802154_frag(&mut self, iface: &mut IfaceState<'_>) -> bool {
+    fn dispatch_ieee802154_frag<D: Driver>(&mut self, iface: &mut IfaceState<'_, D>) -> bool {
         // Create the IEEE802.15.4 header.
         let ieee_repr = Ieee802154Repr {
             frame_type: Ieee802154FrameType::Data,
@@ -966,10 +972,11 @@ mod test {
     fn test_stack(
         hw: Ieee802154Address,
         pan_id: Option<Ieee802154Pan>,
-    ) -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
+    ) -> (Stack<'static, TestDevice>, IfaceHandle, Queue, Sent, Room) {
         let driver = TestDevice::new(Medium::Ieee802154).with_mtu(MTU);
         let (rx, tx, room) = (driver.rx.clone(), driver.tx.clone(), driver.room.clone());
-        let mut stack = Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
+        let mut stack: Stack<'_, TestDevice> =
+            Stack::new(0x1234_5678_dead_beef, crate::test_device::packet_allocator());
         let handle = driver.install(&mut stack, HardwareAddress::Ieee802154(hw));
         stack.iface(handle).set_pan_id(pan_id);
         // Drain the solicited-node multicast reports the link-local address
@@ -979,7 +986,7 @@ mod test {
         (stack, handle, rx, tx, room)
     }
 
-    fn fill_neighbor(stack: &mut Stack, iface: IfaceHandle, addr: Ipv6Addr, ll: Ieee802154Address) {
+    fn fill_neighbor(stack: &mut Stack<'_, TestDevice>, iface: IfaceHandle, addr: Ipv6Addr, ll: Ieee802154Address) {
         stack
             .inner
             .neighbor_cache
@@ -1707,7 +1714,7 @@ mod test {
     /// A stack with the old harness's address and the vectors' address, for
     /// the Contiki-NG vectors.
     #[cfg(all(feature = "sixlowpan-fragmentation", feature = "sixlowpan-reassembly"))]
-    fn vector_stack() -> (Stack<'static>, IfaceHandle, Queue, Sent, Room) {
+    fn vector_stack() -> (Stack<'static, TestDevice>, IfaceHandle, Queue, Sent, Room) {
         let (mut stack, iface, rx, tx, room) = test_stack(TWO_LL, None);
         stack
             .iface(iface)
@@ -1847,7 +1854,14 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
     /// A stack with a UDP socket bound to 6969 and the peer resolved, and a
     /// datagram from the peer that takes two fragments.
     #[cfg(any(feature = "sixlowpan-fragmentation", feature = "sixlowpan-reassembly"))]
-    fn reassembly_stack() -> (Stack<'static>, IfaceHandle, Queue, Sent, Room, crate::udp::UdpHandle) {
+    fn reassembly_stack() -> (
+        Stack<'static, TestDevice>,
+        IfaceHandle,
+        Queue,
+        Sent,
+        Room,
+        crate::udp::UdpHandle,
+    ) {
         let (mut stack, iface, rx, tx, room) = test_stack(OUR_LL, Some(PAN));
         fill_neighbor(&mut stack, iface, PEER_LINK_LOCAL, PEER_LL);
         let udp = stack.add_udp_socket().unwrap();
@@ -1866,7 +1880,7 @@ In at rhoncus tortor. Cras blandit tellus diam, varius vestibulum nibh commodo n
     }
 
     #[cfg(feature = "sixlowpan-reassembly")]
-    fn check_received(stack: &mut Stack, udp: crate::udp::UdpHandle) {
+    fn check_received(stack: &mut Stack<'_, TestDevice>, udp: crate::udp::UdpHandle) {
         let mut socket = stack.udp_socket(udp);
         let received = socket.recv().unwrap();
         assert_eq!(received.len(), 300);

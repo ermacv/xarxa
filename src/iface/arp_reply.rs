@@ -1,5 +1,6 @@
 //! Bounded, coalescing ARP response ownership. No pool allocation and no RX gate.
 use super::IfaceState;
+use crate::driver::Driver;
 use crate::driver::{LinkState, PacketBuf};
 use crate::wire::Ipv4Addr;
 
@@ -22,7 +23,7 @@ impl Replies {
     }
 }
 
-impl IfaceState<'_> {
+impl<D: Driver> IfaceState<'_, D> {
     pub(crate) fn queue_arp_reply(&mut self, peer: Ipv4Addr, local: Ipv4Addr, packet: PacketBuf) {
         // Duplicate requests need one response. Replace in place so a changed
         // sender MAC is reflected without changing FIFO order or adding owners.

@@ -24,6 +24,10 @@ features = ["async", "packetmeta-timestamp"]
 targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
+## Adopt externally owned payload storage as a PacketBuf. Disabled by default;
+## ordinary packet pools then have no external release callback path.
+external-origin = []
+
 ## Derive `defmt::Format` on the types in this crate.
 defmt = ["dep:defmt"]
 

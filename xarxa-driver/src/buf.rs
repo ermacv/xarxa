@@ -70,15 +70,84 @@ struct PacketBufInner {
     data: NonNull<Data>,
 }
 
+/// All fields read by the non-generic ownership operations precede the
+/// variable-length control array in both kinds of origin.
+#[repr(C)]
 struct PacketPoolHeader {
-    allocate: unsafe fn(NonNull<PacketPoolHeader>) -> Option<PacketBuf>,
-    release: unsafe fn(NonNull<PacketPoolHeader>, usize),
-    #[cfg(feature = "async")]
-    has_available: unsafe fn(NonNull<PacketPoolHeader>) -> bool,
+    count: usize,
+    kind: PacketOriginKind,
+    used: [AtomicU32; MAX_BITMAP_WORDS],
     #[cfg(feature = "async")]
     waiter_claimed: AtomicBool,
     #[cfg(feature = "async")]
     waiter: AtomicWaker,
+}
+
+#[derive(Clone, Copy)]
+enum PacketOriginKind {
+    Pool {
+        storage: *const UnsafeCell<MaybeUninit<Data>>,
+    },
+    #[cfg(feature = "external-origin")]
+    External {
+        context: *const (),
+        release: ExternalPacketRelease,
+    },
+}
+
+impl PacketPoolHeader {
+    const fn new(count: usize, kind: PacketOriginKind) -> Self {
+        Self {
+            count,
+            kind,
+            used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+            #[cfg(feature = "async")]
+            waiter_claimed: AtomicBool::new(false),
+            #[cfg(feature = "async")]
+            waiter: AtomicWaker::new(),
+        }
+    }
+
+    /// Claim the first free slot using the compact atomic bitmap protocol.
+    fn alloc_slot(&self) -> Option<usize> {
+        for (word_index, word) in self.used[..self.count.div_ceil(32)].iter().enumerate() {
+            let mut current = word.load(Ordering::Relaxed);
+            loop {
+                let bit = current.trailing_ones() as usize;
+                if bit >= 32 {
+                    break;
+                }
+                let index = word_index * 32 + bit;
+                if index >= self.count {
+                    return None;
+                }
+                // Acquire pairs with release_slot's Release: the preceding
+                // owner has finished with the control and payload slots.
+                match word.compare_exchange_weak(current, current | (1 << bit), Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => return Some(index),
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "async")]
+    #[inline(never)]
+    fn has_available(&self) -> bool {
+        #[cfg(feature = "external-origin")]
+        if !matches!(self.kind, PacketOriginKind::Pool { .. }) {
+            return false;
+        }
+        self.used[..self.count.div_ceil(32)]
+            .iter()
+            .enumerate()
+            .any(|(word_index, word)| {
+                let used = word.load(Ordering::Acquire);
+                let valid = (self.count - word_index * 32).min(32);
+                used.count_ones() < valid as u32
+            })
+    }
 }
 
 /// A small, copyable capability for allocating owned packet buffers.
@@ -104,10 +173,8 @@ impl PacketBufAllocator {
     /// The packet has zero headroom and length and default metadata. Its storage
     /// retains unspecified bytes from the preceding owner.
     pub fn try_alloc(self) -> Option<PacketBuf> {
-        let allocate = unsafe { self.origin.as_ref().allocate };
-        // SAFETY: only `PacketPool::allocator` constructs this capability and
-        // installs the matching monomorphized allocation function.
-        unsafe { allocate(self.origin) }
+        // SAFETY: only a stable static pool constructs this capability.
+        unsafe { allocate_from_pool(self.origin) }
     }
 
     /// Whether `buf` originated from this allocator's pool.
@@ -123,7 +190,7 @@ impl PacketBufAllocator {
     #[cfg(feature = "async")]
     pub fn has_available(self) -> bool {
         let header = unsafe { self.origin.as_ref() };
-        unsafe { (header.has_available)(self.origin) }
+        header.has_available()
     }
 
     /// Claim the pool's unique asynchronous availability waiter.
@@ -165,7 +232,7 @@ impl PacketPoolWaiter {
     pub fn register(&self, waker: &Waker) {
         let header = unsafe { self.origin.as_ref() };
         header.waiter.register(waker);
-        let available = unsafe { (header.has_available)(self.origin) };
+        let available = header.has_available();
         if available {
             header.waiter.wake();
         }
@@ -233,12 +300,9 @@ unsafe impl<const COUNT: usize> Sync for PacketPoolStorage<COUNT> {}
 /// the packet bytes themselves to live in a larger memory class.
 #[repr(C)]
 pub struct PacketPool<const COUNT: usize> {
-    // Must stay first: the type-erased release function casts this address back
-    // to the monomorphized pool type.
+    // The header and controls' offset are independent of COUNT.
     header: PacketPoolHeader,
-    used: [AtomicU32; MAX_BITMAP_WORDS],
     controls: [UnsafeCell<MaybeUninit<PacketBufInner>>; COUNT],
-    storage: &'static PacketPoolStorage<COUNT>,
 }
 
 // SAFETY: every control and payload slot is published only to the one
@@ -267,19 +331,13 @@ impl<const COUNT: usize> PacketPool<COUNT> {
             "a packet pool cannot contain more than 1024 slots"
         );
         Self {
-            header: PacketPoolHeader {
-                allocate: allocate_from_pool::<COUNT>,
-                release: release_slot::<COUNT>,
-                #[cfg(feature = "async")]
-                has_available: has_available_in_pool::<COUNT>,
-                #[cfg(feature = "async")]
-                waiter_claimed: AtomicBool::new(false),
-                #[cfg(feature = "async")]
-                waiter: AtomicWaker::new(),
-            },
-            used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+            header: PacketPoolHeader::new(
+                COUNT,
+                PacketOriginKind::Pool {
+                    storage: storage.data.as_ptr(),
+                },
+            ),
             controls: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; COUNT],
-            storage,
         }
     }
 
@@ -291,7 +349,7 @@ impl<const COUNT: usize> PacketPool<COUNT> {
     /// Create a copyable allocation capability bound to this pool.
     pub fn allocator(&'static self) -> PacketBufAllocator {
         PacketBufAllocator {
-            origin: NonNull::from(&self.header),
+            origin: NonNull::from(self).cast(),
         }
     }
 
@@ -302,98 +360,85 @@ impl<const COUNT: usize> PacketPool<COUNT> {
 
     /// Allocate one empty packet from this pool.
     pub fn try_alloc(&'static self) -> Option<PacketBuf> {
-        let index = self.alloc_slot()?;
-        let ptr = self.controls[index].get().cast::<PacketBufInner>();
-        let data = self.storage.data[index].get().cast::<Data>();
-        // SAFETY:
-        // - the ownership CAS above uniquely claimed both slots at `index`;
-        // - both pointers refer to statically allocated, correctly aligned
-        //   `MaybeUninit` storage for their target types;
-        // - every field read through PacketBuf is initialized here.
-        unsafe {
-            (&raw mut (*ptr).origin).write(NonNull::from(&self.header));
-            (&raw mut (*ptr).slot).write(index);
-            (&raw mut (*ptr).headroom).write(0);
-            (&raw mut (*ptr).len).write(0);
-            (&raw mut (*ptr).meta).write(PacketMeta::default());
-            (&raw mut (*ptr).data).write(NonNull::new_unchecked(data));
-            // Catch code that relies on fresh buffers being zeroed.
-            #[cfg(test)]
-            (*data).fill(0xa5);
-        }
-        Some(PacketBuf {
-            // SAFETY: a pointer into static pool control is never null.
-            inner: unsafe { NonNull::new_unchecked(ptr) },
-        })
-    }
-
-    /// Claim the first free slot using the same compact bitmap protocol as the
-    /// original global packet pool.
-    fn alloc_slot(&self) -> Option<usize> {
-        for (word_index, word) in self.used[..COUNT.div_ceil(32)].iter().enumerate() {
-            let mut current = word.load(Ordering::Relaxed);
-            loop {
-                let bit = current.trailing_ones() as usize;
-                if bit >= 32 {
-                    break;
-                }
-                let index = word_index * 32 + bit;
-                if index >= COUNT {
-                    // Only the final bitmap word can contain indices outside
-                    // this pool. Every real slot before this one is occupied.
-                    return None;
-                }
-                // Acquire pairs with the Release in `release_slot`: the
-                // previous owner is finished before this owner initializes the
-                // reused control slot and accesses its payload.
-                match word.compare_exchange_weak(current, current | (1 << bit), Ordering::Acquire, Ordering::Relaxed) {
-                    Ok(_) => return Some(index),
-                    Err(actual) => current = actual,
-                }
-            }
-        }
-        None
-    }
-
-    #[cfg(feature = "async")]
-    fn has_available(&self) -> bool {
-        self.used[..COUNT.div_ceil(32)]
-            .iter()
-            .enumerate()
-            .any(|(word_index, word)| {
-                let used = word.load(Ordering::Acquire);
-                let valid = (COUNT - word_index * 32).min(32);
-                used.count_ones() < valid as u32
-            })
+        self.allocator().try_alloc()
     }
 }
 
-unsafe fn allocate_from_pool<const COUNT: usize>(origin: NonNull<PacketPoolHeader>) -> Option<PacketBuf> {
-    // SAFETY: `origin` is produced from the first field of a stable
-    // `PacketPool<COUNT>` by that same pool's `allocator` method.
-    unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() }.try_alloc()
+/// Allocate through the fixed prefix of a stable static pool.
+///
+/// # Safety
+/// `origin` must point at the first field of a static PacketPool or
+/// ExternalPacketOrigin initialized by its constructor.
+unsafe fn allocate_from_pool(origin: NonNull<PacketPoolHeader>) -> Option<PacketBuf> {
+    // SAFETY: the caller guarantees the header's lifetime and provenance.
+    let header = unsafe { origin.as_ref() };
+    let storage = match header.kind {
+        PacketOriginKind::Pool { storage } => storage,
+        #[cfg(feature = "external-origin")]
+        PacketOriginKind::External { .. } => return None,
+    };
+    let index = header.alloc_slot()?;
+    // SAFETY: PacketPool is repr(C), with its only COUNT-dependent field last.
+    // Its controls offset is therefore the same even for COUNT = 0. The
+    // actual allocation contains header.count slots, and the CAS above has
+    // exclusively claimed index < header.count. No reference to the dummy
+    // zero-length pool or an uninitialized control is formed.
+    let ptr = unsafe {
+        origin
+            .as_ptr()
+            .byte_add(core::mem::offset_of!(PacketPool<0>, controls))
+            .cast::<UnsafeCell<MaybeUninit<PacketBufInner>>>()
+            .add(index)
+    };
+    let ptr = unsafe { (*ptr).get().cast::<PacketBufInner>() };
+    // SAFETY: the constructor bound a unique static payload array of count
+    // slots; the successful CAS claimed this payload with its control.
+    let data = unsafe { (*storage.add(index)).get().cast::<Data>() };
+    // SAFETY: both pointers are aligned static slots uniquely owned here.
+    // Every field read by PacketBuf is initialized before publication.
+    unsafe {
+        (&raw mut (*ptr).origin).write(origin);
+        (&raw mut (*ptr).slot).write(index);
+        (&raw mut (*ptr).headroom).write(0);
+        (&raw mut (*ptr).len).write(0);
+        (&raw mut (*ptr).meta).write(PacketMeta::default());
+        (&raw mut (*ptr).data).write(NonNull::new_unchecked(data));
+        #[cfg(test)]
+        (*data).fill(0xa5);
+    }
+    Some(PacketBuf {
+        // SAFETY: a pointer into static control storage is non-null.
+        inner: unsafe { NonNull::new_unchecked(ptr) },
+    })
 }
 
-#[cfg(feature = "async")]
-unsafe fn has_available_in_pool<const COUNT: usize>(origin: NonNull<PacketPoolHeader>) -> bool {
-    // SAFETY: paired with the monomorphized function stored by
-    // `PacketPool::<COUNT>::from_storage`.
-    unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() }.has_available()
-}
-
-unsafe fn release_slot<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, index: usize) {
-    // SAFETY: `origin` is written only by `PacketPool<COUNT>::try_alloc` and
-    // points at the first field of that stable `#[repr(C)]` pool.
-    let pool = unsafe { origin.cast::<PacketPool<COUNT>>().as_ref() };
-    debug_assert!(index < COUNT);
+/// Return an exclusively owned slot to its stable static origin.
+#[inline(never)]
+unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
+    // SAFETY: PacketBuf carries the header and index initialized by allocation
+    // or adoption; its lifetime is contained in that of its static origin.
+    let header = unsafe { origin.as_ref() };
+    debug_assert!(index < header.count);
     let bit = 1 << (index % 32);
-    let previous = pool.used[index / 32].fetch_and(!bit, Ordering::Release);
+    let previous = header.used[index / 32].fetch_and(!bit, Ordering::Release);
     debug_assert_ne!(previous & bit, 0, "a packet pool slot was released twice");
-    #[cfg(feature = "async")]
-    pool.header.waiter.wake();
+    match header.kind {
+        PacketOriginKind::Pool { .. } => {
+            #[cfg(feature = "async")]
+            header.waiter.wake();
+        }
+        #[cfg(feature = "external-origin")]
+        PacketOriginKind::External { context, release } => {
+            // SAFETY: ExternalPacketOrigin::new requires this owner callback
+            // to be callable from any core, once per adoption. The packet no
+            // longer accesses its control or payload after clearing the bit.
+            unsafe { release(context, index) };
+        }
+    }
 }
 
 /// Release callback of an [`ExternalPacketOrigin`]: `(context, slot)`.
+#[cfg(feature = "external-origin")]
 pub type ExternalPacketRelease = unsafe fn(*const (), usize);
 
 /// Packet buffers whose payload storage belongs to another owner.
@@ -403,23 +448,21 @@ pub type ExternalPacketRelease = unsafe fn(*const (), usize);
 /// copying it into a [`PacketPool`]. Dropping the packet returns the storage
 /// by calling the owner's release function with the adopted slot index. The
 /// origin never allocates, so it is not an allocator for the stack.
+#[cfg(feature = "external-origin")]
 #[repr(C)]
 pub struct ExternalPacketOrigin<const COUNT: usize> {
-    // Must stay first: the type-erased release function casts this address back
-    // to the monomorphized origin type.
     header: PacketPoolHeader,
-    adopted: [AtomicU32; MAX_BITMAP_WORDS],
     controls: [UnsafeCell<MaybeUninit<PacketBufInner>>; COUNT],
-    context: *const (),
-    release: ExternalPacketRelease,
 }
 
 // SAFETY: every control slot is published only to the one `PacketBuf` whose
 // adoption set its `adopted` bit, and Drop clears that bit with Release
 // ordering. `context` is only passed back to the owner's release function,
 // whose contract makes it callable from any core.
+#[cfg(feature = "external-origin")]
 unsafe impl<const COUNT: usize> Sync for ExternalPacketOrigin<COUNT> {}
 
+#[cfg(feature = "external-origin")]
 impl<const COUNT: usize> ExternalPacketOrigin<COUNT> {
     /// Bind the origin to the storage owner's release function.
     ///
@@ -447,20 +490,8 @@ impl<const COUNT: usize> ExternalPacketOrigin<COUNT> {
             "an external packet origin cannot contain more than 1024 slots"
         );
         Self {
-            header: PacketPoolHeader {
-                allocate: allocate_none,
-                release: release_external::<COUNT>,
-                #[cfg(feature = "async")]
-                has_available: has_available_none,
-                #[cfg(feature = "async")]
-                waiter_claimed: AtomicBool::new(false),
-                #[cfg(feature = "async")]
-                waiter: AtomicWaker::new(),
-            },
-            adopted: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+            header: PacketPoolHeader::new(COUNT, PacketOriginKind::External { context, release }),
             controls: [const { UnsafeCell::new(MaybeUninit::zeroed()) }; COUNT],
-            context,
-            release,
         }
     }
 
@@ -492,9 +523,9 @@ impl<const COUNT: usize> ExternalPacketOrigin<COUNT> {
         assert!(slot < COUNT, "external packet slot out of range");
         assert!(headroom + len <= PACKET_BUF_SIZE, "external packet exceeds its buffer");
         let bit = 1 << (slot % 32);
-        // Acquire pairs with the Release in `release_external`: the previous
+        // Acquire pairs with the Release in `release_slot`: the previous
         // owner of this control slot has finished with it.
-        let previous = self.adopted[slot / 32].fetch_or(bit, Ordering::Acquire);
+        let previous = self.header.used[slot / 32].fetch_or(bit, Ordering::Acquire);
         assert_eq!(previous & bit, 0, "an external packet slot was adopted twice");
         let ptr = self.controls[slot].get().cast::<PacketBufInner>();
         // SAFETY: the adoption bit above uniquely claimed this control slot,
@@ -502,7 +533,7 @@ impl<const COUNT: usize> ExternalPacketOrigin<COUNT> {
         // caller guarantees `data` is a valid, aligned, exclusively owned
         // `Data` for the packet's lifetime.
         unsafe {
-            (&raw mut (*ptr).origin).write(NonNull::from(&self.header));
+            (&raw mut (*ptr).origin).write(NonNull::from(self).cast());
             (&raw mut (*ptr).slot).write(slot);
             (&raw mut (*ptr).headroom).write(headroom as u16);
             (&raw mut (*ptr).len).write(len as u16);
@@ -514,28 +545,6 @@ impl<const COUNT: usize> ExternalPacketOrigin<COUNT> {
             inner: unsafe { NonNull::new_unchecked(ptr) },
         }
     }
-}
-
-unsafe fn allocate_none(_origin: NonNull<PacketPoolHeader>) -> Option<PacketBuf> {
-    None
-}
-
-#[cfg(feature = "async")]
-unsafe fn has_available_none(_origin: NonNull<PacketPoolHeader>) -> bool {
-    false
-}
-
-unsafe fn release_external<const COUNT: usize>(origin: NonNull<PacketPoolHeader>, index: usize) {
-    // SAFETY: `origin` is written only by `ExternalPacketOrigin<COUNT>::adopt`
-    // and points at the first field of that stable `#[repr(C)]` origin.
-    let external = unsafe { origin.cast::<ExternalPacketOrigin<COUNT>>().as_ref() };
-    debug_assert!(index < COUNT);
-    let bit = 1 << (index % 32);
-    let previous = external.adopted[index / 32].fetch_and(!bit, Ordering::Release);
-    debug_assert_ne!(previous & bit, 0, "an external packet slot was released twice");
-    // SAFETY: `new`'s contract makes the owner's release callable here, once
-    // per adoption; the packet no longer accesses its storage.
-    unsafe { (external.release)(external.context, index) };
 }
 
 /// An owned network packet buffer.
@@ -698,10 +707,9 @@ impl Drop for PacketBuf {
     fn drop(&mut self) {
         let inner = self.inner();
         let origin = inner.origin;
-        let release = unsafe { origin.as_ref().release };
-        // SAFETY: the originating pool installed this exact release function
-        // and slot identity before publishing the PacketBuf.
-        unsafe { release(origin, inner.slot) };
+        // SAFETY: allocation or adoption initialized this origin and slot;
+        // PacketBuf exclusively owns them until this release.
+        unsafe { release_slot(origin, inner.slot) };
     }
 }
 
@@ -775,17 +783,20 @@ mod tests {
         new_pool::<1>().try_alloc().unwrap()
     }
 
+    #[cfg(feature = "external-origin")]
     struct ExternalStorage {
         bytes: std::vec::Vec<Box<Data>>,
         released: std::sync::Mutex<std::vec::Vec<usize>>,
     }
 
+    #[cfg(feature = "external-origin")]
     unsafe fn record_release(context: *const (), slot: usize) {
         // SAFETY: the tests pass a leaked `ExternalStorage` as context.
         let storage = unsafe { &*context.cast::<ExternalStorage>() };
         storage.released.lock().unwrap().push(slot);
     }
 
+    #[cfg(feature = "external-origin")]
     fn external<const COUNT: usize>() -> (&'static ExternalStorage, &'static ExternalPacketOrigin<COUNT>) {
         let storage: &'static ExternalStorage = Box::leak(Box::new(ExternalStorage {
             bytes: (0..COUNT)
@@ -798,6 +809,7 @@ mod tests {
         (storage, Box::leak(Box::new(origin)))
     }
 
+    #[cfg(feature = "external-origin")]
     fn adopt<const COUNT: usize>(
         storage: &'static ExternalStorage,
         origin: &'static ExternalPacketOrigin<COUNT>,
@@ -812,6 +824,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn an_adopted_packet_views_the_external_bytes_and_returns_its_slot() {
         let (storage, origin) = external::<2>();
         let mut packet = adopt(storage, origin, 1, 10, 4);
@@ -830,23 +843,27 @@ mod tests {
 
     #[test]
     #[should_panic(expected = "adopted twice")]
+    #[cfg(feature = "external-origin")]
     fn a_slot_cannot_be_adopted_twice() {
         let (storage, origin) = external::<1>();
         let _first = adopt(storage, origin, 0, 0, 0);
         let _second = adopt(storage, origin, 0, 0, 0);
     }
 
+    #[cfg(feature = "external-origin")]
     struct StaticExternal {
         origin: ExternalPacketOrigin<1>,
         released: AtomicU32,
     }
 
+    #[cfg(feature = "external-origin")]
     unsafe fn count_static_release(context: *const (), _slot: usize) {
         // SAFETY: the context is the address of `STATIC_EXTERNAL` below.
         let owner = unsafe { &*context.cast::<StaticExternal>() };
         owner.released.fetch_add(1, Ordering::Relaxed);
     }
 
+    #[cfg(feature = "external-origin")]
     static STATIC_EXTERNAL: StaticExternal = StaticExternal {
         // SAFETY: `count_static_release` only increments a counter of this
         // static, which is callable from any thread at any time.
@@ -855,6 +872,7 @@ mod tests {
     };
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn a_static_origin_can_name_its_enclosing_static_as_context() {
         let data: &'static Data = Box::leak(Box::new(Data([7; PACKET_BUF_SIZE])));
         // SAFETY: the leaked `Data` is aligned, initialized and only accessed
@@ -866,11 +884,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "external-origin")]
     fn an_external_origin_never_allocates() {
         let (_, origin) = external::<1>();
         let header = NonNull::from(&origin.header);
         // SAFETY: the header belongs to a live origin.
-        assert!(unsafe { (origin.header.allocate)(header) }.is_none());
+        assert!(unsafe { allocate_from_pool(header) }.is_none());
     }
 
     #[test]
@@ -903,6 +922,115 @@ mod tests {
         assert_eq!(reused.len(), 0);
         assert_eq!(reused.meta(), PacketMeta::default());
         assert!(pool.try_alloc().is_none());
+    }
+
+    fn check_capacity<const COUNT: usize>() {
+        let pool = new_pool::<COUNT>();
+        let allocator = pool.allocator();
+        let buffers: std::vec::Vec<_> = (0..COUNT)
+            .map(|slot| {
+                #[cfg(feature = "async")]
+                assert!(allocator.has_available());
+                let buffer = if slot % 2 == 0 {
+                    pool.try_alloc()
+                } else {
+                    allocator.try_alloc()
+                }
+                .unwrap();
+                assert_eq!(buffer.inner().slot, slot);
+                assert!(allocator.owns(&buffer));
+                buffer
+            })
+            .collect();
+        assert!(allocator.try_alloc().is_none());
+        #[cfg(feature = "async")]
+        assert!(!allocator.has_available());
+        drop(buffers);
+        #[cfg(feature = "async")]
+        assert!(allocator.has_available());
+        let reused: std::vec::Vec<_> = (0..COUNT)
+            .map(|slot| {
+                let buffer = allocator.try_alloc().unwrap();
+                assert_eq!(buffer.inner().slot, slot);
+                buffer
+            })
+            .collect();
+        assert!(allocator.try_alloc().is_none());
+        drop(reused);
+    }
+
+    #[test]
+    fn one_ownership_implementation_handles_different_capacities() {
+        check_capacity::<1>();
+        check_capacity::<31>();
+        check_capacity::<32>();
+        check_capacity::<33>();
+    }
+
+    #[test]
+    fn maximum_pool_capacity_is_1024() {
+        // Constructing the largest payload array uses a large host frame.
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(check_capacity::<1024>)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(feature = "external-origin")]
+    fn external_maximum_returns_every_slot_once_per_adoption() {
+        let (storage, origin) = external::<1024>();
+        let buffers: std::vec::Vec<_> = (0..1024).map(|slot| adopt(storage, origin, slot, 0, 1)).collect();
+        assert!(storage.released.lock().unwrap().is_empty());
+        drop(buffers);
+        assert_eq!(
+            *storage.released.lock().unwrap(),
+            (0..1024).collect::<std::vec::Vec<_>>()
+        );
+        drop(adopt(storage, origin, 1023, 0, 0));
+        assert_eq!(storage.released.lock().unwrap().len(), 1025);
+    }
+
+    #[test]
+    #[should_panic(expected = "more than 1024")]
+    #[cfg(feature = "external-origin")]
+    fn external_capacity_above_the_limit_is_rejected() {
+        // SAFETY: this constructor rejects the capacity before publication.
+        let _ = unsafe { ExternalPacketOrigin::<1025>::new(core::ptr::null(), record_release) };
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "released twice")]
+    fn a_pool_double_release_is_caught() {
+        let pool = new_pool::<1>();
+        let buffer = core::mem::ManuallyDrop::new(pool.try_alloc().unwrap());
+        // SAFETY: suppressing Drop keeps the control readable for this test;
+        // no later allocation or access to payload storage occurs.
+        unsafe {
+            release_slot(buffer.inner().origin, buffer.inner().slot);
+            release_slot(buffer.inner().origin, buffer.inner().slot);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[cfg(feature = "external-origin")]
+    fn an_external_double_release_does_not_call_the_owner_twice() {
+        let (storage, origin) = external::<1>();
+        let buffer = core::mem::ManuallyDrop::new(adopt(storage, origin, 0, 0, 0));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // SAFETY: Drop is suppressed and the recording owner keeps its
+            // storage alive. The second release must panic before callback.
+            unsafe {
+                release_slot(buffer.inner().origin, buffer.inner().slot);
+                release_slot(buffer.inner().origin, buffer.inner().slot);
+            }
+        }));
+        assert!(result.is_err());
+        assert_eq!(*storage.released.lock().unwrap(), [0]);
     }
 
     #[test]

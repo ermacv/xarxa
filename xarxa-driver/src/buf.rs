@@ -231,12 +231,20 @@ impl PacketPoolWaiter {
     /// Register the task waiting for the pool to become nonempty.
     pub fn register(&self, waker: &Waker) {
         let header = unsafe { self.origin.as_ref() };
-        header.waiter.register(waker);
+        register_pool_waker(&header.waiter, waker);
         let available = header.has_available();
         if available {
             header.waiter.wake();
         }
     }
+}
+
+#[cfg(feature = "async")]
+// Keep registration separate from the availability recheck and its wake:
+// merging both erases Waker call scopes needed by stack analysis.
+#[inline(never)]
+fn register_pool_waker(waiter: &AtomicWaker, waker: &Waker) {
+    waiter.register(waker);
 }
 
 #[cfg(feature = "async")]

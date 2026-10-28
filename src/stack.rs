@@ -52,6 +52,18 @@ use crate::time::{Clock, Instant};
 use crate::udp::{UdpHandle, UdpSocket, UdpSocketIter, UdpSocketState};
 use crate::wire::*;
 
+/// Saturating, whole-stack packet observations since construction.
+/// Reading a snapshot neither resets counters nor changes polling or admission.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Statistics {
+    pub rx_frames: u32,
+    pub icmpv4_echo_requests: u32,
+    pub icmpv4_echo_replies: u32,
+    pub tx_frames: u32,
+    pub tx_refused: u32,
+    pub icmpv4_echo_refused: u32,
+}
+
 /// A network stack.
 pub struct Stack<'d, D: Driver> {
     pub(crate) inner: StackInner,
@@ -141,6 +153,7 @@ pub(crate) struct Sockets<'d> {
 /// Separate from `Stack` so that its methods can borrow an interface from `Stack::ifaces`
 /// while taking `&mut self`.
 pub(crate) struct StackInner {
+    statistics: Statistics,
     /// Pool used for every packet the stack itself creates. Packets received
     /// from a driver retain their own originating pool instead.
     pub(crate) packet_allocator: PacketBufAllocator,
@@ -623,6 +636,11 @@ enum NeighborLookup {
 }
 
 impl<'d, D: Driver> Stack<'d, D> {
+    /// Cumulative observations; all interfaces share this stack's counters.
+    pub fn statistics(&self) -> Statistics {
+        self.inner.statistics
+    }
+
     /// Create a network stack.
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence
@@ -638,6 +656,7 @@ impl<'d, D: Driver> Stack<'d, D> {
 
         Self {
             inner: StackInner {
+                statistics: Statistics::default(),
                 packet_allocator,
                 #[cfg(feature = "packetmeta-timestamp")]
                 tx_timestamps: TxTimestampQueue::new(),
@@ -1271,6 +1290,7 @@ impl<'d, D: Driver> Stack<'d, D> {
                     let medium = self.ifaces.get(index).medium();
                     crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
                 }
+                self.inner.statistics.rx_frames = self.inner.statistics.rx_frames.saturating_add(1);
                 self.process(handle, buf, now);
                 ingress_remaining -= 1;
                 if ingress_remaining == 0 && budget.is_some() {
@@ -1821,6 +1841,8 @@ impl<'d, D: Driver> Stack<'d, D> {
             // Respond to echo requests.
             #[cfg(feature = "icmp-ping-reply")]
             (Icmpv4Message::EchoRequest, 0) => {
+                self.inner.statistics.icmpv4_echo_requests =
+                    self.inner.statistics.icmpv4_echo_requests.saturating_add(1);
                 let reply_src = {
                     let iface = self.ifaces.get(iface.index());
                     // Do not send ICMP replies to non-unicast sources.
@@ -1865,6 +1887,7 @@ impl<'d, D: Driver> Stack<'d, D> {
                         reply_icmp.set_checksum(0);
                     }
                 }
+                self.inner.statistics.icmpv4_echo_replies = self.inner.statistics.icmpv4_echo_replies.saturating_add(1);
                 self.transmit_reply(
                     &route,
                     buf,
@@ -3054,10 +3077,54 @@ impl StackInner {
             let medium = iface.medium();
             crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
         }
-        if iface.driver.transmit(buf).is_err() {
+        self.statistics.tx_frames = self.statistics.tx_frames.saturating_add(1);
+        if let Err(mut buf) = iface.driver.transmit(buf) {
+            self.statistics.tx_refused = self.statistics.tx_refused.saturating_add(1);
+            #[cfg(feature = "ipv4")]
+            if refused_echo_reply(iface.medium(), &mut buf) {
+                self.statistics.icmpv4_echo_refused = self.statistics.icmpv4_echo_refused.saturating_add(1);
+            }
+            // Match the original is_err() consumption: release the refused
+            // owner before invoking a logger, after inspecting it for counters.
+            drop(buf);
             warn!("iface {}: device refused a frame, dropping it", iface.handle.index());
         }
     }
+}
+
+// Classify only refused owners, before the original drop. Checked wire views
+// make malformed input an unclassified refusal, without changing its handling.
+#[cfg(feature = "ipv4")]
+fn refused_echo_reply(medium: Medium, bytes: &mut [u8]) -> bool {
+    let ip_bytes = match medium {
+        #[cfg(feature = "medium-ethernet")]
+        Medium::Ethernet => {
+            let Ok(frame) = EthernetFrame::new_checked(bytes) else {
+                return false;
+            };
+            if frame.ethertype() != EthernetProtocol::Ipv4 {
+                return false;
+            }
+            let Some(payload) = bytes.get_mut(ETHERNET_HEADER_LEN..) else {
+                return false;
+            };
+            payload
+        }
+        #[cfg(feature = "medium-ip")]
+        Medium::Ip => bytes,
+        #[cfg(feature = "medium-ieee802154")]
+        Medium::Ieee802154 => return false,
+    };
+    let Ok(mut ip) = Ipv4Packet::new_checked(ip_bytes) else {
+        return false;
+    };
+    if ip.next_header() != IpProtocol::Icmp {
+        return false;
+    }
+    let Ok(icmp) = Icmpv4Packet::new_checked(ip.payload_mut()) else {
+        return false;
+    };
+    icmp.msg_type() == Icmpv4Message::EchoReply && icmp.msg_code() == 0
 }
 
 /// The outermost header of a frame on an interface of this medium.
@@ -4553,6 +4620,110 @@ pub(crate) mod test {
             tx[0][IPV4_HEADER_LEN..],
             icmpv4_echo(Icmpv4Message::EchoReply, 0x1234, 7, &payload)[..]
         );
+    }
+
+    #[test]
+    fn statistics_count_received_formed_and_refused_echoes_without_retry() {
+        use crate::driver::{Capabilities, Driver, LinkState, PacketBuf, PacketPool, PacketPoolStorage};
+        use std::{
+            cell::{Cell, RefCell},
+            collections::VecDeque,
+            rc::Rc,
+        };
+        struct Device {
+            incoming: Rc<RefCell<VecDeque<PacketBuf>>>,
+            sent: Rc<RefCell<Vec<Vec<u8>>>>,
+            credit: Rc<Cell<bool>>,
+        }
+        impl Driver for Device {
+            fn capabilities(&self) -> Capabilities {
+                let mut caps = Capabilities::default();
+                caps.medium = Medium::Ip.into();
+                caps
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                crate::driver::HardwareAddress::Ip
+            }
+            fn link_state(&mut self) -> LinkState {
+                LinkState::Up
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                self.incoming.borrow_mut().pop_front()
+            }
+            fn can_transmit(&mut self) -> bool {
+                self.credit.get()
+            }
+            fn transmit(&mut self, packet: PacketBuf) -> Result<(), PacketBuf> {
+                if !self.credit.get() {
+                    return Err(packet);
+                }
+                self.sent.borrow_mut().push(packet.to_vec());
+                Ok(())
+            }
+        }
+        let storage = Box::leak(Box::new(PacketPoolStorage::<8>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let incoming = Rc::new(RefCell::new(VecDeque::new()));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let credit = Rc::new(Cell::new(false));
+        let mut driver = Device {
+            incoming: incoming.clone(),
+            sent: sent.clone(),
+            credit: credit.clone(),
+        };
+        let mut stack = Stack::new(7, pool.allocator());
+        let handle = stack.add_iface_borrowed(&mut driver).unwrap();
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
+        let request = || {
+            let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 7, 1, b"loss counter");
+            let bytes = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &echo);
+            let mut packet = pool.allocator().try_alloc().unwrap();
+            packet.reserve(LINK_HEADER_LEN + xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
+            packet.set_len(bytes.len());
+            packet.copy_from_slice(&bytes);
+            packet
+        };
+        for available in [false, true] {
+            credit.set(available);
+            incoming.borrow_mut().push_back(request());
+            stack.poll(Instant::ZERO);
+        }
+        assert_eq!(
+            stack.statistics(),
+            Statistics {
+                rx_frames: 2,
+                icmpv4_echo_requests: 2,
+                icmpv4_echo_replies: 2,
+                tx_frames: 2,
+                tx_refused: 1,
+                icmpv4_echo_refused: 1,
+            }
+        );
+        assert_eq!(sent.borrow().len(), 1);
+        let before = stack.statistics();
+        stack.poll(Instant::ZERO);
+        assert_eq!(stack.statistics(), before);
+        let owners: Vec<_> = (0..8).map(|_| pool.allocator().try_alloc().unwrap()).collect();
+        assert!(pool.allocator().try_alloc().is_none());
+        drop(owners);
+        assert!(!refused_echo_reply(Medium::Ip, &mut []));
+        let reply = icmpv4_echo(Icmpv4Message::EchoReply, 7, 1, b"loss counter");
+        let ip = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol::Icmp, &reply);
+        let mut ethernet = vec![0; ETHERNET_HEADER_LEN + ip.len()];
+        let mut frame = EthernetFrame::new_unchecked(&mut ethernet);
+        frame.set_ethertype(EthernetProtocol::Ipv4);
+        frame.payload_mut().copy_from_slice(&ip);
+        let original = ethernet.clone();
+        assert!(refused_echo_reply(Medium::Ethernet, &mut ethernet));
+        assert_eq!(ethernet, original);
+        stack.inner.statistics.tx_refused = u32::MAX;
+        credit.set(false);
+        incoming.borrow_mut().push_back(request());
+        stack.poll(Instant::ZERO);
+        assert_eq!(stack.statistics().tx_refused, u32::MAX);
     }
 
     /// Same for ICMPv6.

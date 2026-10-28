@@ -79,4 +79,4 @@ pub use xarxa_driver as driver;
 
 #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
 pub use neighbor::{Neighbor, NeighborCache, NeighborState};
-pub use stack::{PollBudget, PollOutcome, Stack};
+pub use stack::{PollBudget, PollOutcome, Stack, Statistics};

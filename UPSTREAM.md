@@ -44,6 +44,9 @@ fork keeps:
 - **Aligned checksum.** `wire::ip::checksum::data` sums aligned 32-bit words
   through `bytemuck`, without `unsafe`.
 
+- **Packet observations.** `Stack::statistics` snapshots saturating RX, native
+  ICMPv4 echo generation and TX refusal counters without changing admission.
+
 ## Upstream changes not taken
 
 - `452d805` "Remove the tx_starved hack" together with the global pool and

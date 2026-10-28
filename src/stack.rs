@@ -3084,8 +3084,9 @@ impl StackInner {
             if refused_echo_reply(iface.medium(), &mut buf) {
                 self.statistics.icmpv4_echo_refused = self.statistics.icmpv4_echo_refused.saturating_add(1);
             }
-            #[cfg(not(feature = "ipv4"))]
-            let _ = buf;
+            // Match the original is_err() consumption: release the refused
+            // owner before invoking a logger, after inspecting it for counters.
+            drop(buf);
             warn!("iface {}: device refused a frame, dropping it", iface.handle.index());
         }
     }
@@ -4623,24 +4624,72 @@ pub(crate) mod test {
 
     #[test]
     fn statistics_count_received_formed_and_refused_echoes_without_retry() {
-        use crate::driver::{PacketPool, PacketPoolStorage};
+        use crate::driver::{Capabilities, Driver, LinkState, PacketBuf, PacketPool, PacketPoolStorage};
+        use std::{
+            cell::{Cell, RefCell},
+            collections::VecDeque,
+            rc::Rc,
+        };
+        struct Device {
+            incoming: Rc<RefCell<VecDeque<PacketBuf>>>,
+            sent: Rc<RefCell<Vec<Vec<u8>>>>,
+            credit: Rc<Cell<bool>>,
+        }
+        impl Driver for Device {
+            fn capabilities(&self) -> Capabilities {
+                let mut caps = Capabilities::default();
+                caps.medium = Medium::Ip.into();
+                caps
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                crate::driver::HardwareAddress::Ip
+            }
+            fn link_state(&mut self) -> LinkState {
+                LinkState::Up
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                self.incoming.borrow_mut().pop_front()
+            }
+            fn can_transmit(&mut self) -> bool {
+                self.credit.get()
+            }
+            fn transmit(&mut self, packet: PacketBuf) -> Result<(), PacketBuf> {
+                if !self.credit.get() {
+                    return Err(packet);
+                }
+                self.sent.borrow_mut().push(packet.to_vec());
+                Ok(())
+            }
+        }
         let storage = Box::leak(Box::new(PacketPoolStorage::<8>::new()));
         let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let incoming = Rc::new(RefCell::new(VecDeque::new()));
+        let sent = Rc::new(RefCell::new(Vec::new()));
+        let credit = Rc::new(Cell::new(false));
+        let mut driver = Device {
+            incoming: incoming.clone(),
+            sent: sent.clone(),
+            credit: credit.clone(),
+        };
         let mut stack = Stack::new(7, pool.allocator());
-        let driver = TestDevice::new(Medium::Ip);
-        let handle = driver.install(&mut stack, HardwareAddress::Ip);
+        let handle = stack.add_iface_borrowed(&mut driver).unwrap();
         stack
             .iface(handle)
             .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
             .unwrap();
-        for room in [Some(0), Some(1)] {
-            driver.room.set(room);
-            let request = icmpv4_echo(Icmpv4Message::EchoRequest, 7, 1, b"loss counter");
-            inject(
-                &mut stack,
-                &driver.rx,
-                ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request),
-            );
+        let request = || {
+            let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 7, 1, b"loss counter");
+            let bytes = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &echo);
+            let mut packet = pool.allocator().try_alloc().unwrap();
+            packet.reserve(LINK_HEADER_LEN + xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
+            packet.set_len(bytes.len());
+            packet.copy_from_slice(&bytes);
+            packet
+        };
+        for available in [false, true] {
+            credit.set(available);
+            incoming.borrow_mut().push_back(request());
+            stack.poll(Instant::ZERO);
         }
         assert_eq!(
             stack.statistics(),
@@ -4653,20 +4702,27 @@ pub(crate) mod test {
                 icmpv4_echo_refused: 1,
             }
         );
-        assert_eq!(driver.tx.borrow().len(), 1);
+        assert_eq!(sent.borrow().len(), 1);
         let before = stack.statistics();
         stack.poll(Instant::ZERO);
         assert_eq!(stack.statistics(), before);
-        assert!(pool.allocator().has_available());
+        let owners: Vec<_> = (0..8).map(|_| pool.allocator().try_alloc().unwrap()).collect();
+        assert!(pool.allocator().try_alloc().is_none());
+        drop(owners);
         assert!(!refused_echo_reply(Medium::Ip, &mut []));
+        let reply = icmpv4_echo(Icmpv4Message::EchoReply, 7, 1, b"loss counter");
+        let ip = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol::Icmp, &reply);
+        let mut ethernet = vec![0; ETHERNET_HEADER_LEN + ip.len()];
+        let mut frame = EthernetFrame::new_unchecked(&mut ethernet);
+        frame.set_ethertype(EthernetProtocol::Ipv4);
+        frame.payload_mut().copy_from_slice(&ip);
+        let original = ethernet.clone();
+        assert!(refused_echo_reply(Medium::Ethernet, &mut ethernet));
+        assert_eq!(ethernet, original);
         stack.inner.statistics.tx_refused = u32::MAX;
-        driver.room.set(Some(0));
-        let request = icmpv4_echo(Icmpv4Message::EchoRequest, 7, 2, b"saturate");
-        inject(
-            &mut stack,
-            &driver.rx,
-            ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &request),
-        );
+        credit.set(false);
+        incoming.borrow_mut().push_back(request());
+        stack.poll(Instant::ZERO);
         assert_eq!(stack.statistics().tx_refused, u32::MAX);
     }
 

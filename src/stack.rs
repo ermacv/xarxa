@@ -641,7 +641,6 @@ impl<'d, D: Driver> Stack<'d, D> {
         self.inner.statistics
     }
 
-
     /// Create a network stack.
     ///
     /// `random_seed` seeds the stack's PRNG, which picks TCP initial sequence

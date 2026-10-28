@@ -16,6 +16,8 @@ pub mod slaac;
 
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 mod arp_reply;
+#[cfg(feature = "ipv4")]
+mod echo_reply;
 
 #[cfg(feature = "multicast")]
 pub use crate::multicast::MulticastError;
@@ -282,6 +284,8 @@ pub(crate) fn link_local_addr(hardware_addr: HardwareAddress) -> Option<IfaceAdd
 
 /// An interface added to the stack, with its configuration.
 pub(crate) struct IfaceState<'d, D: Driver> {
+    #[cfg(feature = "ipv4")]
+    pub(crate) echo_replies: echo_reply::Replies,
     #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
     pub(crate) arp_replies: arp_reply::Replies,
     pub(crate) handle: IfaceHandle,

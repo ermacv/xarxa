@@ -59,9 +59,14 @@ pub struct Statistics {
     pub rx_frames: u32,
     pub icmpv4_echo_requests: u32,
     pub icmpv4_echo_replies: u32,
+    /// Raw driver transmit attempts, including retained EchoReply retries.
     pub tx_frames: u32,
+    /// Refused raw attempts, including owners retained for retry.
     pub tx_refused: u32,
+    /// Refused IPv4 EchoReply attempts; not a count of lost owners.
     pub icmpv4_echo_refused: u32,
+    /// EchoReply owners dropped because their bounded device-credit FIFO is full.
+    pub icmpv4_echo_dropped: u32,
 }
 
 /// A network stack.
@@ -794,6 +799,8 @@ impl<'d, D: Driver> Stack<'d, D> {
             let _ = ip_addrs.push(ll);
         }
         let index = self.ifaces.add_with(|index| IfaceState {
+            #[cfg(feature = "ipv4")]
+            echo_replies: Default::default(),
             #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
             arp_replies: Default::default(),
             handle: IfaceHandle::new(index),
@@ -1277,6 +1284,12 @@ impl<'d, D: Driver> Stack<'d, D> {
             #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
             self.ifaces.get_mut(index).flush_arp_replies();
 
+            #[cfg(feature = "ipv4")]
+            {
+                let iface = self.ifaces.get_mut(index);
+                iface.echo_replies.flush(&mut *iface.driver, &mut self.inner.statistics);
+            }
+
             #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
             self.poll_neighbor_timers(handle, now);
 
@@ -1474,8 +1487,20 @@ impl<'d, D: Driver> Stack<'d, D> {
         #[cfg(any(feature = "ipv4-reassembly", feature = "sixlowpan-reassembly"))]
         self.fragments.assembler.remove_expired(&mut clock);
 
+        // Check after arming the driver's waker, including replies retained
+        // during this poll. Credit may have returned since the initial refusal.
+        // Ready work gets the next turn; absent credit adds no retry timer.
+        #[allow(unused_mut)]
+        let mut deadline = clock.next();
+        #[cfg(feature = "ipv4")]
+        for (_, iface) in self.ifaces.iter_mut() {
+            if !iface.echo_replies.is_empty() && iface.driver.can_transmit() {
+                deadline = now;
+            }
+        }
+
         PollOutcome {
-            deadline: clock.next(),
+            deadline,
             budget_exhausted,
         }
     }
@@ -3069,7 +3094,15 @@ impl StackInner {
         iface: &mut IfaceState<'_, D>,
         #[allow(unused_mut)] mut buf: PacketBuf,
     ) {
-        debug_assert!(buf.headroom() >= xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
+        #[cfg(feature = "ipv4")]
+        let echo_reply = is_ipv4_echo_reply(iface.medium(), &mut buf);
+        // An older refused reply keeps its place even if credit returned since
+        // the start of the poll. Drain it before this newer reply next turn.
+        #[cfg(feature = "ipv4")]
+        if echo_reply && !iface.echo_replies.is_empty() {
+            iface.echo_replies.push(buf, &mut self.statistics);
+            return;
+        }
 
         #[cfg(feature = "packet-log")]
         {
@@ -3078,11 +3111,13 @@ impl StackInner {
             crate::packet_log::log_packet(&mut buf, packet_log_layer(medium));
         }
         self.statistics.tx_frames = self.statistics.tx_frames.saturating_add(1);
-        if let Err(mut buf) = iface.driver.transmit(buf) {
+        if let Err(buf) = iface.driver.transmit(buf) {
             self.statistics.tx_refused = self.statistics.tx_refused.saturating_add(1);
             #[cfg(feature = "ipv4")]
-            if refused_echo_reply(iface.medium(), &mut buf) {
+            if echo_reply {
                 self.statistics.icmpv4_echo_refused = self.statistics.icmpv4_echo_refused.saturating_add(1);
+                iface.echo_replies.push(buf, &mut self.statistics);
+                return;
             }
             // Match the original is_err() consumption: release the refused
             // owner before invoking a logger, after inspecting it for counters.
@@ -3092,10 +3127,10 @@ impl StackInner {
     }
 }
 
-// Classify only refused owners, before the original drop. Checked wire views
-// make malformed input an unclassified refusal, without changing its handling.
+// Checked wire views also recognize socket-originated IPv4 EchoReplies. Both
+// use the same egress FIFO; malformed and other packets keep their handling.
 #[cfg(feature = "ipv4")]
-fn refused_echo_reply(medium: Medium, bytes: &mut [u8]) -> bool {
+fn is_ipv4_echo_reply(medium: Medium, bytes: &mut [u8]) -> bool {
     let ip_bytes = match medium {
         #[cfg(feature = "medium-ethernet")]
         Medium::Ethernet => {
@@ -4623,7 +4658,7 @@ pub(crate) mod test {
     }
 
     #[test]
-    fn statistics_count_received_formed_and_refused_echoes_without_retry() {
+    fn statistics_count_received_formed_refused_and_retried_echoes() {
         use crate::driver::{Capabilities, Driver, LinkState, PacketBuf, PacketPool, PacketPoolStorage};
         use std::{
             cell::{Cell, RefCell},
@@ -4697,19 +4732,20 @@ pub(crate) mod test {
                 rx_frames: 2,
                 icmpv4_echo_requests: 2,
                 icmpv4_echo_replies: 2,
-                tx_frames: 2,
+                tx_frames: 3,
                 tx_refused: 1,
                 icmpv4_echo_refused: 1,
+                icmpv4_echo_dropped: 0,
             }
         );
-        assert_eq!(sent.borrow().len(), 1);
+        assert_eq!(sent.borrow().len(), 2);
         let before = stack.statistics();
         stack.poll(Instant::ZERO);
         assert_eq!(stack.statistics(), before);
         let owners: Vec<_> = (0..8).map(|_| pool.allocator().try_alloc().unwrap()).collect();
         assert!(pool.allocator().try_alloc().is_none());
         drop(owners);
-        assert!(!refused_echo_reply(Medium::Ip, &mut []));
+        assert!(!is_ipv4_echo_reply(Medium::Ip, &mut []));
         let reply = icmpv4_echo(Icmpv4Message::EchoReply, 7, 1, b"loss counter");
         let ip = ipv4_packet(OUR_V4, REMOTE_V4, IpProtocol::Icmp, &reply);
         let mut ethernet = vec![0; ETHERNET_HEADER_LEN + ip.len()];
@@ -4717,7 +4753,7 @@ pub(crate) mod test {
         frame.set_ethertype(EthernetProtocol::Ipv4);
         frame.payload_mut().copy_from_slice(&ip);
         let original = ethernet.clone();
-        assert!(refused_echo_reply(Medium::Ethernet, &mut ethernet));
+        assert!(is_ipv4_echo_reply(Medium::Ethernet, &mut ethernet));
         assert_eq!(ethernet, original);
         stack.inner.statistics.tx_refused = u32::MAX;
         credit.set(false);

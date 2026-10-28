@@ -1639,7 +1639,6 @@ mod test {
                         };
                         let expected_len = iphc_len + ext_len + udp_len + packet.len()
                             - 40
-                            - ext_len.min(8) * 0
                             - if kind >= 2 { 8 } else { 0 }
                             - if ports.is_some() { 8 } else { 0 };
 

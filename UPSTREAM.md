@@ -45,7 +45,16 @@ fork keeps:
   through `bytemuck`, without `unsafe`.
 
 - **Packet observations.** `Stack::statistics` snapshots saturating RX, native
-  ICMPv4 echo generation and TX refusal counters without changing admission.
+  ICMPv4 echo generation, TX refusal attempts (including retries), and IPv4
+  EchoReply retention-overflow counters.
+- **IPv4 EchoReply retention.** A refused owner waits in an eight-entry FIFO
+  per interface, drained on the next stack poll with TX credit before ingress.
+  New replies cannot pass older owners; overflow drops the newest and counts
+  `icmpv4_echo_dropped`. Eight covers W3's eight-owner RX pool without changing
+  its existing queue depths or allocating packets. Checked wire classification
+  also covers raw-socket IPv4 EchoReplies. IPv6 and other raw egress retain
+  their existing behavior. A full device waits for its credit wake without a
+  retry timer; credit returning during a poll requests the next turn.
 
 ## Upstream changes not taken
 

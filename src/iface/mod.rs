@@ -349,6 +349,21 @@ impl<'d, D: Driver> Iface<'_, 'd, D> {
         &mut self.state_mut().driver
     }
 
+    /// Drop every packet the interface holds for its own replies: IPv4
+    /// EchoReply owners waiting for device credit and queued ARP replies.
+    ///
+    /// A reply reuses its request's packet, so a driver that lent a received
+    /// frame's storage gets it back here. Call it when the interface stops
+    /// and its driver will not transmit them; sockets keep their own queues.
+    pub fn release_retained(&mut self) {
+        #[cfg(feature = "ipv4")]
+        {
+            self.state_mut().echo_replies = Default::default();
+        }
+        #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
+        self.state_mut().arp_replies.clear();
+    }
+
     /// The link state reported by the device.
     pub fn link_state(&mut self) -> LinkState {
         self.state_mut().driver.link_state()

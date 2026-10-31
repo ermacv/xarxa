@@ -4658,6 +4658,71 @@ pub(crate) mod test {
     }
 
     #[test]
+    fn releasing_retained_replies_returns_their_request_owners() {
+        use crate::driver::{Capabilities, Driver, LinkState, PacketBuf, PacketPool, PacketPoolStorage};
+        use std::{cell::RefCell, collections::VecDeque, rc::Rc};
+        struct Device {
+            incoming: Rc<RefCell<VecDeque<PacketBuf>>>,
+        }
+        impl Driver for Device {
+            fn capabilities(&self) -> Capabilities {
+                let mut caps = Capabilities::default();
+                caps.medium = Medium::Ip.into();
+                caps
+            }
+            fn hardware_address(&self) -> crate::driver::HardwareAddress {
+                crate::driver::HardwareAddress::Ip
+            }
+            fn link_state(&mut self) -> LinkState {
+                LinkState::Up
+            }
+            fn receive(&mut self) -> Option<PacketBuf> {
+                self.incoming.borrow_mut().pop_front()
+            }
+            // The transmit queue stays full: every reply is retained.
+            fn can_transmit(&mut self) -> bool {
+                false
+            }
+            fn transmit(&mut self, packet: PacketBuf) -> Result<(), PacketBuf> {
+                Err(packet)
+            }
+        }
+        let storage = Box::leak(Box::new(PacketPoolStorage::<4>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        let incoming = Rc::new(RefCell::new(VecDeque::new()));
+        let mut driver = Device {
+            incoming: incoming.clone(),
+        };
+        let mut stack = Stack::new(7, pool.allocator());
+        let handle = stack.add_iface_borrowed(&mut driver).unwrap();
+        stack
+            .iface(handle)
+            .set_ip_addrs([IpCidr::new(OUR_V4.into(), 24)])
+            .unwrap();
+        let echo = icmpv4_echo(Icmpv4Message::EchoRequest, 7, 1, b"retained");
+        let bytes = ipv4_packet(REMOTE_V4, OUR_V4, IpProtocol::Icmp, &echo);
+        for _ in 0..2 {
+            let mut packet = pool.allocator().try_alloc().unwrap();
+            packet.reserve(LINK_HEADER_LEN + xarxa_driver::config::PACKET_BUF_DRIVER_HEADROOM);
+            packet.set_len(bytes.len());
+            packet.copy_from_slice(&bytes);
+            incoming.borrow_mut().push_back(packet);
+        }
+        stack.poll(Instant::ZERO);
+        assert_eq!(stack.statistics().icmpv4_echo_replies, 2);
+        let free = || {
+            let owners: Vec<_> = std::iter::from_fn(|| pool.allocator().try_alloc()).collect();
+            owners.len()
+        };
+        assert_eq!(free(), 2, "both replies hold their request's packet");
+        stack.iface(handle).release_retained();
+        assert_eq!(free(), 4, "releasing returns every owner");
+        let before = stack.statistics();
+        stack.poll(Instant::ZERO);
+        assert_eq!(stack.statistics(), before, "nothing retained is retried");
+    }
+
+    #[test]
     fn statistics_count_received_formed_refused_and_retried_echoes() {
         use crate::driver::{Capabilities, Driver, LinkState, PacketBuf, PacketPool, PacketPoolStorage};
         use std::{

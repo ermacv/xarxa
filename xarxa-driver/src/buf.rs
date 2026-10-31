@@ -487,11 +487,11 @@ pub enum ExternalPacketRefusal {
     Misaligned,
 }
 
-/// A refused adoption: the untouched owner and why.
+/// A refused adoption: the owner, returned without a packet, and why.
 #[cfg(feature = "external-origin")]
 #[derive(Debug)]
 pub struct ExternalPacketRefused<S> {
-    /// The owner, still holding its storage.
+    /// The owner; no packet refers to its storage.
     pub owner: S,
     /// Why the packet was not formed.
     pub reason: ExternalPacketRefusal,
@@ -574,7 +574,9 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
     ///
     /// A full set of slots, a range past `PACKET_BUF_SIZE`, or storage that is
     /// shorter than `PACKET_BUF_SIZE` or misaligned returns the owner with the
-    /// reason; nothing of it was used.
+    /// reason, and no packet is formed. `Full` and `Range` are refused before
+    /// the owner is asked for its storage; `TooShort` and `Misaligned` after
+    /// [`ExternalPacketStorage::storage_mut`], which may have changed it.
     pub fn adopt(&'static self, owner: S, headroom: usize, len: usize) -> Result<PacketBuf, ExternalPacketRefused<S>> {
         let range_fits = headroom.checked_add(len).is_some_and(|end| end <= PACKET_BUF_SIZE);
         if !range_fits {
@@ -913,7 +915,7 @@ mod tests {
                 }
             )*};
         }
-        opaque_debug!(Boxed, Inline, Lent, Probe);
+        opaque_debug!(Boxed, Inline, Lent, Offset, Probe);
 
         fn counter() -> &'static AtomicUsize {
             Box::leak(Box::new(AtomicUsize::new(0)))
@@ -1000,9 +1002,15 @@ mod tests {
             assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4]);
         }
 
-        /// Lends the bytes it was given and counts how often it was asked.
+        /// Twice a packet's bytes at the largest packet alignment.
+        #[repr(C, align(32))]
+        struct Wide([u8; 2 * PACKET_BUF_SIZE]);
+
+        /// Lends the first `len` of its aligned bytes and counts how often it
+        /// was asked.
         struct Lent {
-            bytes: Vec<u8>,
+            bytes: Box<Wide>,
+            len: usize,
             asked: &'static AtomicUsize,
             drops: &'static AtomicUsize,
         }
@@ -1010,7 +1018,16 @@ mod tests {
         impl ExternalPacketStorage for Lent {
             fn storage_mut(&mut self) -> &mut [u8] {
                 self.asked.fetch_add(1, StdOrdering::SeqCst);
-                &mut self.bytes
+                &mut self.bytes.0[..self.len]
+            }
+        }
+
+        fn lent(len: usize, asked: &'static AtomicUsize, drops: &'static AtomicUsize) -> Lent {
+            Lent {
+                bytes: Box::new(Wide([9; 2 * PACKET_BUF_SIZE])),
+                len,
+                asked,
+                drops,
             }
         }
 
@@ -1021,32 +1038,24 @@ mod tests {
         }
 
         #[test]
-        fn a_refusal_returns_the_untouched_owner_and_keeps_the_slot_free() {
+        fn a_refusal_returns_the_owner_and_keeps_the_slot_free() {
             let (asked, drops) = (counter(), counter());
             let slots = slots::<Lent, 1>();
-            let short = Lent {
-                bytes: std::vec![9; PACKET_BUF_SIZE - 1],
-                asked,
-                drops,
-            };
-            let refused = slots.adopt(short, 0, 0).unwrap_err();
+            let refused = slots.adopt(lent(PACKET_BUF_SIZE - 1, asked, drops), 0, 0).unwrap_err();
             assert_eq!(
                 refused.reason,
                 ExternalPacketRefusal::TooShort {
                     available: PACKET_BUF_SIZE - 1
                 }
             );
-            assert_eq!(refused.owner.bytes, std::vec![9; PACKET_BUF_SIZE - 1]);
+            assert_eq!(refused.owner.len, PACKET_BUF_SIZE - 1);
             assert_eq!(drops.load(StdOrdering::SeqCst), 0);
             drop(refused);
             // A range past the packet is refused before the owner is asked.
             let asked_before = asked.load(StdOrdering::SeqCst);
-            let range = Lent {
-                bytes: std::vec![0; PACKET_BUF_SIZE],
-                asked,
-                drops,
-            };
-            let refused = slots.adopt(range, PACKET_BUF_SIZE, 1).unwrap_err();
+            let refused = slots
+                .adopt(lent(PACKET_BUF_SIZE, asked, drops), PACKET_BUF_SIZE, 1)
+                .unwrap_err();
             assert_eq!(
                 refused.reason,
                 ExternalPacketRefusal::Range {
@@ -1057,31 +1066,45 @@ mod tests {
             assert_eq!(asked.load(StdOrdering::SeqCst), asked_before);
             // The refused adoptions left the one slot free.
             let packet = slots.adopt(refused.owner, 0, 1).unwrap();
-            let full = Lent {
-                bytes: std::vec![0; PACKET_BUF_SIZE],
-                asked,
-                drops,
-            };
-            let refused = slots.adopt(full, 0, 0).unwrap_err();
+            let refused = slots.adopt(lent(PACKET_BUF_SIZE, asked, drops), 0, 0).unwrap_err();
             assert_eq!(refused.reason, ExternalPacketRefusal::Full);
             drop(packet);
         }
 
-        #[test]
-        fn misaligned_storage_is_refused() {
-            let (asked, drops) = (counter(), counter());
-            let slots = slots::<Lent, 1>();
-            let align = core::mem::align_of::<Data>();
-            let mut bytes = std::vec![0; PACKET_BUF_SIZE + 2 * align];
-            // Start one byte past an aligned address.
-            let skew = bytes.as_ptr().addr().next_multiple_of(align) - bytes.as_ptr().addr() + 1;
-            bytes.drain(..skew);
-            let result = slots.adopt(Lent { bytes, asked, drops }, 0, 0);
-            if align > 1 {
-                assert_eq!(result.unwrap_err().reason, ExternalPacketRefusal::Misaligned);
-            } else {
-                assert!(result.is_ok());
+        /// Lends `PACKET_BUF_SIZE` bytes starting `offset` past an aligned base.
+        struct Offset {
+            bytes: Box<Wide>,
+            offset: usize,
+        }
+
+        impl ExternalPacketStorage for Offset {
+            fn storage_mut(&mut self) -> &mut [u8] {
+                &mut self.bytes.0[self.offset..self.offset + PACKET_BUF_SIZE]
             }
+        }
+
+        fn offset(offset: usize) -> Offset {
+            Offset {
+                bytes: Box::new(Wide([0; 2 * PACKET_BUF_SIZE])),
+                offset,
+            }
+        }
+
+        #[test]
+        fn storage_off_the_packet_alignment_is_refused() {
+            let slots = slots::<Offset, 1>();
+            let align = core::mem::align_of::<Data>();
+            let skewed = slots.adopt(offset(1), 0, 0);
+            if align > 1 {
+                let refused = skewed.unwrap_err();
+                assert_eq!(refused.reason, ExternalPacketRefusal::Misaligned);
+                assert_eq!(refused.owner.offset, 1);
+            } else {
+                drop(skewed.unwrap());
+            }
+            // An offset of one alignment unit is aligned, and the refused
+            // adoption left the slot free.
+            drop(slots.adopt(offset(align), 0, 0).unwrap());
         }
 
         static PROBE: ExternalPacketSlots<Probe, 1> = ExternalPacketSlots::new();

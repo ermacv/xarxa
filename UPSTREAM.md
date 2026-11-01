@@ -37,7 +37,9 @@ fork keeps:
 - **Zero-copy adoption.** `ExternalPacketOrigin::adopt` hands driver-owned
   buffers to the stack without copying; it requires
   `PACKET_BUF_DRIVER_HEADROOM == 0`, so the headroom features other than 0
-  are not used by this repository's consumers.
+  are not used by this repository's consumers. A packet's drop only releases
+  its slot; the typed slots' `reclaim` drops the owner with a direct call, so
+  no function pointer is called on the release path.
 - **ARP reply owners across backpressure.** Replies wait in a bounded
   per-interface queue for driver credit instead of being dropped or retried
   on a timer.

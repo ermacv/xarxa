@@ -77,6 +77,10 @@ struct PacketPoolHeader {
     count: usize,
     kind: PacketOriginKind,
     used: [AtomicU32; MAX_BITMAP_WORDS],
+    /// External slots whose packet was dropped and whose owner the typed
+    /// [`ExternalPacketSlots::reclaim`] has not dropped yet.
+    #[cfg(feature = "external-origin")]
+    released: [AtomicU32; MAX_BITMAP_WORDS],
     #[cfg(feature = "async")]
     waiter_claimed: AtomicBool,
     #[cfg(feature = "async")]
@@ -89,7 +93,7 @@ enum PacketOriginKind {
         storage: *const UnsafeCell<MaybeUninit<Data>>,
     },
     #[cfg(feature = "external-origin")]
-    External { drop_owner: ExternalOwnerDrop },
+    External,
 }
 
 impl PacketPoolHeader {
@@ -98,6 +102,8 @@ impl PacketPoolHeader {
             count,
             kind,
             used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+            #[cfg(feature = "external-origin")]
+            released: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
             #[cfg(feature = "async")]
             waiter_claimed: AtomicBool::new(false),
             #[cfg(feature = "async")]
@@ -380,7 +386,7 @@ unsafe fn allocate_from_pool(origin: NonNull<PacketPoolHeader>) -> Option<Packet
     let storage = match header.kind {
         PacketOriginKind::Pool { storage } => storage,
         #[cfg(feature = "external-origin")]
-        PacketOriginKind::External { .. } => return None,
+        PacketOriginKind::External => return None,
     };
     let index = header.alloc_slot()?;
     // SAFETY: PacketPool is repr(C), with its only COUNT-dependent field last.
@@ -433,30 +439,30 @@ unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
             header.waiter.wake();
         }
         #[cfg(feature = "external-origin")]
-        PacketOriginKind::External { drop_owner } => {
+        PacketOriginKind::External => {
             let held = header.used[index / 32].load(Ordering::Acquire);
             debug_assert_ne!(held & bit, 0, "a packet pool slot was released twice");
-            // SAFETY: the packet no longer accesses its control or payload;
-            // its slot still holds the owner adoption placed there. The owner
-            // is dropped before the slot is offered to a new adoption.
-            unsafe { drop_owner(origin, index) };
-            header.used[index / 32].fetch_and(!bit, Ordering::Release);
+            // The packet no longer accesses its control or payload; its slot
+            // stays claimed and still holds the owner adoption placed there.
+            // Release pairs with reclaim's Acquire: the typed slots drop the
+            // owner, a direct call, and only then free the slot.
+            let previous = header.released[index / 32].fetch_or(bit, Ordering::Release);
+            debug_assert_eq!(previous & bit, 0, "a packet pool slot was released twice");
+            #[cfg(feature = "async")]
+            header.waiter.wake();
         }
     }
 }
-
-/// Drops the owner of one adopted slot: `(origin header, slot)`.
-#[cfg(feature = "external-origin")]
-type ExternalOwnerDrop = unsafe fn(NonNull<PacketPoolHeader>, usize);
 
 /// Storage another owner lends to one adopted [`PacketBuf`].
 ///
 /// [`ExternalPacketSlots::adopt`] moves the owner into its slot and only then
 /// asks it for its bytes, so storage held inline by the owner is already at
 /// its final address. The packet exposes the first `PACKET_BUF_SIZE` of these
-/// bytes; the owner is not touched again until the packet's final drop drops
-/// it, which is where the owner returns its storage. The packet may be sent
-/// to and dropped in any context, so the owner is `Send`.
+/// bytes; the owner is not touched again until the packet's final drop
+/// releases it and [`ExternalPacketSlots::reclaim`] drops it, which is where
+/// the owner returns its storage. The packet may be sent to and dropped in any
+/// context, and the reclaim may run in another, so the owner is `Send`.
 #[cfg(feature = "external-origin")]
 pub trait ExternalPacketStorage: Send + 'static {
     /// The bytes the packet may use, starting at the packet's storage start.
@@ -504,8 +510,13 @@ pub struct ExternalPacketRefused<S> {
 /// the frame into a [`PacketPool`]. The slots never allocate, so they are not
 /// an allocator for the stack.
 ///
-/// A slot becomes free for a new owner only after the previous owner's drop
-/// has returned.
+/// A packet's drop marks its slot released; the typed
+/// [`reclaim`](Self::reclaim), which [`adopt`](Self::adopt) runs first and a
+/// driver runs when [`register_reclaim`](Self::register_reclaim)'s task
+/// wakes, drops the owner with a direct call. The packet's non-generic drop
+/// never calls through a stored function, so the owner's drop is visible to
+/// static analysis. A slot becomes free for a new owner only after the
+/// previous owner's drop has returned.
 #[cfg(feature = "external-origin")]
 #[repr(C)]
 pub struct ExternalPacketSlots<S: ExternalPacketStorage, const COUNT: usize> {
@@ -547,12 +558,7 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
     pub const fn new() -> Self {
         let () = Self::VALID_COUNT;
         Self {
-            header: PacketPoolHeader::new(
-                COUNT,
-                PacketOriginKind::External {
-                    drop_owner: drop_external_owner::<S, COUNT>,
-                },
-            ),
+            header: PacketPoolHeader::new(COUNT, PacketOriginKind::External),
             controls: [const { UnsafeCell::new(MaybeUninit::uninit()) }; COUNT],
             owners: [const { UnsafeCell::new(MaybeUninit::uninit()) }; COUNT],
         }
@@ -578,6 +584,8 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
     /// the owner is asked for its storage; `TooShort` and `Misaligned` after
     /// [`ExternalPacketStorage::storage_mut`], which may have changed it.
     pub fn adopt(&'static self, owner: S, headroom: usize, len: usize) -> Result<PacketBuf, ExternalPacketRefused<S>> {
+        // Owners of packets dropped since the last reclaim leave first.
+        self.reclaim();
         let range_fits = headroom.checked_add(len).is_some_and(|end| end <= PACKET_BUF_SIZE);
         if !range_fits {
             return Err(ExternalPacketRefused {
@@ -636,6 +644,58 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
             inner: unsafe { NonNull::new_unchecked(control) },
         })
     }
+
+    /// Drop the owner of every packet dropped since the last reclaim, in
+    /// these typed slots, and free its slot; the number of owners dropped.
+    ///
+    /// A packet's drop only marks its slot released (and, with `async`,
+    /// wakes the task [`register_reclaim`](Self::register_reclaim) named):
+    /// the owner's drop is a direct call here, never through a stored
+    /// function. [`adopt`](Self::adopt) reclaims first.
+    pub fn reclaim(&self) -> usize {
+        let mut dropped = 0;
+        let words = self.header.released.iter().zip(&self.header.used);
+        for ((released, used), owners) in words.zip(self.owners.chunks(32)) {
+            // Acquire pairs with release_slot's Release: each packet whose bit
+            // is taken here has finished with its control and its owner.
+            let mut taken = released.swap(0, Ordering::Acquire);
+            while taken != 0 {
+                let bit = taken.trailing_zeros();
+                taken &= taken - 1;
+                // Only a packet of these slots sets a bit, below COUNT.
+                let Some(owner) = owners.get(bit as usize) else {
+                    continue;
+                };
+                // SAFETY: the bit was set by the release of this slot's one
+                // packet, after its last use of the owner, and the swap above
+                // took it exactly once. The slot stays claimed until its bit
+                // is cleared below, so no adoption reaches the owner.
+                unsafe { (*owner.get()).assume_init_drop() };
+                // Release pairs with alloc_slot's Acquire: the next adoption
+                // sees the owner's drop completed.
+                used.fetch_and(!(1 << bit), Ordering::Release);
+                dropped += 1;
+            }
+        }
+        dropped
+    }
+
+    /// Whether a dropped packet's owner waits for [`reclaim`](Self::reclaim).
+    pub fn has_released(&self) -> bool {
+        self.header
+            .released
+            .iter()
+            .take(COUNT.div_ceil(32))
+            .any(|word| word.load(Ordering::Acquire) != 0)
+    }
+
+    /// Make `waker` the one a packet's drop wakes, for its owner's
+    /// [`reclaim`](Self::reclaim). One task reclaims: a later registration
+    /// replaces it. Register, then check [`has_released`](Self::has_released).
+    #[cfg(feature = "async")]
+    pub fn register_reclaim(&self, waker: &Waker) {
+        register_pool_waker(&self.header.waiter, waker);
+    }
 }
 
 #[cfg(feature = "external-origin")]
@@ -643,24 +703,6 @@ impl<S: ExternalPacketStorage, const COUNT: usize> Default for ExternalPacketSlo
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Drop the owner of `slot` of the slots whose header `origin` is.
-///
-/// # Safety
-///
-/// `origin` is the header of a live `ExternalPacketSlots<S, COUNT>`, whose
-/// `slot` holds an owner no packet uses any more.
-#[cfg(feature = "external-origin")]
-unsafe fn drop_external_owner<S: ExternalPacketStorage, const COUNT: usize>(
-    origin: NonNull<PacketPoolHeader>,
-    slot: usize,
-) {
-    // SAFETY: the header is the first field of the repr(C) slots, so its
-    // address is theirs; the caller guarantees they are live.
-    let slots = unsafe { origin.cast::<ExternalPacketSlots<S, COUNT>>().as_ref() };
-    // SAFETY: the caller guarantees the owner is initialized and unused.
-    unsafe { (*slots.owners[slot].get()).assume_init_drop() };
 }
 
 /// An owned network packet buffer.
@@ -963,10 +1005,21 @@ mod tests {
             assert_eq!(&packet[..], &[10, 11, 12, 13]);
             assert_eq!(drops.load(StdOrdering::SeqCst), 0);
             drop(packet);
+            // The packet's drop only released the slot; the typed reclaim
+            // drops its owner, once.
+            assert!(slots.has_released());
+            assert_eq!(drops.load(StdOrdering::SeqCst), 0);
+            assert_eq!(slots.reclaim(), 1);
+            assert!(!slots.has_released());
+            assert_eq!(slots.reclaim(), 0);
             assert_eq!(drops.load(StdOrdering::SeqCst), 1);
-            // The released slot takes a new owner.
+            // The freed slot takes a new owner; the next adoption reclaims
+            // the one its packet released.
+            drop(slots.adopt(boxed(drops), 0, 0).unwrap());
             drop(slots.adopt(boxed(drops), 0, 0).unwrap());
             assert_eq!(drops.load(StdOrdering::SeqCst), 2);
+            assert_eq!(slots.reclaim(), 1);
+            assert_eq!(drops.load(StdOrdering::SeqCst), 3);
         }
 
         /// Holds its bytes inline: they move with the owner into its slot.
@@ -998,6 +1051,7 @@ mod tests {
             let mut packet = slots.adopt(owner, 0, 4).unwrap();
             packet.copy_from_slice(&[1, 2, 3, 4]);
             drop(packet);
+            assert_eq!(slots.reclaim(), 1);
             // The owner, dropped in its slot, holds what the packet wrote.
             assert_eq!(*seen.lock().unwrap(), [1, 2, 3, 4]);
         }
@@ -1143,6 +1197,8 @@ mod tests {
                 probe: true,
             };
             drop(PROBE.adopt(owner, 0, 0).unwrap());
+            // The reclaim drops the owner, which tries the slot again.
+            assert_eq!(PROBE.reclaim(), 1);
             assert_eq!(*PROBED.lock().unwrap(), [ExternalPacketRefusal::Full]);
             // Once that drop returned, the slot takes a new owner.
             let owner = Probe {
@@ -1153,13 +1209,37 @@ mod tests {
         }
 
         #[test]
-        fn an_owner_is_dropped_where_its_packet_is_dropped() {
+        fn a_packet_dropped_on_another_thread_leaves_its_owner_to_the_reclaim() {
             let drops = counter();
             let slots = slots::<Boxed, 1>();
             let packet = slots.adopt(boxed(drops), 0, 1).unwrap();
             std::thread::spawn(move || drop(packet)).join().unwrap();
+            assert_eq!(drops.load(StdOrdering::SeqCst), 0);
+            assert_eq!(slots.reclaim(), 1);
             assert_eq!(drops.load(StdOrdering::SeqCst), 1);
             drop(slots.adopt(boxed(drops), 0, 1).unwrap());
+        }
+
+        #[cfg(feature = "async")]
+        #[test]
+        fn a_packet_drop_wakes_the_reclaiming_task() {
+            struct Flag(AtomicUsize);
+            impl std::task::Wake for Flag {
+                fn wake(self: std::sync::Arc<Self>) {
+                    self.0.fetch_add(1, StdOrdering::SeqCst);
+                }
+            }
+            let drops = counter();
+            let slots = slots::<Boxed, 1>();
+            let flag = std::sync::Arc::new(Flag(AtomicUsize::new(0)));
+            let waker = std::task::Waker::from(flag.clone());
+            slots.register_reclaim(&waker);
+            assert!(!slots.has_released());
+            drop(slots.adopt(boxed(drops), 0, 1).unwrap());
+            assert_eq!(flag.0.load(StdOrdering::SeqCst), 1);
+            assert!(slots.has_released());
+            assert_eq!(slots.reclaim(), 1);
+            assert_eq!(drops.load(StdOrdering::SeqCst), 1);
         }
 
         #[test]
@@ -1180,6 +1260,8 @@ mod tests {
             drop(refused);
             assert_eq!(drops.load(StdOrdering::SeqCst), 1);
             drop(packets);
+            assert_eq!(drops.load(StdOrdering::SeqCst), 1);
+            assert_eq!(slots.reclaim(), 1024);
             assert_eq!(drops.load(StdOrdering::SeqCst), 1025);
         }
 
@@ -1198,6 +1280,8 @@ mod tests {
                 }
             }));
             assert!(result.is_err());
+            // The owner is dropped once, by the reclaim.
+            assert_eq!(slots.reclaim(), 1);
             assert_eq!(drops.load(StdOrdering::SeqCst), 1);
         }
     }

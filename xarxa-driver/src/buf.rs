@@ -654,22 +654,26 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
     /// function. [`adopt`](Self::adopt) reclaims first.
     pub fn reclaim(&self) -> usize {
         let mut dropped = 0;
-        for (word_index, word) in self.header.released[..COUNT.div_ceil(32)].iter().enumerate() {
+        let words = self.header.released.iter().zip(&self.header.used);
+        for ((released, used), owners) in words.zip(self.owners.chunks(32)) {
             // Acquire pairs with release_slot's Release: each packet whose bit
             // is taken here has finished with its control and its owner.
-            let mut taken = word.swap(0, Ordering::Acquire);
+            let mut taken = released.swap(0, Ordering::Acquire);
             while taken != 0 {
-                let bit = taken.trailing_zeros() as usize;
+                let bit = taken.trailing_zeros();
                 taken &= taken - 1;
-                let slot = word_index * 32 + bit;
+                // Only a packet of these slots sets a bit, below COUNT.
+                let Some(owner) = owners.get(bit as usize) else {
+                    continue;
+                };
                 // SAFETY: the bit was set by the release of this slot's one
                 // packet, after its last use of the owner, and the swap above
                 // took it exactly once. The slot stays claimed until its bit
                 // is cleared below, so no adoption reaches the owner.
-                unsafe { (*self.owners[slot].get()).assume_init_drop() };
+                unsafe { (*owner.get()).assume_init_drop() };
                 // Release pairs with alloc_slot's Acquire: the next adoption
                 // sees the owner's drop completed.
-                self.header.used[word_index].fetch_and(!(1 << bit), Ordering::Release);
+                used.fetch_and(!(1 << bit), Ordering::Release);
                 dropped += 1;
             }
         }
@@ -678,8 +682,10 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
 
     /// Whether a dropped packet's owner waits for [`reclaim`](Self::reclaim).
     pub fn has_released(&self) -> bool {
-        self.header.released[..COUNT.div_ceil(32)]
+        self.header
+            .released
             .iter()
+            .take(COUNT.div_ceil(32))
             .any(|word| word.load(Ordering::Acquire) != 0)
     }
 

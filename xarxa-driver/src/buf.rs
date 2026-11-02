@@ -6,6 +6,9 @@
 //! Buffers are allocated from explicit static pools. [`PacketPool`] and
 //! [`PacketPoolStorage`] let a system independently place multiple pools
 //! without changing the packet type passed through drivers and the stack.
+//! [`ParkedPacketSlots`] is such a pool over storage a driver lends, for
+//! example its DMA transmit buffers, so that a packet the stack writes is
+//! sent from where it was written.
 
 use core::cell::UnsafeCell;
 use core::fmt;
@@ -94,14 +97,24 @@ enum PacketOriginKind {
     },
     #[cfg(feature = "external-origin")]
     External,
+    /// Owners parked in [`ParkedPacketSlots`]: allocation takes a parked
+    /// owner's storage, and a packet's drop parks it again.
+    #[cfg(feature = "external-origin")]
+    Parked,
 }
 
 impl PacketPoolHeader {
     const fn new(count: usize, kind: PacketOriginKind) -> Self {
+        // A parked origin holds no owner yet: no slot is free to allocate.
+        let used = match kind {
+            #[cfg(feature = "external-origin")]
+            PacketOriginKind::Parked => [const { AtomicU32::new(u32::MAX) }; MAX_BITMAP_WORDS],
+            _ => [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+        };
         Self {
             count,
             kind,
-            used: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
+            used,
             #[cfg(feature = "external-origin")]
             released: [const { AtomicU32::new(0) }; MAX_BITMAP_WORDS],
             #[cfg(feature = "async")]
@@ -139,15 +152,17 @@ impl PacketPoolHeader {
     #[inline(never)]
     fn has_available(&self) -> bool {
         #[cfg(feature = "external-origin")]
-        if !matches!(self.kind, PacketOriginKind::Pool { .. }) {
+        if matches!(self.kind, PacketOriginKind::External) {
             return false;
         }
         self.used[..self.count.div_ceil(32)]
             .iter()
             .enumerate()
             .any(|(word_index, word)| {
-                let used = word.load(Ordering::Acquire);
+                // A parked origin sets the bits past its count too.
                 let valid = (self.count - word_index * 32).min(32);
+                let mask = u32::MAX >> (32 - valid);
+                let used = word.load(Ordering::Acquire) & mask;
                 used.count_ones() < valid as u32
             })
     }
@@ -194,6 +209,14 @@ impl PacketBufAllocator {
     pub fn has_available(self) -> bool {
         let header = unsafe { self.origin.as_ref() };
         header.has_available()
+    }
+
+    /// Whether an asynchronous stack holds the pool's waiter already, so
+    /// that [`try_claim_waiter`](Self::try_claim_waiter) would refuse.
+    #[cfg(feature = "async")]
+    pub fn waiter_claimed(self) -> bool {
+        let header = unsafe { self.origin.as_ref() };
+        header.waiter_claimed.load(Ordering::Acquire)
     }
 
     /// Claim the pool's unique asynchronous availability waiter.
@@ -384,9 +407,12 @@ unsafe fn allocate_from_pool(origin: NonNull<PacketPoolHeader>) -> Option<Packet
     // SAFETY: the caller guarantees the header's lifetime and provenance.
     let header = unsafe { origin.as_ref() };
     let storage = match header.kind {
-        PacketOriginKind::Pool { storage } => storage,
+        PacketOriginKind::Pool { storage } => Some(storage),
         #[cfg(feature = "external-origin")]
         PacketOriginKind::External => return None,
+        // The parked owner's storage is already in the control.
+        #[cfg(feature = "external-origin")]
+        PacketOriginKind::Parked => None,
     };
     let index = header.alloc_slot()?;
     // SAFETY: PacketPool is repr(C), with its only COUNT-dependent field last.
@@ -402,20 +428,28 @@ unsafe fn allocate_from_pool(origin: NonNull<PacketPoolHeader>) -> Option<Packet
             .add(index)
     };
     let ptr = unsafe { (*ptr).get().cast::<PacketBufInner>() };
-    // SAFETY: the constructor bound a unique static payload array of count
-    // slots; the successful CAS claimed this payload with its control.
-    let data = unsafe { (*storage.add(index)).get().cast::<Data>() };
     // SAFETY: both pointers are aligned static slots uniquely owned here.
-    // Every field read by PacketBuf is initialized before publication.
+    // Every field read by PacketBuf is initialized before publication: a
+    // parked slot's data was written when its owner was parked, before the
+    // Release that made the slot free, which the claim's Acquire observed.
     unsafe {
         (&raw mut (*ptr).origin).write(origin);
         (&raw mut (*ptr).slot).write(index);
         (&raw mut (*ptr).headroom).write(0);
         (&raw mut (*ptr).len).write(0);
         (&raw mut (*ptr).meta).write(PacketMeta::default());
-        (&raw mut (*ptr).data).write(NonNull::new_unchecked(data));
-        #[cfg(test)]
-        (*data).fill(0xa5);
+    }
+    if let Some(storage) = storage {
+        // SAFETY: the constructor bound a unique static payload array of
+        // count slots; the successful CAS claimed this payload with its
+        // control.
+        let data = unsafe { (*storage.add(index)).get().cast::<Data>() };
+        // SAFETY: as above, the control is uniquely owned here.
+        unsafe {
+            (&raw mut (*ptr).data).write(NonNull::new_unchecked(data));
+            #[cfg(test)]
+            (*data).fill(0xa5);
+        }
     }
     Some(PacketBuf {
         // SAFETY: a pointer into static control storage is non-null.
@@ -432,12 +466,11 @@ unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
     debug_assert!(index < header.count);
     let bit = 1 << (index % 32);
     match header.kind {
-        PacketOriginKind::Pool { .. } => {
-            let previous = header.used[index / 32].fetch_and(!bit, Ordering::Release);
-            debug_assert_ne!(previous & bit, 0, "a packet pool slot was released twice");
-            #[cfg(feature = "async")]
-            header.waiter.wake();
-        }
+        // A parked packet's owner stays parked in its slot: freeing the
+        // slot parks it again for the next allocation.
+        PacketOriginKind::Pool { .. } => release_free(header, index, bit),
+        #[cfg(feature = "external-origin")]
+        PacketOriginKind::Parked => release_free(header, index, bit),
         #[cfg(feature = "external-origin")]
         PacketOriginKind::External => {
             let held = header.used[index / 32].load(Ordering::Acquire);
@@ -452,6 +485,16 @@ unsafe fn release_slot(origin: NonNull<PacketPoolHeader>, index: usize) {
             header.waiter.wake();
         }
     }
+}
+
+/// Free a slot whose control and payload its packet no longer accesses.
+fn release_free(header: &PacketPoolHeader, index: usize, bit: u32) {
+    // Release pairs with alloc_slot's Acquire: the next owner sees this
+    // packet's last access completed.
+    let previous = header.used[index / 32].fetch_and(!bit, Ordering::Release);
+    debug_assert_ne!(previous & bit, 0, "a packet pool slot was released twice");
+    #[cfg(feature = "async")]
+    header.waiter.wake();
 }
 
 /// Storage another owner lends to one adopted [`PacketBuf`].
@@ -700,6 +743,202 @@ impl<S: ExternalPacketStorage, const COUNT: usize> ExternalPacketSlots<S, COUNT>
 
 #[cfg(feature = "external-origin")]
 impl<S: ExternalPacketStorage, const COUNT: usize> Default for ExternalPacketSlots<S, COUNT> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What [`ParkedPacketSlots::take`] hands back: the owner a packet was
+/// allocated over, and where the packet's bytes sit in its storage.
+#[cfg(feature = "external-origin")]
+#[derive(Debug)]
+pub struct TakenPacket<S> {
+    /// The owner; no packet refers to its storage any more.
+    pub owner: S,
+    /// The packet's first byte, from the owner's storage start.
+    pub headroom: usize,
+    /// The packet's length.
+    pub len: usize,
+}
+
+/// A general packet pool over storage other owners lend.
+///
+/// [`park`](Self::park) places an owner, such as a driver's DMA transmit
+/// buffer, in a slot; the [`allocator`](Self::allocator) allocates packets
+/// over parked owners' storage, like a [`PacketPool`]'s. A packet's drop
+/// parks its owner again, untouched, for the next allocation. A driver that
+/// receives such a packet to send [`take`](Self::take)s its owner out with
+/// the packet's place in the storage, and sends from it without a copy; the
+/// slot stays empty until an owner is parked again.
+///
+/// Owners are never dropped while parked: the slots are a `static`.
+#[cfg(feature = "external-origin")]
+#[repr(C)]
+pub struct ParkedPacketSlots<S: ExternalPacketStorage, const COUNT: usize> {
+    // The header precedes everything COUNT-dependent; allocation finds the
+    // controls from it.
+    header: PacketPoolHeader,
+    controls: [UnsafeCell<MaybeUninit<PacketBufInner>>; COUNT],
+    owners: [UnsafeCell<MaybeUninit<S>>; COUNT],
+    /// Slots without an owner: set until [`Self::park`] places one, set again
+    /// by [`Self::take`].
+    vacant: [AtomicU32; MAX_BITMAP_WORDS],
+}
+
+// SAFETY: an owner slot is written by the one park whose claim cleared its
+// vacant bit, reached by packets only through the storage it named, and read
+// out by the one take that holds the slot's packet. Owners move between
+// contexts with their packets' takes, which `S: Send` permits; no owner is
+// shared.
+#[cfg(feature = "external-origin")]
+unsafe impl<S: ExternalPacketStorage, const COUNT: usize> Sync for ParkedPacketSlots<S, COUNT> {}
+
+#[cfg(feature = "external-origin")]
+impl<S: ExternalPacketStorage, const COUNT: usize> ParkedPacketSlots<S, COUNT> {
+    const VALID_COUNT: () = {
+        if COUNT == 0 {
+            panic!("parked packet slots must contain at least one slot");
+        }
+        if COUNT > MAX_PACKET_POOL_COUNT {
+            panic!("parked packet slots cannot contain more than 1024 slots");
+        }
+    };
+
+    /// Empty slots; `const`, so that they can live in a `static`.
+    pub const fn new() -> Self {
+        let () = Self::VALID_COUNT;
+        Self {
+            header: PacketPoolHeader::new(COUNT, PacketOriginKind::Parked),
+            controls: [const { UnsafeCell::new(MaybeUninit::uninit()) }; COUNT],
+            owners: [const { UnsafeCell::new(MaybeUninit::uninit()) }; COUNT],
+            vacant: [const { AtomicU32::new(u32::MAX) }; MAX_BITMAP_WORDS],
+        }
+    }
+
+    /// Number of owners these slots can hold at once.
+    pub const fn capacity(&self) -> usize {
+        COUNT
+    }
+
+    /// The allocator over the parked owners' storage: the stack's general
+    /// allocator, for example.
+    pub fn allocator(&'static self) -> PacketBufAllocator {
+        PacketBufAllocator {
+            origin: NonNull::from(self).cast(),
+        }
+    }
+
+    /// Whether `buf` was allocated over an owner of these slots.
+    pub fn owns(&self, buf: &PacketBuf) -> bool {
+        core::ptr::eq(buf.inner().origin.as_ptr(), &self.header)
+    }
+
+    /// Claim the first slot without an owner.
+    fn claim_vacant(&self) -> Option<usize> {
+        for (word_index, word) in self.vacant[..COUNT.div_ceil(32)].iter().enumerate() {
+            let mut current = word.load(Ordering::Relaxed);
+            while current != 0 {
+                let bit = current.trailing_zeros() as usize;
+                let index = word_index * 32 + bit;
+                if index >= COUNT {
+                    return None;
+                }
+                // Acquire pairs with take's Release: the previous owner was
+                // read out before the slot became vacant.
+                match word.compare_exchange_weak(current, current & !(1 << bit), Ordering::Acquire, Ordering::Relaxed) {
+                    Ok(_) => return Some(index),
+                    Err(actual) => current = actual,
+                }
+            }
+        }
+        None
+    }
+
+    /// Park `owner` in an empty slot, free for the allocator; with `async`,
+    /// this wakes the allocator's waiter.
+    ///
+    /// # Errors
+    ///
+    /// No empty slot, or storage shorter than `PACKET_BUF_SIZE` or
+    /// misaligned, returns the owner with the reason. `Full` is refused
+    /// before the owner is asked for its storage; `TooShort` and
+    /// `Misaligned` after [`ExternalPacketStorage::storage_mut`], which may
+    /// have changed it.
+    pub fn park(&self, owner: S) -> Result<(), ExternalPacketRefused<S>> {
+        let Some(slot) = self.claim_vacant() else {
+            return Err(ExternalPacketRefused {
+                owner,
+                reason: ExternalPacketRefusal::Full,
+            });
+        };
+        let owners = self.owners[slot].get();
+        // SAFETY: the vacant claim above made this owner slot exclusively
+        // ours; its allocation bit stays set, so no packet reaches it.
+        let placed = unsafe { (*owners).write(owner) };
+        // The owner is at its final address before it names its bytes.
+        let storage = placed.storage_mut();
+        let available = storage.len();
+        let refusal = if available < PACKET_BUF_SIZE {
+            Some(ExternalPacketRefusal::TooShort { available })
+        } else if !storage.as_ptr().addr().is_multiple_of(core::mem::align_of::<Data>()) {
+            Some(ExternalPacketRefusal::Misaligned)
+        } else {
+            None
+        };
+        let bit = 1 << (slot % 32);
+        if let Some(reason) = refusal {
+            // SAFETY: the owner was written above and no packet refers to
+            // it; reading it out leaves the slot empty again.
+            let owner = unsafe { (*owners).assume_init_read() };
+            self.vacant[slot / 32].fetch_or(bit, Ordering::Release);
+            return Err(ExternalPacketRefused { owner, reason });
+        }
+        // `storage` is a valid, initialized and exclusively borrowed slice of
+        // at least PACKET_BUF_SIZE aligned bytes inside the placed owner.
+        let data = NonNull::from(storage).cast::<Data>();
+        let control = self.controls[slot].get().cast::<PacketBufInner>();
+        // SAFETY: the slot's allocation bit is still set, so no packet holds
+        // this control. The owner stays in its slot, untouched, until a take
+        // reads it out, so `data` stays valid for every packet over it.
+        unsafe { (&raw mut (*control).data).write(data) };
+        // Release pairs with alloc_slot's Acquire: an allocation sees the
+        // owner and its storage in place.
+        self.header.used[slot / 32].fetch_and(!bit, Ordering::Release);
+        #[cfg(feature = "async")]
+        self.header.waiter.wake();
+        Ok(())
+    }
+
+    /// Take `buf`'s owner out of its slot, with the packet's place in the
+    /// owner's storage; the slot stays empty until the next park.
+    ///
+    /// # Errors
+    ///
+    /// A packet these slots did not allocate is returned unchanged.
+    pub fn take(&self, buf: PacketBuf) -> Result<TakenPacket<S>, PacketBuf> {
+        if !self.owns(&buf) {
+            return Err(buf);
+        }
+        let (slot, headroom, len) = (buf.inner().slot, buf.headroom(), buf.len());
+        // Only an allocation of these slots formed the packet, below COUNT.
+        let Some(owner) = self.owners.get(slot) else {
+            return Err(buf);
+        };
+        // The packet ends here without its release: its slot stays allocated.
+        let _ended = core::mem::ManuallyDrop::new(buf);
+        // SAFETY: the packet held this slot's allocation, so the owner parked
+        // there is in place and no other packet or take reaches it. The
+        // packet is gone; nothing refers to the owner's storage any more.
+        let owner = unsafe { (*owner.get()).assume_init_read() };
+        // Release pairs with claim_vacant's Acquire: the owner was read out
+        // before a park may write the slot again.
+        self.vacant[slot / 32].fetch_or(1 << (slot % 32), Ordering::Release);
+        Ok(TakenPacket { owner, headroom, len })
+    }
+}
+
+#[cfg(feature = "external-origin")]
+impl<S: ExternalPacketStorage, const COUNT: usize> Default for ParkedPacketSlots<S, COUNT> {
     fn default() -> Self {
         Self::new()
     }
@@ -990,6 +1229,123 @@ mod tests {
 
         fn slots<S: ExternalPacketStorage, const COUNT: usize>() -> &'static ExternalPacketSlots<S, COUNT> {
             Box::leak(Box::new(ExternalPacketSlots::new()))
+        }
+
+        fn parked<S: ExternalPacketStorage, const COUNT: usize>() -> &'static ParkedPacketSlots<S, COUNT> {
+            Box::leak(Box::new(ParkedPacketSlots::new()))
+        }
+
+        #[test]
+        fn parked_slots_allocate_nothing_until_an_owner_is_parked() {
+            let slots = parked::<Boxed, 2>();
+            let allocator = slots.allocator();
+            assert!(allocator.try_alloc().is_none());
+            #[cfg(feature = "async")]
+            assert!(!allocator.has_available());
+            slots.park(boxed(counter())).unwrap();
+            #[cfg(feature = "async")]
+            assert!(allocator.has_available());
+            let packet = allocator.try_alloc().unwrap();
+            assert!(slots.owns(&packet));
+            assert!(allocator.try_alloc().is_none());
+        }
+
+        #[test]
+        fn a_parked_packet_writes_the_owner_storage_and_its_drop_parks_the_owner_again() {
+            let drops = counter();
+            let slots = parked::<Boxed, 1>();
+            let allocator = slots.allocator();
+            slots.park(boxed(drops)).unwrap();
+            let mut packet = allocator.try_alloc().unwrap();
+            assert_eq!((packet.headroom(), packet.len()), (0, 0));
+            packet.reserve(4);
+            packet.set_len(3);
+            packet.copy_from_slice(&[7, 8, 9]);
+            drop(packet);
+            // The owner stays parked, never dropped, and lends the same bytes.
+            assert_eq!(drops.load(StdOrdering::SeqCst), 0);
+            let mut again = allocator.try_alloc().unwrap();
+            assert_eq!(&again.storage_mut()[4..7], &[7, 8, 9]);
+        }
+
+        #[test]
+        fn a_take_returns_the_owner_with_the_packets_place_and_leaves_the_slot_empty() {
+            let drops = counter();
+            let slots = parked::<Boxed, 1>();
+            let allocator = slots.allocator();
+            slots.park(boxed(drops)).unwrap();
+            let mut packet = allocator.try_alloc().unwrap();
+            packet.reserve(6);
+            packet.set_len(2);
+            packet.copy_from_slice(&[1, 2]);
+            let taken = slots.take(packet).unwrap();
+            assert_eq!((taken.headroom, taken.len), (6, 2));
+            let TakenPacket { mut owner, .. } = taken;
+            assert_eq!(&owner.storage_mut()[6..8], &[1, 2]);
+            assert!(allocator.try_alloc().is_none());
+            assert_eq!(drops.load(StdOrdering::SeqCst), 0);
+            // The emptied slot takes an owner again.
+            slots.park(owner).unwrap();
+            assert!(allocator.try_alloc().is_some());
+        }
+
+        #[test]
+        fn a_take_refuses_a_packet_of_another_origin() {
+            let slots = parked::<Boxed, 1>();
+            slots.park(boxed(counter())).unwrap();
+            let foreign = new_buffer();
+            let foreign = slots.take(foreign).unwrap_err();
+            drop(foreign);
+            assert!(slots.allocator().try_alloc().is_some());
+        }
+
+        #[test]
+        fn a_full_park_returns_the_owner() {
+            let drops = counter();
+            let slots = parked::<Boxed, 1>();
+            slots.park(boxed(drops)).unwrap();
+            let refused = slots.park(boxed(drops)).unwrap_err();
+            assert_eq!(refused.reason, ExternalPacketRefusal::Full);
+            drop(refused);
+            assert_eq!(drops.load(StdOrdering::SeqCst), 1);
+        }
+
+        #[test]
+        fn a_short_owner_is_refused_and_its_slot_stays_empty() {
+            let (asked, drops) = (counter(), counter());
+            let slots = parked::<Lent, 1>();
+            let refused = slots.park(lent(PACKET_BUF_SIZE - 1, asked, drops)).unwrap_err();
+            assert_eq!(
+                refused.reason,
+                ExternalPacketRefusal::TooShort {
+                    available: PACKET_BUF_SIZE - 1
+                }
+            );
+            drop(refused);
+            assert_eq!(drops.load(StdOrdering::SeqCst), 1);
+            assert!(slots.allocator().try_alloc().is_none());
+            slots.park(lent(PACKET_BUF_SIZE, asked, drops)).unwrap();
+            assert!(slots.allocator().try_alloc().is_some());
+        }
+
+        #[cfg(feature = "async")]
+        #[test]
+        fn a_park_and_a_parked_packets_drop_wake_the_allocators_waiter() {
+            let slots = parked::<Boxed, 1>();
+            let allocator = slots.allocator();
+            assert!(!allocator.waiter_claimed());
+            let waiter = allocator.try_claim_waiter().unwrap();
+            assert!(allocator.waiter_claimed());
+            let wakes = Arc::new(AtomicUsize::new(0));
+            let waker = Waker::from(Arc::new(CountWake(Arc::clone(&wakes))));
+            waiter.register(&waker);
+            assert_eq!(wakes.load(StdOrdering::Relaxed), 0);
+            slots.park(boxed(counter())).unwrap();
+            assert_eq!(wakes.load(StdOrdering::Relaxed), 1);
+            let packet = allocator.try_alloc().unwrap();
+            waiter.register(&waker);
+            drop(packet);
+            assert_eq!(wakes.load(StdOrdering::Relaxed), 2);
         }
 
         #[test]

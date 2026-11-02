@@ -6,7 +6,7 @@
 //! room freeing up in a ring buffer. A future built on top can then poll the
 //! socket, register, and go to sleep.
 
-#![cfg_attr(not(any(feature = "tcp", feature = "udp", feature = "raw")), allow(unused))]
+#![cfg_attr(not(any(feature = "tcp", feature = "udp", feature = "_raw")), allow(unused))]
 
 use core::task::Waker;
 

@@ -33,8 +33,8 @@ mod field {
 /// Read `n` bytes at `*offset` and advance it. For parsers of headers whose
 /// layout depends on their own fields.
 #[cfg(feature = "medium-ieee802154")]
-pub(crate) fn take<'a>(buf: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8]> {
-    let bytes = buf.get(*offset..*offset + n).ok_or(Error)?;
+pub(crate) fn take<'a>(buf: &'a [u8], offset: &mut usize, n: usize) -> Result<&'a [u8], Malformed> {
+    let bytes = buf.get(*offset..*offset + n).ok_or(Malformed)?;
     *offset += n;
     Ok(bytes)
 }
@@ -67,15 +67,24 @@ mod mld;
 mod ndisc;
 #[cfg(all(any(feature = "medium-ethernet", feature = "medium-ieee802154"), feature = "ipv6"))]
 mod ndiscoption;
+mod parser;
+#[cfg(feature = "serde")]
+mod serde_impls;
 #[cfg(feature = "medium-ieee802154")]
 pub(crate) mod sixlowpan;
 #[cfg(feature = "tcp")]
 mod tcp;
-#[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "udp",
+    feature = "dhcpv4",
+    feature = "dhcpv4-server",
+    feature = "medium-ieee802154"
+))]
 mod udp;
 
 use core::fmt;
 
+use crate::error::Malformed;
 use crate::iface::Medium;
 
 pub use self::ethernet::{
@@ -104,7 +113,7 @@ pub use self::arp::{
     BUFFER_LEN as ARP_BUFFER_LEN, Hardware as ArpHardware, Operation as ArpOperation, Packet as ArpPacket,
 };
 
-#[cfg(feature = "dhcpv4")]
+#[cfg(any(feature = "dhcpv4", feature = "dhcpv4-server"))]
 pub(crate) use self::dhcpv4::field as dhcpv4_field;
 #[cfg(all(feature = "medium-ethernet", feature = "ipv4"))]
 pub use self::dhcpv4::{
@@ -115,29 +124,28 @@ pub use self::dhcpv4::{
 
 pub use self::ip::checksum;
 pub use self::ip::{
-    Address as IpAddress, Cidr as IpCidr, Endpoint as IpEndpoint, ListenEndpoint as IpListenEndpoint,
-    Protocol as IpProtocol, Version as IpVersion,
+    Address as IpAddr, Cidr as IpCidr, ListenSocketAddr, Protocol as IpProtocol, SocketAddr, Version as IpVersion,
 };
 
 #[cfg(feature = "ipv4")]
 pub use self::ipv4::{
-    Address as Ipv4Address, Cidr as Ipv4Cidr, FRAGMENT_PAYLOAD_ALIGNMENT as IPV4_FRAGMENT_PAYLOAD_ALIGNMENT,
+    Address as Ipv4Addr, Cidr as Ipv4Cidr, FRAGMENT_PAYLOAD_ALIGNMENT as IPV4_FRAGMENT_PAYLOAD_ALIGNMENT,
     HEADER_LEN as IPV4_HEADER_LEN, MIN_MTU as IPV4_MIN_MTU, MULTICAST_ALL_ROUTERS as IPV4_MULTICAST_ALL_ROUTERS,
     MULTICAST_ALL_SYSTEMS as IPV4_MULTICAST_ALL_SYSTEMS, Packet as Ipv4Packet,
 };
 
 #[cfg(feature = "ipv4")]
-pub(crate) use self::ipv4::AddressExt as Ipv4AddressExt;
+pub(crate) use self::ipv4::AddressExt as Ipv4AddrExt;
 
 #[cfg(feature = "ipv6")]
 pub use self::ipv6::{
-    Address as Ipv6Address, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN,
+    Address as Ipv6Addr, Cidr as Ipv6Cidr, HEADER_LEN as IPV6_HEADER_LEN,
     LINK_LOCAL_ALL_MLDV2_ROUTERS as IPV6_LINK_LOCAL_ALL_MLDV2_ROUTERS,
     LINK_LOCAL_ALL_NODES as IPV6_LINK_LOCAL_ALL_NODES, LINK_LOCAL_ALL_ROUTERS as IPV6_LINK_LOCAL_ALL_ROUTERS,
     MIN_MTU as IPV6_MIN_MTU, Packet as Ipv6Packet,
 };
 #[cfg(feature = "ipv6")]
-pub(crate) use self::ipv6::{AddressExt as Ipv6AddressExt, MulticastScope as Ipv6MulticastScope};
+pub(crate) use self::ipv6::{AddressExt as Ipv6AddrExt, MulticastScope as Ipv6MulticastScope};
 
 #[cfg(feature = "ipv6")]
 pub use self::ipv6ext::{
@@ -196,7 +204,12 @@ pub use self::tcp::{
     Control as TcpControl, HEADER_LEN as TCP_HEADER_LEN, Packet as TcpPacket, SeqNumber as TcpSeqNumber, TcpOption,
 };
 
-#[cfg(any(feature = "udp", feature = "dhcpv4", feature = "medium-ieee802154"))]
+#[cfg(any(
+    feature = "udp",
+    feature = "dhcpv4",
+    feature = "dhcpv4-server",
+    feature = "medium-ieee802154"
+))]
 pub use self::udp::{HEADER_LEN as UDP_HEADER_LEN, Packet as UdpPacket};
 
 #[cfg(feature = "dns")]
@@ -204,23 +217,6 @@ pub use self::dns::{
     Flags as DnsFlags, HEADER_LEN as DNS_HEADER_LEN, Opcode as DnsOpcode, Packet as DnsPacket, Question as DnsQuestion,
     Rcode as DnsRcode, Record as DnsRecord, RecordData as DnsRecordData, Type as DnsType,
 };
-
-/// Parsing a packet failed.
-///
-/// Either it is malformed, or it is not supported by xarxa.
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Error;
-
-impl core::error::Error for Error {}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "wire::Error")
-    }
-}
-
-pub type Result<T> = core::result::Result<T, Error>;
 
 /// A hardware (link-layer) address.
 ///
@@ -460,30 +456,30 @@ impl RawHardwareAddress {
 
     /// Parse the address as an address of the given medium.
     ///
-    /// Errors:
-    /// - `Error` if the length is wrong for the medium: 6 bytes for Ethernet,
+    /// # Errors
+    /// - `Malformed`: if the length is wrong for the medium: 6 bytes for Ethernet,
     ///   8 (an extended address) for IEEE 802.15.4, or if the medium has no
     ///   addresses.
-    pub fn parse(&self, medium: Medium) -> Result<HardwareAddress> {
+    pub fn parse(&self, medium: Medium) -> Result<HardwareAddress, Malformed> {
         match medium {
             #[cfg(feature = "medium-ethernet")]
             Medium::Ethernet => {
                 if self.len() != 6 {
-                    return Err(Error);
+                    return Err(Malformed);
                 }
                 Ok(HardwareAddress::Ethernet(EthernetAddress::from_bytes(self.as_bytes())))
             }
             #[cfg(feature = "medium-ieee802154")]
             Medium::Ieee802154 => {
                 if self.len() != 8 {
-                    return Err(Error);
+                    return Err(Malformed);
                 }
                 Ok(HardwareAddress::Ieee802154(Ieee802154Address::from_bytes(
                     self.as_bytes(),
                 )))
             }
             #[cfg(feature = "medium-ip")]
-            Medium::Ip => Err(Error),
+            Medium::Ip => Err(Malformed),
         }
     }
 }
@@ -544,10 +540,10 @@ mod test {
             parse(&[0u8; 6]),
             Ok(HardwareAddress::Ethernet(EthernetAddress([0, 0, 0, 0, 0, 0])))
         );
-        assert_eq!(parse(&[1u8; 5]), Err(Error));
+        assert_eq!(parse(&[1u8; 5]), Err(Malformed));
         // A 7-byte address only fits `RawHardwareAddress` with `medium-ieee802154`.
         #[cfg(feature = "medium-ieee802154")]
-        assert_eq!(parse(&[1u8; 7]), Err(Error));
+        assert_eq!(parse(&[1u8; 7]), Err(Malformed));
     }
 
     #[test]
@@ -558,7 +554,7 @@ mod test {
             parse(&[0u8; 8]),
             Ok(HardwareAddress::Ieee802154(Ieee802154Address::Extended([0; 8])))
         );
-        assert_eq!(parse(&[1u8; 2]), Err(Error));
-        assert_eq!(parse(&[1u8; 1]), Err(Error));
+        assert_eq!(parse(&[1u8; 2]), Err(Malformed));
+        assert_eq!(parse(&[1u8; 1]), Err(Malformed));
     }
 }

@@ -3,7 +3,7 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::fmt;
 
-use super::{Error, Result};
+use crate::error::Malformed;
 
 pub use super::IpProtocol as Protocol;
 
@@ -103,6 +103,16 @@ pub(crate) trait AddressExt {
     #[cfg(any(feature = "medium-ethernet", feature = "medium-ieee802154"))]
     fn solicited_node(&self) -> Address;
 
+    /// The Ethernet address this multicast address maps to (RFC 2464 §7).
+    ///
+    /// The mapping keeps only the low 32 bits of the group, so distinct groups
+    /// can map to the same Ethernet address.
+    ///
+    /// # Panics
+    /// Panics if the address is not multicast.
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress;
+
     /// Return the scope of the address.
     ///
     /// `x_` prefix is to avoid a collision with the still-unstable method in `core::ip`.
@@ -153,6 +163,13 @@ impl AddressExt for Address {
         Address::from([
             0xff, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xFF, o[13], o[14], o[15],
         ])
+    }
+
+    #[cfg(feature = "medium-ethernet")]
+    fn multicast_ethernet_addr(&self) -> super::EthernetAddress {
+        assert!(self.is_multicast());
+        let b = self.octets();
+        super::EthernetAddress([0x33, 0x33, b[12], b[13], b[14], b[15]])
     }
 
     fn x_multicast_scope(&self) -> MulticastScope {
@@ -229,11 +246,21 @@ impl Cidr {
 
     /// Create an IPv6 CIDR block from the given address and prefix length.
     ///
+    /// Return `None` if the prefix length is larger than 128.
+    pub const fn try_new(address: Address, prefix_len: u8) -> Option<Self> {
+        if prefix_len <= 128 {
+            Some(Self { address, prefix_len })
+        } else {
+            None
+        }
+    }
+
+    /// Create an IPv6 CIDR block from the given address and prefix length.
+    ///
     /// # Panics
     /// This function panics if the prefix length is larger than 128.
-    pub const fn new(address: Address, prefix_len: u8) -> Cidr {
-        core::assert!(prefix_len <= 128);
-        Cidr { address, prefix_len }
+    pub const fn new(address: Address, prefix_len: u8) -> Self {
+        Self::try_new(address, prefix_len).unwrap()
     }
 
     /// Return the address of this IPv6 CIDR block.
@@ -338,23 +365,25 @@ impl<'a> Packet<'a> {
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
     #[inline]
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
     ///
     /// The result of this check is invalidated by calling [set_payload_len].
     ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    ///
     /// [set_payload_len]: #method.set_payload_len
     #[inline]
-    pub fn check_len(&self) -> Result<()> {
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
         if len < field::DST_ADDR.end || len < self.total_len() {
-            Err(Error)
+            Err(Malformed)
         } else {
             Ok(())
         }
@@ -845,6 +874,6 @@ pub(crate) mod test {
         bytes.extend(&REPR_PACKET_BYTES[..]);
         Packet::new_unchecked(&mut bytes).set_payload_len(0x80);
 
-        assert_eq!(Packet::new_checked(&mut bytes).unwrap_err(), Error);
+        assert_eq!(Packet::new_checked(&mut bytes).unwrap_err(), Malformed);
     }
 }

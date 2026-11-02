@@ -43,7 +43,7 @@ This has a few implications:
   - You need to pay at least 2x MTU (1500*2 = 3kb) of RAM for each UDP/raw socket you create. This is why _smoltcp_ implements DNS and DHCP sockets as dedicated `DnsSocket` and `DhcpSocket` types instead of building them on top of UDP and raw sockets. This is not very elegant.
   - For multi-interface you need dedicated pools per interface.
 
-Instead, _xarxa_ has a single global packet pool. It passes owned handles around, so any part of the stack (device, sockets, everything else) can easily own packets. This unlocks many improvements:
+Instead, _xarxa_ passes owned packet handles between explicit static pools, drivers, the stack, sockets, and applications. Each packet returns to its originating pool when dropped, so systems can choose independent capacity and memory placement for different traffic domains. This unlocks many improvements:
 - Multi-interface becomes trivial.
 - Zero-copy is now possible. An interface writes a received packet into a buffer, which then goes through dispatch, gets queued in a socket, and then gets handed to the user. Same for egress.
 - It allows fixing "structurally unfixable" bugs like the [tx queue clog](https://github.com/smoltcp-rs/smoltcp/issues/594) when sending to multiple IPs from a single socket.
@@ -88,6 +88,10 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - IPv4 (feature `ipv4`)
   - DHCP client (feature `dhcpv4`)
     - Raw access to all lease options by option number. (feature `dhcpv4-options`)
+    - Sends the stack's hostname to the server, if set. (feature `hostname`)
+  - DHCP server (feature `dhcpv4-server`)
+    - Turned on per interface, hands out leases from a configured pool with gateway and DNS options.
+    - API to inspect and remove leases.
   - Fragmentation (feature `ipv4-fragmentation`)
   - Reassembly (feature `ipv4-reassembly`)
 - IPv6 (feature `ipv6`)
@@ -99,10 +103,10 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 - UDP sockets (feature `udp`)
   - **zero-copy** on both TX and RX
   - Supports all binding modes Linux supports, including unconnected (receives from any IP) and connected sockets (receives from one fixed remote IP+port).
-- Raw sockets (feature `raw`)
+- Raw sockets
   - **zero-copy** on both TX and RX
-  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing, you choose the interface manually.
-  - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types.
+  - Ethernet-layer raw sockets transmit/receive raw Ethernet frames. No routing. (feature `raw-ethernet`)
+  - IP-layer raw sockets transmit/receive raw IP packets. The stack handles routing same as other socket types. (feature `raw-ip`)
   - IP headers are byte-copied instead of parsed+re-emitted, so all fields and options are kept, even those unsupported by _xarxa_.
 - TCP sockets (feature `tcp`)
   - Full TCP implementation
@@ -123,6 +127,8 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
   - Join and leave multicast groups per interface.
   - IGMPv1/IGMPv2 (IPv4) and MLDv2 (IPv6): membership is reported on join and leave, and in response to router queries.
   - The IPv6 solicited-node groups of the interface's addresses are joined automatically.
+  - The multicast hardware addresses the stack listens on are reported to the driver, for devices that filter multicast in hardware.
+- Bind sockets to an interface, like Linux's `SO_BINDTODEVICE`. (feature `iface-bind`)
 - Packet metadata
   - Support for hardware timestamping on both RX and TX. Allows implementing protocols like PTP, NTP. (feature `packetmeta-timestamp`)
   - Opaque ID for correlating packets through the stack. (feature `packetmeta-id`)
@@ -132,7 +138,6 @@ Benchmark source code is available [here](https://github.com/embassy-rs/xarxa-be
 
 All of the below is planned. Please open an issue or reach out on [the Matrix chat](https://matrix.to/#/#xarxa:matrix.org) if you want to work on one of these so we don't duplicate work.
 
-- DHCP server
 - Acting on link state: skipping down interfaces on egress routing, restarting DHCP/SLAAC on link-up.
 - IPv6 DAD (duplicate address detection)
 - IPv6 RDNSS (DNS servers from router advertisements)
@@ -148,3 +153,16 @@ All of the below is planned. Please open an issue or reach out on [the Matrix ch
 _xarxa_ is distributed under the terms of 0-clause BSD license.
 
 See [LICENSE-0BSD](LICENSE-0BSD.txt) for details.
+
+## Maintained backpressure changes
+
+This branch preserves the upstream driver and Embassy contracts. UDP senders
+wait for routed device capacity. ARP replies reuse the received packet owner
+and are retained in a bounded four-entry interface queue on device backpressure.
+Repeated requests for the same peer/local IPv4 pair replace the queued response
+without growing the queue. Distinct excess requests are dropped with a warning;
+RX continues and no extra pool allocation or immediate retry timer is needed.
+Returned device credit serves retained replies before new socket packets. Link
+down, interface removal and configuration changes release retained replies.
+The driver must report capacity changes through its normal wake mechanism.
+This does not add retry storage for other immediate control protocols.

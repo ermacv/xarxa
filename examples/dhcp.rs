@@ -16,6 +16,8 @@
 //!     --dhcp-range=192.168.69.50,192.168.69.90,12h
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -30,10 +32,11 @@ fn main() {
     let name = std::env::args().nth(1).unwrap_or_else(|| "tap0".to_string());
 
     let hardware_addr = HardwareAddress::Ethernet(EthernetAddress([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]));
-    let driver = TunTapDriver::new(&name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = TunTapDriver::new(&name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
 
     // That's all it takes: the stack installs the address and default route
@@ -42,7 +45,7 @@ fn main() {
     // from the lease below.
     let mut config = DhcpConfig::default();
     config.parameter_request_list = Some(&[1, 3, 6, 42]);
-    stack.iface(iface).set_dhcpv4(Some(config));
+    stack.iface(iface).set_dhcpv4(Some(config)).unwrap();
 
     let mut generation = stack.iface(iface).config_generation();
     loop {
@@ -64,15 +67,9 @@ fn main() {
             }
         }
 
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 

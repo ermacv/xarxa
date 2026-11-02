@@ -3,11 +3,11 @@ use byteorder::{ByteOrder, NetworkEndian};
 use core::iter;
 use core::iter::Iterator;
 
-use super::{Error, Result};
+use crate::error::Malformed;
 #[cfg(feature = "ipv4")]
-use crate::wire::Ipv4Address;
+use crate::wire::Ipv4Addr;
 #[cfg(feature = "ipv6")]
-use crate::wire::Ipv6Address;
+use crate::wire::Ipv6Addr;
 
 open_enum! {
     /// DNS opcode.
@@ -100,18 +100,23 @@ impl<'a> Packet<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is smaller than
-    /// the header length.
-    pub fn check_len(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is smaller than the header length.
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
-        if len < field::HEADER_END { Err(Error) } else { Ok(()) }
+        if len < field::HEADER_END {
+            Err(Malformed)
+        } else {
+            Ok(())
+        }
     }
 
     /// Consume the packet, returning the underlying buffer.
@@ -178,20 +183,20 @@ impl<'a> Packet<'a> {
     ///
     /// Yields one label at a time. Pointers are only allowed to point backwards, so
     /// pointer loops end the iteration with an error.
-    pub fn parse_name<'b>(&'b self, mut bytes: &'b [u8]) -> impl Iterator<Item = Result<&'b [u8]>> {
+    pub fn parse_name<'b>(&'b self, mut bytes: &'b [u8]) -> impl Iterator<Item = Result<&'b [u8], Malformed>> {
         let mut packet: &'b [u8] = self.buffer;
 
         iter::from_fn(move || {
             loop {
                 if bytes.is_empty() {
-                    return Some(Err(Error));
+                    return Some(Err(Malformed));
                 }
                 match bytes[0] {
                     0x00 => return None,
                     x if x & 0xC0 == 0x00 => {
                         let len = (x & 0x3F) as usize;
                         if bytes.len() < 1 + len {
-                            return Some(Err(Error));
+                            return Some(Err(Malformed));
                         }
                         let label = &bytes[1..1 + len];
                         bytes = &bytes[1 + len..];
@@ -199,12 +204,12 @@ impl<'a> Packet<'a> {
                     }
                     x if x & 0xC0 == 0xC0 => {
                         if bytes.len() < 2 {
-                            return Some(Err(Error));
+                            return Some(Err(Malformed));
                         }
                         let y = bytes[1];
                         let ptr = ((x & 0x3F) as usize) << 8 | (y as usize);
                         if packet.len() <= ptr {
-                            return Some(Err(Error));
+                            return Some(Err(Malformed));
                         }
 
                         // RFC1035 says: "In this scheme, an entire domain name or a list of labels at
@@ -222,7 +227,7 @@ impl<'a> Packet<'a> {
                         bytes = &packet[ptr..];
                         packet = &packet[..ptr];
                     }
-                    _ => return Some(Err(Error)),
+                    _ => return Some(Err(Malformed)),
                 }
             }
         })
@@ -281,26 +286,29 @@ impl<'a> Packet<'a> {
 
 /// Parse part of a name from `bytes`, not following pointers.
 /// Returns the unused part of `bytes`, and the pointer offset if the sequence ends with a pointer.
-fn parse_name_part<'a>(mut bytes: &'a [u8], mut f: impl FnMut(&'a [u8])) -> Result<(&'a [u8], Option<usize>)> {
+fn parse_name_part<'a>(
+    mut bytes: &'a [u8],
+    mut f: impl FnMut(&'a [u8]),
+) -> Result<(&'a [u8], Option<usize>), Malformed> {
     loop {
-        let x = *bytes.first().ok_or(Error)?;
+        let x = *bytes.first().ok_or(Malformed)?;
         bytes = &bytes[1..];
         match x {
             0x00 => return Ok((bytes, None)),
             x if x & 0xC0 == 0x00 => {
                 let len = (x & 0x3F) as usize;
-                let label = bytes.get(..len).ok_or(Error)?;
+                let label = bytes.get(..len).ok_or(Malformed)?;
                 bytes = &bytes[len..];
                 f(label);
             }
             x if x & 0xC0 == 0xC0 => {
-                let y = *bytes.first().ok_or(Error)?;
+                let y = *bytes.first().ok_or(Malformed)?;
                 bytes = &bytes[1..];
 
                 let ptr = ((x & 0x3F) as usize) << 8 | (y as usize);
                 return Ok((bytes, Some(ptr)));
             }
-            _ => return Err(Error),
+            _ => return Err(Malformed),
         }
     }
 }
@@ -318,20 +326,23 @@ pub struct Question<'a> {
 impl<'a> Question<'a> {
     /// Parse a question from the start of `buffer`.
     ///
-    /// Returns the rest of the buffer and the question. Fails if the class is not IN.
-    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], Question<'a>)> {
+    /// Returns the rest of the buffer and the question.
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short, or the class is not IN.
+    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], Question<'a>), Malformed> {
         let (rest, _) = parse_name_part(buffer, |_| ())?;
         let name = &buffer[..buffer.len() - rest.len()];
 
         if rest.len() < 4 {
-            return Err(Error);
+            return Err(Malformed);
         }
         let type_ = NetworkEndian::read_u16(&rest[0..2]).into();
         let class = NetworkEndian::read_u16(&rest[2..4]);
         let rest = &rest[4..];
 
         if class != CLASS_IN {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         Ok((rest, Question { name, type_ }))
@@ -367,15 +378,15 @@ pub struct Record<'a> {
 
 impl<'a> RecordData<'a> {
     /// Parse record data of the given type.
-    pub fn parse(type_: Type, data: &'a [u8]) -> Result<RecordData<'a>> {
+    pub fn parse(type_: Type, data: &'a [u8]) -> Result<RecordData<'a>, Malformed> {
         match type_ {
             #[cfg(feature = "ipv4")]
-            Type::A => Ok(RecordData::A(Ipv4Address::from(
-                <[u8; 4]>::try_from(data).map_err(|_| Error)?,
+            Type::A => Ok(RecordData::A(Ipv4Addr::from(
+                <[u8; 4]>::try_from(data).map_err(|_| Malformed)?,
             ))),
             #[cfg(feature = "ipv6")]
-            Type::Aaaa => Ok(RecordData::Aaaa(Ipv6Address::from(
-                <[u8; 16]>::try_from(data).map_err(|_| Error)?,
+            Type::Aaaa => Ok(RecordData::Aaaa(Ipv6Addr::from(
+                <[u8; 16]>::try_from(data).map_err(|_| Malformed)?,
             ))),
             Type::Cname => Ok(RecordData::Cname(data)),
             x => Ok(RecordData::Other(x, data)),
@@ -389,10 +400,10 @@ impl<'a> RecordData<'a> {
 pub enum RecordData<'a> {
     /// An IPv4 address.
     #[cfg(feature = "ipv4")]
-    A(Ipv4Address),
+    A(Ipv4Addr),
     /// An IPv6 address.
     #[cfg(feature = "ipv6")]
-    Aaaa(Ipv6Address),
+    Aaaa(Ipv6Addr),
     /// A canonical name, in wire format. May contain compression pointers.
     Cname(&'a [u8]),
     /// Any other record type, with its raw data.
@@ -402,13 +413,16 @@ pub enum RecordData<'a> {
 impl<'a> Record<'a> {
     /// Parse a record from the start of `buffer`.
     ///
-    /// Returns the rest of the buffer and the record. Fails if the class is not IN.
-    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], Record<'a>)> {
+    /// Returns the rest of the buffer and the record.
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short, or the class is not IN.
+    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], Record<'a>), Malformed> {
         let (rest, _) = parse_name_part(buffer, |_| ())?;
         let name = &buffer[..buffer.len() - rest.len()];
 
         if rest.len() < 10 {
-            return Err(Error);
+            return Err(Malformed);
         }
         let type_ = NetworkEndian::read_u16(&rest[0..2]).into();
         let class = NetworkEndian::read_u16(&rest[2..4]);
@@ -417,10 +431,10 @@ impl<'a> Record<'a> {
         let rest = &rest[10..];
 
         if class != CLASS_IN {
-            return Err(Error);
+            return Err(Malformed);
         }
 
-        let data = rest.get(..len).ok_or(Error)?;
+        let data = rest.get(..len).ok_or(Malformed)?;
         let rest = &rest[len..];
 
         Ok((
@@ -488,7 +502,7 @@ mod test {
     }
 
     impl<'a> Parsed<'a> {
-        fn parse(bytes: &'a mut [u8]) -> Result<Self> {
+        fn parse(bytes: &'a mut [u8]) -> Result<Self, Malformed> {
             let mut questions = Vec::new();
             let mut answers = Vec::new();
             let mut authorities = Vec::new();
@@ -591,10 +605,7 @@ mod test {
 
         assert_eq!(p.answers[0].name, &[0xc0, 0x0c]);
         assert_eq!(p.answers[0].ttl, 202);
-        assert_eq!(
-            p.answers[0].data,
-            RecordData::A(Ipv4Address::new(0xac, 0xd9, 0xa8, 0xae))
-        );
+        assert_eq!(p.answers[0].data, RecordData::A(Ipv4Addr::new(0xac, 0xd9, 0xa8, 0xae)));
     }
 
     #[test]
@@ -632,10 +643,7 @@ mod test {
         for (i, last) in [0x35, 0x28, 0x43, 0x62].into_iter().enumerate() {
             assert_eq!(p.answers[i].name, &[0xc0, 0x0c]);
             assert_eq!(p.answers[i].ttl, 9);
-            assert_eq!(
-                p.answers[i].data,
-                RecordData::A(Ipv4Address::new(0x0d, 0xe0, 0x77, last))
-            );
+            assert_eq!(p.answers[i].data, RecordData::A(Ipv4Addr::new(0x0d, 0xe0, 0x77, last)));
         }
     }
 
@@ -683,10 +691,7 @@ mod test {
         // a
         assert_eq!(p.answers[1].name, &[0xc0, 0x2e]);
         assert_eq!(p.answers[1].ttl, 5);
-        assert_eq!(
-            p.answers[1].data,
-            RecordData::A(Ipv4Address::new(0x1f, 0x0d, 0x53, 0x24))
-        );
+        assert_eq!(p.answers[1].data, RecordData::A(Ipv4Addr::new(0x1f, 0x0d, 0x53, 0x24)));
     }
 
     #[test]

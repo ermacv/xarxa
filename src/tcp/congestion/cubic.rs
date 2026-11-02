@@ -1,4 +1,7 @@
-use crate::{tcp::RttEstimator, time::Instant};
+use crate::{
+    tcp::RttEstimator,
+    time::{Duration, Instant},
+};
 
 use super::Controller;
 
@@ -122,17 +125,16 @@ impl Controller for Cubic {
             }
         };
 
-        // Elapsed time since the start of the recovery phase, in microseconds so the
-        // cubic curve still advances between ACKs on sub-millisecond-RTT links.
-        let t = now.total_micros() - recovery_start.total_micros();
-        if t < 0 {
+        // Elapsed time since the start of the recovery phase, in milliseconds.
+        let Some(t) = now.checked_duration_since(recovery_start) else {
             return;
-        }
+        };
+        let t = t.as_millis();
 
         // RFC 9438 §4.3: use cubic function to get suggested cwnd.
         // W_cubic(t) = C(t - K)^3 + w_max, evaluated at the current time t.
         let c_as_bytes = C * self.mss as f64;
-        let w_cubic = c_as_bytes * cube(t as f64 / 1_000_000.0 - self.k) + self.w_max as f64;
+        let w_cubic = c_as_bytes * cube(t as f64 / 1000.0 - self.k) + self.w_max as f64;
 
         // RFC 9438 §4.3: advance our reno-like suggested cwnd.
         // When cwnd exceeds prior cwnd, change α_cubic to match Reno's AIMD.
@@ -155,10 +157,10 @@ impl Controller for Cubic {
 
         // RFC 9438 §4.2: the congestion window target is W_cubic one RTT into the future.
         let w_cubic_target = {
-            // srtt is in millis so floor at 1ms to ensure sub-ms RTTs don't ruin the lookahead.
-            let srtt = (rtt.smoothed_rtt() as u64 * 1000).max(1000);
+            // Floor srtt at 1ms to ensure sub-ms RTTs don't ruin the lookahead.
+            let srtt = rtt.smoothed_rtt().max(Duration::from_millis(1));
 
-            let t_ahead = (t as f64 + srtt as f64) / 1_000_000.0;
+            let t_ahead = (t as f64 + srtt.as_millis() as f64) / 1000.0;
             let raw = c_as_bytes * cube(t_ahead - self.k) + self.w_max as f64;
             raw.min(1.5 * self.cwnd as f64) // clamp to avoid increasing faster than slow-start would
         };

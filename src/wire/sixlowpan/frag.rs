@@ -3,7 +3,7 @@
 //! [RFC 4944 § 5.3]: https://datatracker.ietf.org/doc/html/rfc4944#section-5.3
 
 use super::{DISPATCH_FIRST_FRAGMENT_HEADER, DISPATCH_FRAGMENT_HEADER};
-use crate::wire::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::{Ieee802154Address, Ieee802154Repr};
 
 /// Key used for identifying all the link fragments that belong to the same packet.
@@ -94,12 +94,12 @@ impl defmt::Format for Repr {
 impl Repr {
     /// Parse a fragment header from the front of `buf`.
     ///
-    /// Errors:
-    /// - `Error` if the buffer is shorter than the header, or does not start
+    /// # Errors
+    /// - `Malformed`: if the buffer is shorter than the header, or does not start
     ///   with a fragment header dispatch.
-    pub fn parse(buf: &[u8]) -> Result<Self> {
+    pub fn parse(buf: &[u8]) -> Result<Self, Malformed> {
         if buf.len() < FIRST_FRAGMENT_HEADER_SIZE {
-            return Err(Error);
+            return Err(Malformed);
         }
         let size = u16::from_be_bytes([buf[0], buf[1]]) & 0b111_1111_1111;
         let tag = u16::from_be_bytes([buf[2], buf[3]]);
@@ -107,7 +107,7 @@ impl Repr {
             DISPATCH_FIRST_FRAGMENT_HEADER => Ok(Self::FirstFragment { size, tag }),
             DISPATCH_FRAGMENT_HEADER => {
                 if buf.len() < NEXT_FRAGMENT_HEADER_SIZE {
-                    return Err(Error);
+                    return Err(Malformed);
                 }
                 Ok(Self::Fragment {
                     size,
@@ -115,7 +115,7 @@ impl Repr {
                     offset: buf[4],
                 })
             }
-            _ => Err(Error),
+            _ => Err(Malformed),
         }
     }
 

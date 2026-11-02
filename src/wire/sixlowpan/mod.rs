@@ -4,7 +4,7 @@
 //! [RFC 4944]: https://datatracker.ietf.org/doc/html/rfc4944
 //! [RFC 6282]: https://datatracker.ietf.org/doc/html/rfc6282
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::IpProtocol;
 
 pub mod frag;
@@ -38,14 +38,14 @@ const DISPATCH_EXT_HEADER: u8 = 0b1110;
 impl SixlowpanPacket {
     /// Read the dispatch byte of a 6LoWPAN payload.
     ///
-    /// Errors:
-    /// - `Error` if the payload is empty, or the dispatch is neither a
+    /// # Errors
+    /// - `Malformed`: if the payload is empty, or the dispatch is neither a
     ///   fragment header nor an IPHC header.
-    pub fn dispatch(buffer: &[u8]) -> Result<Self> {
+    pub fn dispatch(buffer: &[u8]) -> Result<Self, Malformed> {
         let raw = buffer;
 
         if raw.is_empty() {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         if raw[0] >> 3 == DISPATCH_FIRST_FRAGMENT_HEADER || raw[0] >> 3 == DISPATCH_FRAGMENT_HEADER {
@@ -53,7 +53,7 @@ impl SixlowpanPacket {
         } else if raw[0] >> 5 == DISPATCH_IPHC_HEADER {
             Ok(Self::IphcHeader)
         } else {
-            Err(Error)
+            Err(Malformed)
         }
     }
 }

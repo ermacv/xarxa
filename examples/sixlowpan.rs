@@ -46,12 +46,14 @@
 //! rmmod mac802154_hwsim
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
 use xarxa::driver_impls::{RawSocketDriver, wait};
 use xarxa::time::Instant;
-use xarxa::wire::{HardwareAddress, Ieee802154Address, Ieee802154Pan, IpListenEndpoint};
+use xarxa::wire::{HardwareAddress, Ieee802154Address, Ieee802154Pan, ListenSocketAddr};
 
 const UDP_PORT: u16 = 6969;
 const TCP_PORT: u16 = 50000;
@@ -64,10 +66,11 @@ fn main() {
     let hardware_addr = HardwareAddress::Ieee802154(Ieee802154Address::Extended([
         0x1a, 0x0b, 0x42, 0x42, 0x42, 0x42, 0x42, 0x42,
     ]));
-    let driver = RawSocketDriver::new(&name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = RawSocketDriver::new(&name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     // The link-local address is derived from the extended address:
     // fe80::180b:4242:4242:4242.
@@ -79,7 +82,7 @@ fn main() {
     let udp_handle = stack.add_udp_socket().unwrap();
     stack
         .udp_socket(udp_handle)
-        .bind(UDP_PORT, IpListenEndpoint::UNSPECIFIED)
+        .bind(UDP_PORT, ListenSocketAddr::UNSPECIFIED)
         .unwrap();
 
     let listener = stack.add_tcp_listener().unwrap();
@@ -99,15 +102,14 @@ fn main() {
             log::info!("udp: echoing {} octets to {}", packet.payload().len(), meta);
             let data = packet.payload().to_vec();
             drop(packet); // free the buffer before sending
-            socket.send_slice(&data, meta.endpoint).unwrap();
+            socket.send_slice(&data, meta.remote_addr).unwrap();
         }
 
-        // Accept every queued connection attempt.
-        while let Some(handle) = stack.tcp_listener(listener).accept(4096, 4096) {
-            log::info!(
-                "tcp: connection from {}",
-                stack.tcp_socket(handle).remote_endpoint().unwrap()
-            );
+        // Accept every queued connection attempt into a fresh socket.
+        while let Some(token) = stack.tcp_listener(listener).accept() {
+            log::info!("tcp: connection from {}", token.remote_addr());
+            let handle = stack.add_tcp_socket(4096, 4096).unwrap();
+            stack.tcp_socket(handle).accept(token).unwrap();
             connections.push(handle);
         }
 
@@ -123,7 +125,7 @@ fn main() {
                 socket.send_slice(&buf[..len]).unwrap();
             }
 
-            // The remote endpoint closed its transmit half and everything
+            // The remote peer closed its transmit half and everything
             // received has been echoed back: close ours too.
             if !socket.may_recv() && socket.may_send() {
                 socket.close();
@@ -141,15 +143,9 @@ fn main() {
 
         let deadline = stack.poll(Instant::now());
 
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 }
 

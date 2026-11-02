@@ -19,15 +19,27 @@ use std::vec::Vec;
 
 use xarxa::Stack;
 use xarxa::driver::Capabilities;
-use xarxa::driver::PacketBuf;
 #[cfg(feature = "packetmeta-id")]
 use xarxa::driver::PacketMeta;
 use xarxa::driver::{ChecksumCapabilities, Driver, LinkState};
+use xarxa::driver::{PacketBuf, PacketBufAllocator, PacketPool, PacketPoolStorage};
 #[cfg(feature = "packetmeta-timestamp")]
 use xarxa::driver::{Timestamp, TxTimestamp};
 use xarxa::iface::IfaceHandle;
 use xarxa::iface::Medium;
 use xarxa::wire::HardwareAddress;
+
+/// Process-wide packet storage for tests. Individual tests still exercise
+/// explicit allocator plumbing; the large shared capacity only prevents the
+/// parallel test runner from introducing unrelated exhaustion.
+pub fn packet_allocator() -> PacketBufAllocator {
+    static ALLOCATOR: std::sync::OnceLock<PacketBufAllocator> = std::sync::OnceLock::new();
+    *ALLOCATOR.get_or_init(|| {
+        let storage = Box::leak(Box::new(PacketPoolStorage::<256>::new()));
+        let pool = Box::leak(Box::new(PacketPool::new(storage)));
+        pool.allocator()
+    })
+}
 
 /// Frames waiting to be received, oldest first.
 pub type Queue = Rc<RefCell<VecDeque<Vec<u8>>>>;
@@ -44,6 +56,9 @@ pub type Room = Rc<Cell<Option<usize>>>;
 
 /// Control over the link state the device reports, shared with the test.
 pub type Link = Rc<Cell<LinkState>>;
+
+/// The multicast filter updates reported so far, oldest first. `true` is add.
+pub type McastFilter = Rc<RefCell<Vec<Vec<[u8; 6]>>>>;
 
 /// A mock network device.
 ///
@@ -72,6 +87,8 @@ pub struct TestDevice {
     pub hardware_addr: HardwareAddress,
     /// The link state it reports.
     pub link: Link,
+    /// Multicast filter lists the stack set, oldest first.
+    pub mcast_filter: McastFilter,
     /// Metadata stamped onto every received packet.
     #[cfg(feature = "packetmeta-id")]
     pub rx_meta: PacketMeta,
@@ -96,6 +113,7 @@ impl TestDevice {
             #[cfg(feature = "packetmeta-id")]
             tx_meta: Rc::new(RefCell::new(Vec::new())),
             room: Rc::new(Cell::new(None)),
+            mcast_filter: Rc::new(RefCell::new(Vec::new())),
             hardware_addr: match medium {
                 #[cfg(feature = "medium-ethernet")]
                 Medium::Ethernet => {
@@ -148,7 +166,7 @@ impl TestDevice {
     ///
     /// The stack gets its own copy, sharing this one's queues. It is leaked, so
     /// the interface lives as long as the test wants it to.
-    pub fn install(&self, stack: &mut Stack<'_>, hw: HardwareAddress) -> IfaceHandle {
+    pub fn install(&self, stack: &mut Stack<'_, TestDevice>, hw: HardwareAddress) -> IfaceHandle {
         let mut driver = self.clone();
         driver.hardware_addr = hw;
         stack.add_iface_borrowed(Box::leak(Box::new(driver))).unwrap()
@@ -174,7 +192,7 @@ impl Driver for TestDevice {
 
     fn receive(&mut self) -> Option<PacketBuf> {
         let bytes = self.rx.borrow_mut().pop_front()?;
-        let mut buf = PacketBuf::try_new().unwrap();
+        let mut buf = packet_allocator().try_alloc().unwrap();
         buf.set_len(bytes.len());
         buf.copy_from_slice(&bytes);
         #[cfg(feature = "packetmeta-id")]
@@ -213,5 +231,9 @@ impl Driver for TestDevice {
     #[cfg(feature = "packetmeta-timestamp")]
     fn poll_tx_timestamp(&mut self) -> Option<TxTimestamp> {
         self.tx_stamps.pop_front()
+    }
+
+    fn set_multicast_filter(&mut self, addrs: &[[u8; 6]]) {
+        self.mcast_filter.borrow_mut().push(addrs.to_vec());
     }
 }

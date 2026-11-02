@@ -1,8 +1,8 @@
 use std::io;
 use std::os::unix::io::{AsRawFd, RawFd};
 
-use crate::driver::PacketBuf;
 use crate::driver::{Capabilities, Driver};
+use crate::driver::{PacketBuf, PacketBufAllocator};
 use crate::iface::Medium;
 #[cfg(feature = "medium-ethernet")]
 use crate::wire::ETHERNET_HEADER_LEN;
@@ -69,6 +69,7 @@ pub struct TunTapDriver {
     lower: libc::c_int,
     mtu: usize,
     hardware_addr: HardwareAddress,
+    packet_allocator: PacketBufAllocator,
 }
 
 impl AsRawFd for TunTapDriver {
@@ -83,11 +84,16 @@ impl TunTapDriver {
     /// `hardware_addr` is the address the interface reports to the stack, and picks the
     /// medium: [`HardwareAddress::Ip`] opens a TUN interface, an Ethernet address opens a
     /// TAP one.
+    /// `packet_allocator` provides buffers for frames received from the host.
     ///
     /// If `name` is a persistent interface configured with UID of the current user,
     /// no special privileges are needed. Otherwise, this requires superuser privileges
     /// or a corresponding capability set on the executable.
-    pub fn new(name: &str, hardware_addr: HardwareAddress) -> io::Result<TunTapDriver> {
+    pub fn new(
+        name: &str,
+        hardware_addr: HardwareAddress,
+        packet_allocator: PacketBufAllocator,
+    ) -> io::Result<TunTapDriver> {
         let medium = hardware_addr.medium();
 
         let lower = unsafe {
@@ -106,6 +112,7 @@ impl TunTapDriver {
             lower,
             mtu,
             hardware_addr,
+            packet_allocator,
         })
     }
 
@@ -116,11 +123,18 @@ impl TunTapDriver {
     ///
     /// `hardware_addr` is the address the interface reports to the stack, and picks the
     /// medium, as in [`new`](Self::new).
-    pub fn from_fd(fd: RawFd, hardware_addr: HardwareAddress, mtu: usize) -> io::Result<TunTapDriver> {
+    /// `packet_allocator` provides buffers for frames received from the host.
+    pub fn from_fd(
+        fd: RawFd,
+        hardware_addr: HardwareAddress,
+        mtu: usize,
+        packet_allocator: PacketBufAllocator,
+    ) -> io::Result<TunTapDriver> {
         Ok(TunTapDriver {
             lower: fd,
             mtu,
             hardware_addr,
+            packet_allocator,
         })
     }
 
@@ -216,7 +230,7 @@ impl Driver for TunTapDriver {
     }
 
     fn receive(&mut self) -> Option<PacketBuf> {
-        let mut buf = PacketBuf::try_new()?;
+        let mut buf = self.packet_allocator.try_alloc()?;
         buf.set_len(buf.capacity());
         match self.recv(&mut buf[..]) {
             Ok(size) => {

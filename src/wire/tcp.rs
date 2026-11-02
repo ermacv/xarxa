@@ -1,9 +1,9 @@
 use byteorder::{ByteOrder, NetworkEndian};
 use core::{cmp, fmt, ops};
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::ip::checksum;
-use crate::wire::{IpAddress, IpProtocol};
+use crate::wire::{IpAddr, IpProtocol};
 
 /// A TCP sequence number.
 ///
@@ -132,28 +132,29 @@ impl<'a> Packet<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    /// Returns `Err(Error)` if the header length field has a value smaller
-    /// than the minimal header length.
     ///
     /// The result of this check is invalidated by calling [set_header_len].
     ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short, or the header length field is
+    ///   smaller than the minimal header length.
+    ///
     /// [set_header_len]: #method.set_header_len
-    pub fn check_len(&self) -> Result<()> {
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
         if len < field::URGENT.end {
-            Err(Error)
+            Err(Malformed)
         } else {
             let header_len = self.header_len() as usize;
             if len < header_len || header_len < field::URGENT.end {
-                Err(Error)
+                Err(Malformed)
             } else {
                 Ok(())
             }
@@ -280,7 +281,7 @@ impl<'a> Packet<'a> {
     ///
     /// # Fuzzing
     /// This function always returns `true` when fuzzing.
-    pub fn verify_checksum(&self, src_addr: &IpAddress, dst_addr: &IpAddress) -> bool {
+    pub fn verify_checksum(&self, src_addr: &IpAddr, dst_addr: &IpAddr) -> bool {
         if cfg!(fuzzing) {
             return true;
         }
@@ -429,7 +430,7 @@ impl<'a> Packet<'a> {
     /// # Panics
     /// This function panics unless `src_addr` and `dst_addr` belong to the same family,
     /// and that family is IPv4 or IPv6.
-    pub fn fill_checksum(&mut self, src_addr: &IpAddress, dst_addr: &IpAddress) {
+    pub fn fill_checksum(&mut self, src_addr: &IpAddr, dst_addr: &IpAddr) {
         self.set_checksum(0);
         let checksum = {
             let data = &self.buffer[..];
@@ -484,9 +485,9 @@ pub enum TcpOption<'a> {
 }
 
 impl<'a> TcpOption<'a> {
-    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>)> {
+    pub fn parse(buffer: &'a [u8]) -> Result<(&'a [u8], TcpOption<'a>), Malformed> {
         let (length, option);
-        match *buffer.first().ok_or(Error)? {
+        match *buffer.first().ok_or(Malformed)? {
             field::OPT_END => {
                 length = 1;
                 option = TcpOption::EndOfList;
@@ -496,19 +497,19 @@ impl<'a> TcpOption<'a> {
                 option = TcpOption::NoOperation;
             }
             kind => {
-                length = *buffer.get(1).ok_or(Error)? as usize;
-                let data = buffer.get(2..length).ok_or(Error)?;
+                length = *buffer.get(1).ok_or(Malformed)? as usize;
+                let data = buffer.get(2..length).ok_or(Malformed)?;
                 match (kind, length) {
                     (field::OPT_END, _) | (field::OPT_NOP, _) => unreachable!(),
                     (field::OPT_MSS, 4) => option = TcpOption::MaxSegmentSize(NetworkEndian::read_u16(data)),
-                    (field::OPT_MSS, _) => return Err(Error),
+                    (field::OPT_MSS, _) => return Err(Malformed),
                     (field::OPT_WS, 3) => option = TcpOption::WindowScale(data[0]),
-                    (field::OPT_WS, _) => return Err(Error),
+                    (field::OPT_WS, _) => return Err(Malformed),
                     (field::OPT_SACKPERM, 2) => option = TcpOption::SackPermitted,
-                    (field::OPT_SACKPERM, _) => return Err(Error),
+                    (field::OPT_SACKPERM, _) => return Err(Malformed),
                     (field::OPT_SACKRNG, n) => {
                         if n < 10 || (n - 2) % 8 != 0 {
-                            return Err(Error);
+                            return Err(Malformed);
                         }
                         if n > 26 {
                             // It's possible for a remote to send 4 SACK blocks, but extremely rare.
@@ -657,10 +658,10 @@ impl Control {
 #[cfg(all(test, feature = "ipv4"))]
 mod test {
     use super::*;
-    use crate::wire::Ipv4Address;
+    use crate::wire::Ipv4Addr;
 
-    const SRC_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 1);
-    const DST_ADDR: Ipv4Address = Ipv4Address::new(192, 168, 1, 2);
+    const SRC_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 1);
+    const DST_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 1, 2);
 
     static PACKET_BYTES: [u8; 28] = [
         0xbf, 0x00, 0x00, 0x50, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x60, 0x35, 0x01, 0x23, 0x01, 0xb6,
@@ -723,7 +724,7 @@ mod test {
     fn test_truncated() {
         let mut bytes = PACKET_BYTES;
         let packet = Packet::new_unchecked(&mut bytes[..23]);
-        assert_eq!(packet.check_len(), Err(Error));
+        assert_eq!(packet.check_len(), Err(Malformed));
     }
 
     #[test]
@@ -731,14 +732,14 @@ mod test {
         let mut bytes = vec![0; 20];
         let mut packet = Packet::new_unchecked(&mut bytes);
         packet.set_header_len(10);
-        assert_eq!(packet.check_len(), Err(Error));
+        assert_eq!(packet.check_len(), Err(Malformed));
     }
 
     macro_rules! assert_option_parses {
         ($opt:expr, $data:expr) => {{
             assert_eq!(TcpOption::parse($data), Ok((&[][..], $opt)));
             let buffer = &mut [0; 40][..$opt.buffer_len()];
-            assert_eq!($opt.emit(buffer), &mut []);
+            assert_eq!($opt.emit(buffer), &mut [] as &mut [u8]);
             assert_eq!(&*buffer, $data);
         }};
     }
@@ -796,11 +797,11 @@ mod test {
 
     #[test]
     fn test_malformed_tcp_options() {
-        assert_eq!(TcpOption::parse(&[]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0xc]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0xc, 0x05, 0x01, 0x02]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Error));
-        assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Error));
+        assert_eq!(TcpOption::parse(&[]), Err(Malformed));
+        assert_eq!(TcpOption::parse(&[0xc]), Err(Malformed));
+        assert_eq!(TcpOption::parse(&[0xc, 0x05, 0x01, 0x02]), Err(Malformed));
+        assert_eq!(TcpOption::parse(&[0xc, 0x01]), Err(Malformed));
+        assert_eq!(TcpOption::parse(&[0x2, 0x02]), Err(Malformed));
+        assert_eq!(TcpOption::parse(&[0x3, 0x02]), Err(Malformed));
     }
 }

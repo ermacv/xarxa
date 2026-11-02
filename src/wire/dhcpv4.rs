@@ -4,9 +4,9 @@ use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
 use core::iter;
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::arp::Hardware;
-use crate::wire::{EthernetAddress, Ipv4Address};
+use crate::wire::{EthernetAddress, Ipv4Addr};
 
 /// The UDP port DHCP servers listen on.
 pub const SERVER_PORT: u16 = 67;
@@ -83,16 +83,17 @@ impl<'a> OptionWriter<'a> {
 
     /// Write one option.
     ///
-    /// Errors if the option data is longer than 255 bytes or doesn't fit in the
-    /// remaining space.
-    pub fn emit(&mut self, option: DhcpOption<'_>) -> Result<()> {
+    /// # Errors
+    /// - `Malformed`: if the option data is longer than 255 bytes, or does not
+    ///   fit in the remaining space.
+    pub fn emit(&mut self, option: DhcpOption<'_>) -> Result<(), Malformed> {
         if option.data.len() > u8::MAX as _ {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         let total_len = 2 + option.data.len();
         if self.buffer.len() < total_len {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         let (buf, rest) = core::mem::take(&mut self.buffer).split_at_mut(total_len);
@@ -108,10 +109,11 @@ impl<'a> OptionWriter<'a> {
 
     /// Write the end marker. No more options can be written after this.
     ///
-    /// Errors if there is no space left.
-    pub fn end(&mut self) -> Result<()> {
+    /// # Errors
+    /// - `Malformed`: if there is no space left.
+    pub fn end(&mut self) -> Result<(), Malformed> {
         if self.buffer.is_empty() {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         self.buffer[0] = field::OPT_END;
@@ -289,17 +291,19 @@ impl<'a> Packet<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    pub fn check_len(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
-        if len < HEADER_LEN { Err(Error) } else { Ok(()) }
+        if len < HEADER_LEN { Err(Malformed) } else { Ok(()) }
     }
 
     /// Return the operation code of this packet.
@@ -360,23 +364,23 @@ impl<'a> Packet<'a> {
     /// This corresponds to the `ciaddr` field in the DHCP specification. According to it,
     /// this field is “only filled in if client is in `BOUND`, `RENEW` or `REBINDING` state
     /// and can respond to ARP requests”.
-    pub fn client_ip(&self) -> Ipv4Address {
-        Ipv4Address::from_octets(self.buffer[field::CIADDR].try_into().unwrap())
+    pub fn client_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from_octets(self.buffer[field::CIADDR].try_into().unwrap())
     }
 
     /// Return the value of the `yiaddr` field, zero if not set.
-    pub fn your_ip(&self) -> Ipv4Address {
-        Ipv4Address::from_octets(self.buffer[field::YIADDR].try_into().unwrap())
+    pub fn your_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from_octets(self.buffer[field::YIADDR].try_into().unwrap())
     }
 
     /// Return the value of the `siaddr` field, zero if not set.
-    pub fn server_ip(&self) -> Ipv4Address {
-        Ipv4Address::from_octets(self.buffer[field::SIADDR].try_into().unwrap())
+    pub fn server_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from_octets(self.buffer[field::SIADDR].try_into().unwrap())
     }
 
     /// Return the value of the `giaddr` field, zero if not set.
-    pub fn relay_agent_ip(&self) -> Ipv4Address {
-        Ipv4Address::from_octets(self.buffer[field::GIADDR].try_into().unwrap())
+    pub fn relay_agent_ip(&self) -> Ipv4Addr {
+        Ipv4Addr::from_octets(self.buffer[field::GIADDR].try_into().unwrap())
     }
 
     /// Return the flags field.
@@ -431,38 +435,41 @@ impl<'a> Packet<'a> {
 
     /// Return the message type, from the message type option.
     ///
-    /// Errors if the option is missing or malformed.
-    pub fn message_type(&self) -> Result<MessageType> {
+    /// # Errors
+    /// - `Malformed`: if the option is missing or malformed.
+    pub fn message_type(&self) -> Result<MessageType, Malformed> {
         match self.option(field::OPT_DHCP_MESSAGE_TYPE) {
             Some(&[value]) => Ok(MessageType::from(value)),
-            _ => Err(Error),
+            _ => Err(Malformed),
         }
     }
 
     /// Return the `sname` (server name) field as a string.
     ///
-    /// Errors if it is empty or not valid UTF-8.
-    pub fn get_sname(&self) -> Result<&str> {
+    /// # Errors
+    /// - `Malformed`: if the field is empty or not valid UTF-8.
+    pub fn sname(&self) -> Result<&str, Malformed> {
         let data = &self.buffer[field::SNAME];
-        let len = data.iter().position(|&x| x == 0).ok_or(Error)?;
+        let len = data.iter().position(|&x| x == 0).ok_or(Malformed)?;
         if len == 0 {
-            return Err(Error);
+            return Err(Malformed);
         }
 
-        let data = core::str::from_utf8(&data[..len]).map_err(|_| Error)?;
+        let data = core::str::from_utf8(&data[..len]).map_err(|_| Malformed)?;
         Ok(data)
     }
 
     /// Return the `file` (boot file name) field as a string.
     ///
-    /// Errors if it is empty or not valid UTF-8.
-    pub fn get_boot_file(&self) -> Result<&str> {
+    /// # Errors
+    /// - `Malformed`: if the field is empty or not valid UTF-8.
+    pub fn boot_file(&self) -> Result<&str, Malformed> {
         let data = &self.buffer[field::FILE];
-        let len = data.iter().position(|&x| x == 0).ok_or(Error)?;
+        let len = data.iter().position(|&x| x == 0).ok_or(Malformed)?;
         if len == 0 {
-            return Err(Error);
+            return Err(Malformed);
         }
-        let data = core::str::from_utf8(&data[..len]).map_err(|_| Error)?;
+        let data = core::str::from_utf8(&data[..len]).map_err(|_| Malformed)?;
         Ok(data)
     }
 
@@ -538,22 +545,22 @@ impl<'a> Packet<'a> {
     /// This corresponds to the `ciaddr` field in the DHCP specification. According to it,
     /// this field is “only filled in if client is in `BOUND`, `RENEW` or `REBINDING` state
     /// and can respond to ARP requests”.
-    pub fn set_client_ip(&mut self, value: Ipv4Address) {
+    pub fn set_client_ip(&mut self, value: Ipv4Addr) {
         self.buffer[field::CIADDR].copy_from_slice(&value.octets());
     }
 
     /// Set the value of the `yiaddr` field.
-    pub fn set_your_ip(&mut self, value: Ipv4Address) {
+    pub fn set_your_ip(&mut self, value: Ipv4Addr) {
         self.buffer[field::YIADDR].copy_from_slice(&value.octets());
     }
 
     /// Set the value of the `siaddr` field.
-    pub fn set_server_ip(&mut self, value: Ipv4Address) {
+    pub fn set_server_ip(&mut self, value: Ipv4Addr) {
         self.buffer[field::SIADDR].copy_from_slice(&value.octets());
     }
 
     /// Set the value of the `giaddr` field.
-    pub fn set_relay_agent_ip(&mut self, value: Ipv4Address) {
+    pub fn set_relay_agent_ip(&mut self, value: Ipv4Addr) {
         self.buffer[field::GIADDR].copy_from_slice(&value.octets());
     }
 
@@ -613,7 +620,7 @@ mod test {
         0x00, 0x00, 0x00, 0x00, 0x00,
     ];
 
-    const IP_NULL: Ipv4Address = Ipv4Address::new(0, 0, 0, 0);
+    const IP_NULL: Ipv4Addr = Ipv4Addr::new(0, 0, 0, 0);
     const CLIENT_MAC: EthernetAddress = EthernetAddress([0x0, 0x0b, 0x82, 0x01, 0xfc, 0x42]);
     const DHCP_SIZE: u16 = 1500;
 
@@ -733,8 +740,8 @@ mod test {
         let mut bytes = [0u8; 4];
         let mut writer = OptionWriter::new(&mut bytes);
         assert_eq!(writer.emit(DhcpOption { kind: 1, data: &[1, 2] }), Ok(()));
-        assert_eq!(writer.emit(DhcpOption { kind: 1, data: &[1] }), Err(Error));
-        assert_eq!(writer.end(), Err(Error));
+        assert_eq!(writer.emit(DhcpOption { kind: 1, data: &[1] }), Err(Malformed));
+        assert_eq!(writer.end(), Err(Malformed));
         assert_eq!(writer.written(), 4);
     }
 
@@ -772,6 +779,6 @@ mod test {
         let mut writer = OptionWriter::new(&mut bytes);
         let hostname: [u8; 256] = ['a' as u8; 256];
         let hostname_opt = DhcpOption::hostname(&hostname);
-        assert_eq!(writer.emit(hostname_opt), Err(Error));
+        assert_eq!(writer.emit(hostname_opt), Err(Malformed));
     }
 }

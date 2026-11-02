@@ -1,7 +1,7 @@
 //! IPv6 extension headers (RFC 8200 §4): the common (next header, length) prefix,
 //! and the TLV option walk shared by the Hop-by-Hop and Destination Options headers.
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::ip::Protocol;
 
 /// A read wrapper around an IPv6 extension header.
@@ -31,17 +31,19 @@ impl<'a> ExtHeader<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a [u8]) -> Result<ExtHeader<'a>> {
+    pub fn new_checked(buffer: &'a [u8]) -> Result<ExtHeader<'a>, Malformed> {
         let header = Self::new_unchecked(buffer);
         header.check_len()?;
         Ok(header)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    pub fn check_len(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    pub fn check_len(&self) -> Result<(), Malformed> {
         if self.buffer.len() < field::DATA_START || self.buffer.len() < self.header_len() {
-            Err(Error)
+            Err(Malformed)
         } else {
             Ok(())
         }
@@ -150,7 +152,7 @@ impl<'a> OptionsIter<'a> {
 }
 
 impl<'a> Iterator for OptionsIter<'a> {
-    type Item = Result<(usize, OptionType, &'a [u8])>;
+    type Item = Result<(usize, OptionType, &'a [u8]), Malformed>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.offset >= self.options.len() {
@@ -174,7 +176,7 @@ impl<'a> Iterator for OptionsIter<'a> {
             }
             None => {
                 self.offset = usize::MAX;
-                Some(Err(Error))
+                Some(Err(Malformed))
             }
         }
     }
@@ -202,18 +204,119 @@ mod test {
             ]
         );
 
-        // Too short for the length it claims.
-        assert_eq!(ExtHeader::new_checked(&bytes[..7]), Err(Error));
-        assert_eq!(ExtHeader::new_checked(&[0x11]), Err(Error));
+        // Length 1: 16 bytes total, one PadN.
+        let header = ExtHeader::new_checked(&REPR_PACKET_PAD12).unwrap();
+        assert_eq!(header.next_header(), Protocol::Tcp);
+        assert_eq!(header.header_len(), 16);
+        assert_eq!(header.data(), &REPR_PACKET_PAD12[2..]);
+        let options: Vec<_> = OptionsIter::new(header.data()).map(Result::unwrap).collect();
+        assert_eq!(options, vec![(0, OptionType::PadN, &[0u8; 12][..])]);
+    }
+
+    static REPR_PACKET_PAD4: [u8; 8] = [0x6, 0x0, 0x1, 0x4, 0x0, 0x0, 0x0, 0x0];
+    static REPR_PACKET_PAD12: [u8; 16] = [
+        0x06, 0x1, 0x1, 0x0C, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0,
+    ];
+
+    #[test]
+    fn test_ext_header_check_len() {
+        // Empty and one-byte buffers.
+        assert_eq!(ExtHeader::new_checked(&REPR_PACKET_PAD4[..0]), Err(Malformed));
+        assert_eq!(ExtHeader::new_checked(&REPR_PACKET_PAD4[..1]), Err(Malformed));
+        // One byte short of the length the header claims.
+        assert_eq!(ExtHeader::new_checked(&REPR_PACKET_PAD4[..7]), Err(Malformed));
+        assert_eq!(ExtHeader::new_checked(&REPR_PACKET_PAD12[..15]), Err(Malformed));
+        // Exactly the claimed length.
+        assert!(ExtHeader::new_checked(&REPR_PACKET_PAD4).is_ok());
+        assert!(ExtHeader::new_checked(&REPR_PACKET_PAD12).is_ok());
+        // A length field claiming more than the buffer holds.
+        let bytes = [0x06, 0x02, 0x0, 0x0, 0x0, 0x0, 0x0, 0x0];
+        assert_eq!(ExtHeader::new_checked(&bytes), Err(Malformed));
+    }
+
+    /// Bytes past the header's own length are not part of its data.
+    #[test]
+    fn test_ext_header_overlong() {
+        let mut bytes = REPR_PACKET_PAD4.to_vec();
+        bytes.push(0);
+        let header = ExtHeader::new_checked(&bytes).unwrap();
+        assert_eq!(header.header_len(), 8);
+        assert_eq!(header.data().len(), 6);
+
+        let mut bytes = REPR_PACKET_PAD12.to_vec();
+        bytes.push(0);
+        let header = ExtHeader::new_checked(&bytes).unwrap();
+        assert_eq!(header.header_len(), 16);
+        assert_eq!(header.data().len(), 14);
+    }
+
+    /// Every option shape: Pad1, PadN of several sizes, router alert and an
+    /// unknown type, whole and truncated.
+    #[test]
+    fn test_option_parse() {
+        fn first(bytes: &[u8]) -> Option<Result<(usize, OptionType, &[u8]), Malformed>> {
+            OptionsIter::new(bytes).next()
+        }
+
+        // Pad1.
+        assert_eq!(first(&[0x0]), Some(Ok((0, OptionType::Pad1, &[][..]))));
+        // PadN.
+        assert_eq!(first(&[0x1, 0x0]), Some(Ok((0, OptionType::PadN, &[][..]))));
+        assert_eq!(first(&[0x1, 0x1, 0x0]), Some(Ok((0, OptionType::PadN, &[0][..]))));
+        assert_eq!(first(&[0x1, 0x1]), Some(Err(Malformed)));
+        assert_eq!(first(&[0x1]), Some(Err(Malformed)));
+        // PadN followed by a bare, truncated option.
+        let mut iter = OptionsIter::new(&[0x1, 0x7, 0, 0, 0, 0, 0, 0, 0, 0xff]);
+        assert_eq!(iter.next(), Some(Ok((0, OptionType::PadN, &[0; 7][..]))));
+        assert_eq!(iter.next(), Some(Err(Malformed)));
+        assert_eq!(iter.next(), None);
+        // Router alert, every known value and an unknown one.
+        for (bytes, value) in [
+            ([0x05, 0x02, 0x00, 0x00], RouterAlert::MulticastListenerDiscovery),
+            ([0x05, 0x02, 0x00, 0x01], RouterAlert::Rsvp),
+            ([0x05, 0x02, 0x00, 0x02], RouterAlert::ActiveNetworks),
+            ([0x05, 0x02, 0xbe, 0xef], RouterAlert(0xbeef)),
+        ] {
+            let (offset, option_type, data) = first(&bytes).unwrap().unwrap();
+            assert_eq!(offset, 0);
+            assert_eq!(option_type, OptionType::RouterAlert);
+            assert_eq!(data.len(), RouterAlert::DATA_LEN as usize);
+            assert_eq!(RouterAlert::from(u16::from_be_bytes([data[0], data[1]])), value);
+        }
+        assert_eq!(first(&[0x05, 0x02, 0x00]), Some(Err(Malformed)));
+        // Unknown type.
+        assert_eq!(
+            first(&[0xff, 0x3, 0x0, 0x0, 0x0]),
+            Some(Ok((0, OptionType(255), &[0; 3][..])))
+        );
+        assert_eq!(OptionType::from(0xff), OptionType(255));
+        assert_eq!(first(&[0xff, 0x3, 0x0, 0x0]), Some(Err(Malformed)));
+        assert_eq!(first(&[0xff]), Some(Err(Malformed)));
+        // Nothing at all.
+        assert_eq!(first(&[]), None);
     }
 
     #[test]
-    fn test_options_pad1_and_malformed() {
-        // Pad1, then an option whose length overruns the buffer.
-        let options = [0x00, 0x02, 0x40];
+    fn test_options_iter() {
+        let options = [
+            0x00, 0x01, 0x01, 0x00, 0x01, 0x02, 0x00, 0x00, 0x01, 0x00, 0x00, 0x11, 0x00, 0x05, 0x02, 0x00, 0x01, 0x01,
+            0x08, 0x00,
+        ];
         let mut iter = OptionsIter::new(&options);
         assert_eq!(iter.next(), Some(Ok((0, OptionType::Pad1, &[][..]))));
-        assert_eq!(iter.next(), Some(Err(Error)));
+        assert_eq!(iter.next(), Some(Ok((1, OptionType::PadN, &[0x00][..]))));
+        assert_eq!(iter.next(), Some(Ok((4, OptionType::PadN, &[0x00, 0x00][..]))));
+        assert_eq!(iter.next(), Some(Ok((8, OptionType::PadN, &[][..]))));
+        assert_eq!(iter.next(), Some(Ok((10, OptionType::Pad1, &[][..]))));
+        assert_eq!(iter.next(), Some(Ok((11, OptionType(0x11), &[][..]))));
+        let (offset, option_type, data) = iter.next().unwrap().unwrap();
+        assert_eq!((offset, option_type), (13, OptionType::RouterAlert));
+        assert_eq!(
+            RouterAlert::from(u16::from_be_bytes([data[0], data[1]])),
+            RouterAlert::Rsvp
+        );
+        // A PadN claiming 8 data bytes with only one left.
+        assert_eq!(iter.next(), Some(Err(Malformed)));
         assert_eq!(iter.next(), None);
     }
 

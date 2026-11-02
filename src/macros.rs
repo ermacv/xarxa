@@ -156,7 +156,7 @@ mod tests {
         check_handle!(crate::iface::IfaceHandle, crate::config::IFACE_COUNT);
         #[cfg(feature = "udp")]
         check_handle!(crate::udp::UdpHandle, crate::config::UDP_SOCKET_COUNT);
-        #[cfg(feature = "raw")]
+        #[cfg(feature = "_raw")]
         check_handle!(crate::raw::RawHandle, crate::config::RAW_SOCKET_COUNT);
         #[cfg(feature = "tcp")]
         check_handle!(crate::tcp::TcpHandle, crate::config::TCP_SOCKET_COUNT);

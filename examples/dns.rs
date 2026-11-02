@@ -20,6 +20,8 @@
 //! sudo iptables -I FORWARD -o tap0 -j ACCEPT
 //! ```
 
+mod common;
+
 use std::os::unix::io::AsRawFd;
 
 use xarxa::Stack;
@@ -27,7 +29,7 @@ use xarxa::dns::{DnsClient, GetQueryResultError};
 use xarxa::driver_impls::{TunTapDriver, wait};
 use xarxa::time::Instant;
 use xarxa::wire::DnsType as Type;
-use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use xarxa::wire::{EthernetAddress, HardwareAddress, IpAddr, IpCidr, Ipv4Addr};
 
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
@@ -41,33 +43,34 @@ fn main() {
     };
     let name = args.first().map(String::as_str).unwrap_or("tap0");
     let host = args.get(1).map(String::as_str).unwrap_or("rust-lang.org");
-    let server: IpAddress = args
+    let server: IpAddr = args
         .get(2)
         .map(|s| {
             s.parse::<std::net::IpAddr>()
                 .expect("invalid DNS server address")
                 .into()
         })
-        .unwrap_or(IpAddress::v4(8, 8, 8, 8));
+        .unwrap_or(IpAddr::v4(8, 8, 8, 8));
 
-    let driver = TunTapDriver::new(name, hardware_addr).unwrap();
+    let packet_allocator = common::packet_allocator();
+    let driver = TunTapDriver::new(name, hardware_addr, packet_allocator).unwrap();
     let fd = driver.as_raw_fd();
 
-    let mut stack = Stack::new(random_seed());
+    let mut stack = Stack::new(random_seed(), packet_allocator);
     let iface = stack.add_iface(Box::new(driver)).unwrap();
     stack
         .iface(iface)
         .set_ip_addrs([
-            IpCidr::new(IpAddress::v4(192, 168, 69, 1), 24),
-            IpCidr::new(IpAddress::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
-            IpCidr::new(IpAddress::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddr::v4(192, 168, 69, 1), 24),
+            IpCidr::new(IpAddr::v6(0xfdaa, 0, 0, 0, 0, 0, 0, 1), 64),
+            IpCidr::new(IpAddr::v6(0xfe80, 0, 0, 0, 0, 0, 0, 1), 64),
         ])
         .unwrap();
 
     // Off-link traffic routes to the host's address on this interface.
     stack
         .routes_mut()
-        .add_default_ipv4_route(Ipv4Address::new(192, 168, 69, 100), iface)
+        .add_default_ipv4_route(Ipv4Addr::new(192, 168, 69, 100), iface)
         .unwrap();
 
     let mut dns = DnsClient::new(&mut stack, &[server]).unwrap();
@@ -76,7 +79,7 @@ fn main() {
 
     loop {
         let stack_deadline = stack.poll(Instant::now());
-        let dns_deadline = dns.poll(&mut stack);
+        let dns_deadline = dns.poll(&mut stack, Instant::now());
 
         match dns.get_query_result(query) {
             Ok(addrs) => {
@@ -91,15 +94,9 @@ fn main() {
         }
 
         let deadline = stack_deadline.min(dns_deadline);
-        let timeout = (deadline != Instant::MAX).then(|| {
-            let now = Instant::now();
-            if deadline <= now {
-                std::time::Duration::ZERO
-            } else {
-                (deadline - now).into()
-            }
-        });
-        wait(fd, timeout).unwrap();
+        // Zero if the deadline has already passed.
+        let timeout = deadline - Instant::now();
+        wait(fd, Some(timeout.into())).unwrap();
     }
 
     dns.remove(&mut stack);

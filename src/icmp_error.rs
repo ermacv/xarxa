@@ -4,6 +4,7 @@
 //! arrives (from the network or generated locally when neighbor resolution fails)
 //! it contains a "quoted" packet inside we can use to identify which socket was the cause.
 
+use crate::error::IcmpError;
 #[cfg(feature = "tcp")]
 use crate::wire::TcpSeqNumber;
 #[cfg(all(feature = "ipv4", any(feature = "udp", feature = "tcp")))]
@@ -11,47 +12,7 @@ use crate::wire::{IPV4_HEADER_LEN, Icmpv4DstUnreachable, Icmpv4Message, Ipv4Pack
 #[cfg(all(feature = "ipv6", any(feature = "udp", feature = "tcp")))]
 use crate::wire::{IPV6_HEADER_LEN, Icmpv6DstUnreachable, Icmpv6Message, Ipv6ExtHeader, Ipv6Packet};
 #[cfg(any(feature = "udp", feature = "tcp"))]
-use crate::wire::{IpAddress, IpProtocol, IpVersion};
-
-/// ICMP error reported against a socket.
-///
-/// Returned by `take_icmp_error` on UDP and TCP sockets (and by
-/// [`UdpSocket::recv`](crate::udp::UdpSocket::recv)) when an ICMP error message quoting
-/// one of the socket's packets arrives. Requires the `icmp-errors` cargo
-/// feature.
-#[cfg_attr(feature = "defmt", derive(defmt::Format))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[non_exhaustive]
-pub enum IcmpError {
-    /// The destination network is unreachable (`ENETUNREACH`).
-    NetUnreachable,
-    /// The destination host is unreachable (`EHOSTUNREACH`). Also reported when
-    /// the stack's own neighbor resolution (ARP/NDISC) for the destination fails.
-    HostUnreachable,
-    /// The destination host does not speak this protocol (`EPROTO`).
-    ProtoUnreachable,
-    /// Nothing is listening on the destination port (`ECONNREFUSED`).
-    PortUnreachable,
-    /// The packet was too big for a link on the path and could not be fragmented
-    /// (`EMSGSIZE`): ICMPv4 "fragmentation needed and DF set" / ICMPv6 packet too
-    /// big.
-    PacketTooBig,
-    /// Any other error: time exceeded, parameter problem, source route failed, ...
-    Other,
-}
-
-impl core::fmt::Display for IcmpError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            IcmpError::NetUnreachable => write!(f, "network unreachable"),
-            IcmpError::HostUnreachable => write!(f, "host unreachable"),
-            IcmpError::ProtoUnreachable => write!(f, "protocol unreachable"),
-            IcmpError::PortUnreachable => write!(f, "port unreachable"),
-            IcmpError::PacketTooBig => write!(f, "packet too big"),
-            IcmpError::Other => write!(f, "other ICMP error"),
-        }
-    }
-}
+use crate::wire::{IpAddr, IpProtocol, IpVersion};
 
 impl IcmpError {
     /// Condense an ICMPv4 error message's type and code, `None` if the message is
@@ -105,8 +66,8 @@ impl IcmpError {
 /// its destination the remote end.
 #[cfg(any(feature = "udp", feature = "tcp"))]
 pub(crate) struct QuotedPacket {
-    pub src_addr: IpAddress,
-    pub dst_addr: IpAddress,
+    pub src_addr: IpAddr,
+    pub dst_addr: IpAddr,
     pub protocol: IpProtocol,
     pub src_port: u16,
     pub dst_port: u16,
@@ -125,43 +86,42 @@ pub(crate) struct QuotedPacket {
 /// identify one.
 #[cfg(any(feature = "udp", feature = "tcp"))]
 pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
-    let (src_addr, dst_addr, protocol, l4_offset): (IpAddress, IpAddress, _, _) =
-        match IpVersion::of_packet(quote).ok()? {
-            #[cfg(feature = "ipv4")]
-            IpVersion::Ipv4 => {
-                if quote.len() < IPV4_HEADER_LEN {
-                    return None;
-                }
-                let packet = Ipv4Packet::new_unchecked(quote);
-                let header_len = packet.header_len() as usize;
-                if header_len < IPV4_HEADER_LEN {
-                    return None;
-                }
-                (
-                    packet.src_addr().into(),
-                    packet.dst_addr().into(),
-                    packet.next_header(),
-                    header_len,
-                )
+    let (src_addr, dst_addr, protocol, l4_offset): (IpAddr, IpAddr, _, _) = match IpVersion::of_packet(quote).ok()? {
+        #[cfg(feature = "ipv4")]
+        IpVersion::V4 => {
+            if quote.len() < IPV4_HEADER_LEN {
+                return None;
             }
-            #[cfg(feature = "ipv6")]
-            IpVersion::Ipv6 => {
-                if quote.len() < IPV6_HEADER_LEN {
-                    return None;
-                }
-                let packet = Ipv6Packet::new_unchecked(quote);
-                let src_addr = packet.src_addr();
-                let dst_addr = packet.dst_addr();
-                let mut protocol = packet.next_header();
-                let mut l4_offset = IPV6_HEADER_LEN;
-                if protocol == IpProtocol::HopByHop {
-                    let ext = Ipv6ExtHeader::new_checked(&quote[IPV6_HEADER_LEN..]).ok()?;
-                    protocol = ext.next_header();
-                    l4_offset += ext.header_len();
-                }
-                (src_addr.into(), dst_addr.into(), protocol, l4_offset)
+            let packet = Ipv4Packet::new_unchecked(quote);
+            let header_len = packet.header_len() as usize;
+            if header_len < IPV4_HEADER_LEN {
+                return None;
             }
-        };
+            (
+                packet.src_addr().into(),
+                packet.dst_addr().into(),
+                packet.next_header(),
+                header_len,
+            )
+        }
+        #[cfg(feature = "ipv6")]
+        IpVersion::V6 => {
+            if quote.len() < IPV6_HEADER_LEN {
+                return None;
+            }
+            let packet = Ipv6Packet::new_unchecked(quote);
+            let src_addr = packet.src_addr();
+            let dst_addr = packet.dst_addr();
+            let mut protocol = packet.next_header();
+            let mut l4_offset = IPV6_HEADER_LEN;
+            if protocol == IpProtocol::HopByHop {
+                let ext = Ipv6ExtHeader::new_checked(&quote[IPV6_HEADER_LEN..]).ok()?;
+                protocol = ext.next_header();
+                l4_offset += ext.header_len();
+            }
+            (src_addr.into(), dst_addr.into(), protocol, l4_offset)
+        }
+    };
 
     // The ports (and TCP sequence number) sit in the first 8 bytes of the quoted
     // L4 header, for both UDP and TCP.
@@ -180,7 +140,7 @@ pub(crate) fn parse_quoted_packet(quote: &mut [u8]) -> Option<QuotedPacket> {
 #[cfg(all(test, feature = "ipv4", feature = "ipv6", any(feature = "udp", feature = "tcp")))]
 mod test {
     use super::*;
-    use crate::wire::{Ipv4Address, Ipv6Address};
+    use crate::wire::{Ipv4Addr, Ipv6Addr};
 
     #[test]
     fn test_mapping() {
@@ -214,8 +174,8 @@ mod test {
             ip.set_version(4);
             ip.set_header_len(IPV4_HEADER_LEN as u8);
             ip.set_next_header(IpProtocol::Udp);
-            ip.set_src_addr(Ipv4Address::new(10, 0, 0, 1));
-            ip.set_dst_addr(Ipv4Address::new(10, 0, 0, 2));
+            ip.set_src_addr(Ipv4Addr::new(10, 0, 0, 1));
+            ip.set_dst_addr(Ipv4Addr::new(10, 0, 0, 2));
         }
         assert!(parse_quoted_packet(&mut quote).is_none());
 
@@ -231,8 +191,8 @@ mod test {
             let mut ip = Ipv6Packet::new_unchecked(&mut quote[..]);
             ip.set_version(6);
             ip.set_next_header(IpProtocol::HopByHop);
-            ip.set_src_addr(Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 1));
-            ip.set_dst_addr(Ipv6Address::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2));
+            ip.set_src_addr(Ipv6Addr::new(0xfdaa, 0, 0, 0, 0, 0, 0, 1));
+            ip.set_dst_addr(Ipv6Addr::new(0xfdaa, 0, 0, 0, 0, 0, 0, 2));
         }
         // Hop-by-hop: next header UDP, length 0, PadN(4).
         quote[IPV6_HEADER_LEN..IPV6_HEADER_LEN + 8].copy_from_slice(&[0x11, 0x00, 0x01, 0x04, 0, 0, 0, 0]);

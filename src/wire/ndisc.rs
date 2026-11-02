@@ -2,7 +2,7 @@ use bitflags::bitflags;
 use byteorder::{ByteOrder, NetworkEndian};
 
 use crate::time::Duration;
-use crate::wire::Ipv6Address;
+use crate::wire::Ipv6Addr;
 use crate::wire::icmpv6::{Packet, field};
 
 bitflags! {
@@ -42,19 +42,19 @@ impl<'a> Packet<'a> {
     /// Return the router lifetime field.
     #[inline]
     pub fn router_lifetime(&self) -> Duration {
-        Duration::from_secs(NetworkEndian::read_u16(&self.buffer[field::ROUTER_LT]) as u64)
+        Duration::from_secs(NetworkEndian::read_u16(&self.buffer[field::ROUTER_LT]).into())
     }
 
     /// Return the reachable time field.
     #[inline]
     pub fn reachable_time(&self) -> Duration {
-        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::REACHABLE_TM]) as u64)
+        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::REACHABLE_TM]))
     }
 
     /// Return the retransmit time field.
     #[inline]
     pub fn retrans_time(&self) -> Duration {
-        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::RETRANS_TM]) as u64)
+        Duration::from_millis(NetworkEndian::read_u32(&self.buffer[field::RETRANS_TM]))
     }
 }
 
@@ -67,8 +67,8 @@ impl<'a> Packet<'a> {
 impl<'a> Packet<'a> {
     /// Return the target address field.
     #[inline]
-    pub fn target_addr(&self) -> Ipv6Address {
-        Ipv6Address::from_octets(self.buffer[field::TARGET_ADDR].try_into().unwrap())
+    pub fn target_addr(&self) -> Ipv6Addr {
+        Ipv6Addr::from_octets(self.buffer[field::TARGET_ADDR].try_into().unwrap())
     }
 }
 
@@ -91,8 +91,8 @@ impl<'a> Packet<'a> {
 impl<'a> Packet<'a> {
     /// Return the destination address field.
     #[inline]
-    pub fn dest_addr(&self) -> Ipv6Address {
-        Ipv6Address::from_octets(self.buffer[field::DEST_ADDR].try_into().unwrap())
+    pub fn dest_addr(&self) -> Ipv6Addr {
+        Ipv6Addr::from_octets(self.buffer[field::DEST_ADDR].try_into().unwrap())
     }
 }
 
@@ -116,19 +116,19 @@ impl<'a> Packet<'a> {
     /// Set the router lifetime field.
     #[inline]
     pub fn set_router_lifetime(&mut self, value: Duration) {
-        NetworkEndian::write_u16(&mut self.buffer[field::ROUTER_LT], value.secs() as u16);
+        NetworkEndian::write_u16(&mut self.buffer[field::ROUTER_LT], value.as_secs() as u16);
     }
 
     /// Set the reachable time field.
     #[inline]
     pub fn set_reachable_time(&mut self, value: Duration) {
-        NetworkEndian::write_u32(&mut self.buffer[field::REACHABLE_TM], value.total_millis() as u32);
+        NetworkEndian::write_u32(&mut self.buffer[field::REACHABLE_TM], value.as_millis());
     }
 
     /// Set the retransmit time field.
     #[inline]
     pub fn set_retrans_time(&mut self, value: Duration) {
-        NetworkEndian::write_u32(&mut self.buffer[field::RETRANS_TM], value.total_millis() as u32);
+        NetworkEndian::write_u32(&mut self.buffer[field::RETRANS_TM], value.as_millis());
     }
 }
 
@@ -141,7 +141,7 @@ impl<'a> Packet<'a> {
 impl<'a> Packet<'a> {
     /// Set the target address field.
     #[inline]
-    pub fn set_target_addr(&mut self, value: Ipv6Address) {
+    pub fn set_target_addr(&mut self, value: Ipv6Addr) {
         self.buffer[field::TARGET_ADDR].copy_from_slice(&value.octets());
     }
 }
@@ -165,7 +165,7 @@ impl<'a> Packet<'a> {
 impl<'a> Packet<'a> {
     /// Set the destination address field.
     #[inline]
-    pub fn set_dest_addr(&mut self, value: Ipv6Address) {
+    pub fn set_dest_addr(&mut self, value: Ipv6Addr) {
         self.buffer[field::DEST_ADDR].copy_from_slice(&value.octets());
     }
 }
@@ -193,6 +193,36 @@ mod test {
         assert_eq!(packet.reachable_time(), Duration::from_millis(900));
         assert_eq!(packet.retrans_time(), Duration::from_millis(900));
         assert_eq!(packet.payload(), &SOURCE_LINK_LAYER_OPT[..]);
+    }
+
+    #[test]
+    fn test_router_advert_construct() {
+        use crate::wire::{Ipv6Addr, NdiscOption, NdiscOptionType, RawHardwareAddress};
+        let src = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+        let dst = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+
+        // Into a buffer full of stale bytes: every byte of the message is written.
+        let mut bytes = [0x2a; 24];
+        let mut packet = Packet::new_unchecked(&mut bytes[..]);
+        packet.set_msg_type(Message::RouterAdvert);
+        packet.set_msg_code(0);
+        packet.set_current_hop_limit(64);
+        packet.set_router_flags(RouterFlags::MANAGED);
+        packet.set_router_lifetime(Duration::from_secs(900));
+        packet.set_reachable_time(Duration::from_millis(900));
+        packet.set_retrans_time(Duration::from_millis(900));
+        {
+            let mut opt = NdiscOption::new_unchecked(packet.payload_mut());
+            opt.set_option_type(NdiscOptionType::SourceLinkLayerAddr);
+            opt.set_data_len(1);
+            opt.set_link_layer_addr(RawHardwareAddress::from_bytes(&[0x52, 0x54, 0x00, 0x12, 0x34, 0x56]));
+        }
+        packet.fill_checksum(&src, &dst);
+        assert_eq!(&bytes[..], &ROUTER_ADVERT_BYTES[..]);
+
+        // And it verifies, for the addresses it was built with.
+        let packet = Packet::new_checked(&mut bytes[..]).unwrap();
+        assert!(packet.verify_checksum(&src, &dst));
     }
 }
 

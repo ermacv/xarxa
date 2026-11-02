@@ -1,8 +1,8 @@
 use byteorder::{ByteOrder, NetworkEndian};
 
-use super::{Error, Result};
+use crate::error::Malformed;
 use crate::wire::ip::checksum;
-use crate::wire::{IpProtocol, Ipv6Address};
+use crate::wire::{IpProtocol, Ipv6Addr};
 
 open_enum! {
     /// Internet protocol control message type.
@@ -194,19 +194,21 @@ impl<'a> Packet<'a> {
     ///
     /// [new_unchecked]: #method.new_unchecked
     /// [check_len]: #method.check_len
-    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>> {
+    pub fn new_checked(buffer: &'a mut [u8]) -> Result<Packet<'a>, Malformed> {
         let packet = Self::new_unchecked(buffer);
         packet.check_len()?;
         Ok(packet)
     }
 
     /// Ensure that no accessor method will panic if called.
-    /// Returns `Err(Error)` if the buffer is too short.
-    pub fn check_len(&self) -> Result<()> {
+    ///
+    /// # Errors
+    /// - `Malformed`: if the buffer is too short.
+    pub fn check_len(&self) -> Result<(), Malformed> {
         let len = self.buffer.len();
 
         if len < 4 {
-            return Err(Error);
+            return Err(Malformed);
         }
 
         match self.msg_type() {
@@ -224,11 +226,11 @@ impl<'a> Packet<'a> {
             | Message::Redirect
             | Message::MldReport => {
                 if len < field::HEADER_END || len < self.header_len() {
-                    return Err(Error);
+                    return Err(Malformed);
                 }
             }
-            Message::RplControl => return Err(Error),
-            _ => return Err(Error),
+            Message::RplControl => return Err(Malformed),
+            _ => return Err(Malformed),
         }
 
         Ok(())
@@ -305,7 +307,7 @@ impl<'a> Packet<'a> {
     ///
     /// # Fuzzing
     /// This function always returns `true` when fuzzing.
-    pub fn verify_checksum(&self, src_addr: &Ipv6Address, dst_addr: &Ipv6Address) -> bool {
+    pub fn verify_checksum(&self, src_addr: &Ipv6Addr, dst_addr: &Ipv6Addr) -> bool {
         if cfg!(fuzzing) {
             return true;
         }
@@ -406,7 +408,7 @@ impl<'a> Packet<'a> {
     }
 
     /// Compute and fill in the header checksum.
-    pub fn fill_checksum(&mut self, src_addr: &Ipv6Address, dst_addr: &Ipv6Address) {
+    pub fn fill_checksum(&mut self, src_addr: &Ipv6Addr, dst_addr: &Ipv6Addr) {
         self.set_checksum(0);
         let checksum = {
             let data = &*self.buffer;
@@ -430,8 +432,8 @@ impl<'a> Packet<'a> {
 mod test {
     use super::*;
 
-    const MOCK_IP_ADDR_1: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
-    const MOCK_IP_ADDR_2: Ipv6Address = Ipv6Address::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
+    const MOCK_IP_ADDR_1: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 1);
+    const MOCK_IP_ADDR_2: Ipv6Addr = Ipv6Addr::new(0xfe80, 0, 0, 0, 0, 0, 0, 2);
 
     static ECHO_PACKET_BYTES: [u8; 12] = [0x80, 0x00, 0x19, 0xb3, 0x12, 0x34, 0xab, 0xcd, 0xaa, 0x00, 0x00, 0xff];
 

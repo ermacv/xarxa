@@ -699,7 +699,8 @@ impl<'d> TcpSocketState<'d> {
         let next_ack = self.remote_seq_no + self.rx_buffer.len();
 
         let last_win = (self.remote_last_win as usize) << self.remote_win_shift;
-        let last_win_adjusted = last_ack + last_win - next_ack;
+        // A forged SYN can move `next_ack` past the window we announced.
+        let last_win_adjusted = (last_ack + last_win).max(next_ack) - next_ack;
 
         Some(u16::try_from(last_win_adjusted >> self.remote_win_shift).unwrap_or(u16::MAX))
     }
@@ -1093,8 +1094,10 @@ impl<'d> TcpSocketState<'d> {
         }
 
         let window_start = self.remote_seq_no + self.rx_buffer.len();
+        // A FIN takes the sequence number one past the window its ACK has not
+        // announced yet: that window is empty, never negative.
         let window_end = if let Some(last_ack) = self.remote_last_ack {
-            last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)
+            (last_ack + ((self.remote_last_win as usize) << self.remote_win_shift)).max(window_start)
         } else {
             window_start
         };
@@ -3413,6 +3416,43 @@ mod test {
     // =========================================================================================//
     // Tests for the CLOSED state.
     // =========================================================================================//
+    #[test]
+    fn segment_after_fin_filling_the_window_does_not_underflow() {
+        let mut s = socket_established_with_buffer_sizes(64, 16);
+        send!(
+            s,
+            TcpRepr {
+                control: TcpControl::Fin,
+                seq_number: REMOTE_SEQ + 1,
+                ack_number: Some(LOCAL_SEQ + 1),
+                payload: &[0xaa; 16],
+                ..SEND_TEMPL
+            }
+        );
+        assert_eq!(s.state, State::CloseWait);
+        // The FIN took one past the end of the window its ACK has not yet
+        // announced: nothing fits, wherever the segment claims to start.
+        let window_start = REMOTE_SEQ + 1 + 16 + 1;
+        for distance in [i32::MAX, i32::MIN] {
+            let segment = TcpRepr {
+                seq_number: TcpSeqNumber(window_start.0.wrapping_add(distance)),
+                ack_number: Some(LOCAL_SEQ + 1),
+                ..SEND_TEMPL
+            };
+            send(&mut s, Instant::from_millis(0), &segment);
+        }
+        assert_eq!(s.state, State::CloseWait);
+    }
+
+    #[test]
+    fn last_window_past_its_end_is_zero() {
+        let mut s = socket_established();
+        s.remote_last_ack = Some(REMOTE_SEQ);
+        s.remote_last_win = 0;
+        s.remote_seq_no = REMOTE_SEQ + 1;
+        assert_eq!(s.last_scaled_window(), Some(0));
+    }
+
     #[test]
     fn test_closed_reject() {
         let s = socket();
